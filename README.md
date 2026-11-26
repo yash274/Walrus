@@ -15,6 +15,7 @@
 
 <p align="center">
   <a href="https://blueice.one"><img src="https://img.shields.io/badge/Affiliation-BlueIce-0284c7.svg?style=flat-square" alt="BlueIce Affiliation"></a>
+  <a href="https://blueice.one/#builders-community"><img src="https://img.shields.io/badge/Community-Join%20Builders-sky.svg?style=flat-square" alt="Join the Builders Community"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-38bdf8.svg?style=flat-square" alt="MIT License"></a>
   <a href="dist/WALRUS-Setup-0.25.0-beta.exe"><img src="https://img.shields.io/badge/Download-Windows%20Setup%20.exe-emerald.svg?style=flat-square" alt="Download Windows Installer"></a>
   <img src="https://img.shields.io/badge/Release-v0.25.0--beta-emerald.svg?style=flat-square" alt="Release Version">
@@ -217,7 +218,7 @@ We welcome contributions from developers, security researchers, and systems arch
 ### How to Contribute
 1. **Fork the Repository:** Create a feature branch (`git checkout -b feature/amazing-scanner`).
 2. **Coding Standards:**
-   - Adhere to the established [Coding Standards](CODING_STANDARDS.md).
+   - Adhere to the established [Contribution Guidelines](CONTRIBUTING.md).
    - Use strict workspace boundary checks (`fs.realpathSync.native`) for any file operations.
    - All UI code in `frontend/observatory` must use Svelte 5 Runes and follow the `unslop` design tokens.
 3. **Write Tests:** Add unit and integration tests under `tests/main/` or `tests/renderer/`.
@@ -232,7 +233,8 @@ If you discover a security vulnerability or bypass in Project Walrus, please rep
 ## 🌐 Community & Links
 
 * **Official Website:** [https://blueice.one](https://blueice.one)
-* **Join the Builders Community:** [blueice.one#builders-community](https://blueice.one)
+* **Join the Builders Community:** [https://blueice.one/#builders-community](https://blueice.one/#builders-community) — *Register to collaborate on agent swarms, MCP tools, and secure AI control platforms with researcher access, early API keys, and private workgroups.*
+* **GitHub Repository:** [https://github.com/yash274/Walrus](https://github.com/yash274/Walrus)
 * **License:** [MIT License](LICENSE)
 
 <p align="center">
