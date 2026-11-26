@@ -23,6 +23,18 @@
   <img src="https://img.shields.io/badge/Privacy-100%25%20Local--First-sky.svg?style=flat-square" alt="Local-First Privacy">
 </p>
 
+<p align="center">
+  <a href="https://blueice.one/#builders-community">
+    <img src="https://img.shields.io/badge/🚀%20Join%20the%20Builders%20Community-Register%20Now-0284c7?style=for-the-badge" alt="Join the Builders Community">
+  </a>
+</p>
+
+> [!TIP]
+> ### 🌐 Join the BlueIce Builders Community
+> Collaborate directly with researchers, systems architects, and engineers designing next-generation sovereign agent swarms, Model Context Protocol (MCP) tools, and secure AI control platforms.
+> 
+> **[👉 Register as a Builder at blueice.one/#builders-community](https://blueice.one/#builders-community)** — *Get early access to open-source agent tooling, private swarms, researcher access, and engineering workgroups.*
+
 ---
 
 ## ⚡ The Core Philosophy
@@ -232,10 +244,12 @@ If you discover a security vulnerability or bypass in Project Walrus, please rep
 
 ## 🌐 Community & Links
 
-* **Official Website:** [https://blueice.one](https://blueice.one)
-* **Join the Builders Community:** [https://blueice.one/#builders-community](https://blueice.one/#builders-community) — *Register to collaborate on agent swarms, MCP tools, and secure AI control platforms with researcher access, early API keys, and private workgroups.*
-* **GitHub Repository:** [https://github.com/yash274/Walrus](https://github.com/yash274/Walrus)
-* **License:** [MIT License](LICENSE)
+| Channel | Destination | Description |
+|:---|:---|:---|
+| 🏛️ **Official Website** | [**blueice.one**](https://blueice.one) | Enterprise AI research, sovereign brain platforms, and trust infrastructure |
+| 🚀 **Builders Community** | [![Join Builders](https://img.shields.io/badge/Join%20Builders%20Community-Register%20Now-0284c7?style=flat-square)](https://blueice.one/#builders-community) | Register for open-source swarms, researcher access, and engineering workgroups |
+| 💻 **Source Code** | [![GitHub](https://img.shields.io/badge/GitHub-yash274%2FWalrus-181717?style=flat-square&logo=github)](https://github.com/yash274/Walrus) | Official repository, discussions, and contribution PRs |
+| 📄 **Licensing** | [![License](https://img.shields.io/badge/License-MIT-38bdf8.svg?style=flat-square)](LICENSE) | Open-source software distributed under permissive MIT license |
 
 <p align="center">
   <sub>Built with care by <a href="https://blueice.one">BlueIce</a> and the open-source community.</sub>
