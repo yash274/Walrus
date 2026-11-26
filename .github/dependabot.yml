@@ -1,0 +1,38 @@
+version: 2
+# Dependency updates for the npm tree at the repo root. Minor and patch updates
+# are grouped into a single weekly PR so a normal week produces one review
+# rather than one per package; major updates stay as separate PRs. Any lockfile
+# Dependabot rewrites goes through the same `npm ci` gate (Node per `engines`) as
+# every other PR, and master requires the five status contexts
+# (`build`, `lint`, `svelte-check`, `test`, `audit`) before merge, so nothing
+# lands unreviewed. See Aegis issue #268 for the rationale.
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    # typescript-eslint currently supports TypeScript >=4.8.4 <6.1.0.
+    # Revisit this ceiling with a compatible parser/plugin release:
+    # https://typescript-eslint.io/users/dependency-versions/
+    ignore:
+      - dependency-name: typescript
+        versions: ['>=6.1.0']
+      # vite-plugin-svelte 6.2.4 declares Vite ^6.3.0 || ^7.0.0.
+      # Lift this ceiling with the compatible Svelte plugin migration.
+      - dependency-name: vite
+        versions: ['>=8.0.0']
+    groups:
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
+  # The optional development tools have a separate manifest and lockfile.
+  - package-ecosystem: npm
+    directory: /tools/development
+    schedule:
+      interval: weekly
+    groups:
+      development-minor-patch:
+        update-types:
+          - minor
+          - patch

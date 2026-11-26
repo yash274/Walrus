@@ -1,0 +1,387 @@
+/**
+ * The `getStats()` composer (main.js).
+ *
+ * `app.whenReady()` never resolves in this harness, so `loadDeferredModules` never
+ * runs and every deferred module stays `undefined`. That IS the BOOTING branch, and
+ * exercising it here is the point: it is the one path where the composer must answer
+ * without a single leaf record existing.
+ */
+import { describe, it, expect, afterAll, vi } from 'vitest';
+import Module from 'module';
+import os from 'os';
+import fs from 'fs';
+import path from 'path';
+import { createRequire } from 'module';
+import { APP_HEALTH_STATE } from '../../src/main/app-health.js';
+
+const fakeElectron = {
+  app: {
+    name: 'Aegis',
+    getPath: () => os.tmpdir(),
+    getVersion: () => '0.0.0-test',
+    setName: () => {},
+    disableHardwareAcceleration: () => {},
+    requestSingleInstanceLock: () => true,
+    whenReady: () => new Promise(() => {}),
+    on: () => {},
+    quit: () => {},
+  },
+  BrowserWindow: class {},
+  globalShortcut: { register: () => {}, unregisterAll: () => {} },
+  shell: { openExternal: () => {} },
+  ipcMain: { handle: () => {}, on: () => {} },
+  dialog: {},
+  Notification: class {},
+  Tray: class {},
+  Menu: { buildFromTemplate: (t) => t },
+  nativeImage: { createFromBuffer: (b) => b },
+  safeStorage: { isEncryptionAvailable: () => false },
+};
+
+const originalLoad = Module._load;
+Module._load = function (request, _parent, _isMain) {
+  if (request === 'electron') return fakeElectron;
+  return originalLoad.apply(this, arguments);
+};
+
+const originalArgv = process.argv;
+// main.js exits early via a module-scope `return` when argv carries a CLI flag —
+// vitest's own argv must not trip that branch and blank out module.exports.
+process.argv = ['node', 'main.js'];
+
+// createRequire, not `import`: main.js is CommonJS with a module-scope `return`, which
+// is a syntax error under an ESM transform but legal for the CJS loader.
+const require_ = createRequire(import.meta.url);
+const main = require_('../../src/main/main.js');
+const auditLogger = require_('../../src/main/audit-logger.js');
+const operationalLogger = require_('../../src/main/logger.js');
+
+afterAll(() => {
+  Module._load = originalLoad;
+  process.argv = originalArgv;
+});
+
+describe('getStats() — app health composition', () => {
+  it('projects project readiness independently of healthy other roots without reading selection paths', () => {
+    const mainPath = require_.resolve('../../src/main/main.js');
+    const previous = require_.cache[mainPath];
+    delete require_.cache[mainPath];
+    const partial = require_(mainPath);
+    try {
+      partial._loadDeferredModulesForTest();
+      const watcher = require_('../../src/main/file-watcher');
+      const selection = { getWatchKey: vi.fn(), resolveRoot: vi.fn() };
+      partial._setProjectWatchSelectionForTest(selection);
+      const root = (state, hasLiveWatcher = true) => ({
+        id: 'project-dir',
+        state,
+        hasLiveWatcher,
+        path: 'PRIVATE_PROJECT_PATH',
+      });
+      const cases = [
+        [[], ['project-dir'], 'not-observed'],
+        [[root('planned', false)], [], 'starting'],
+        [[root('registered')], [], 'starting'],
+        [[root('ready')], [], 'observed'],
+        [[root('ready', false)], [], 'unavailable'],
+        [[root('registration-failed', false)], [], 'unavailable'],
+        [[root('errored')], [], 'unavailable'],
+        [[root('not-attempted', false)], [], 'unavailable'],
+        [[], [], 'unknown'],
+        [[root('PRIVATE_PROJECT_PATH')], [], 'unknown'],
+        [[root('ready')], ['project-dir'], 'unknown'],
+      ];
+      for (const [groups, absentGroups, expected] of cases) {
+        partial._setWatcherForTest({
+          ...watcher,
+          getWatchPlan: () => ({
+            state: 'HEALTHY',
+            liveWatcherCount: 3,
+            unavailableGroups: [],
+            groups,
+            absentGroups,
+          }),
+        });
+        const view = partial.getStats().appHealth.watchPlan;
+        expect(view).toEqual({
+          state: 'HEALTHY',
+          liveWatcherCount: 3,
+          unavailableGroups: [],
+          projectState: expected,
+        });
+        expect(JSON.stringify(view)).not.toContain('PRIVATE_PROJECT_PATH');
+      }
+      expect(selection.getWatchKey).not.toHaveBeenCalled();
+      expect(selection.resolveRoot).not.toHaveBeenCalled();
+    } finally {
+      require_.cache[mainPath] = previous;
+    }
+  });
+  it('keeps reentrant health and stats reads BOOTING throughout the real deferred require pass', () => {
+    const mainPath = require_.resolve('../../src/main/main.js');
+    const previousMain = require_.cache[mainPath];
+    const previousLoad = Module._load;
+    const boundaries = [
+      './network-monitor',
+      './platform',
+      './ide-extension-detector',
+      './wsl-detector',
+      './llm-runtime-detector',
+    ];
+    const observed = [];
+    delete require_.cache[mainPath];
+    try {
+      const partial = require_(mainPath);
+      Module._load = function (request, parent, isMain) {
+        if (parent?.filename === mainPath && boundaries.includes(request)) {
+          observed.push({
+            boundary: request,
+            health: partial.getAppHealth(),
+            statsHealth: partial.getStats().appHealth,
+          });
+        }
+        return previousLoad.call(this, request, parent, isMain);
+      };
+      partial._loadDeferredModulesForTest();
+      expect(observed.map((row) => row.boundary)).toEqual(boundaries);
+      for (const { health, statsHealth } of observed) {
+        expect(health).toEqual({
+          state: APP_HEALTH_STATE.BOOTING,
+          reasons: [],
+          populationState: null,
+          populationReliable: false,
+          populationAsOf: null,
+          identityQuality: null,
+          identityDegraded: false,
+          sensors: { byId: {}, raw: null, effective: null, projections: [] },
+          watchPlan: null,
+        });
+        expect(statsHealth).toEqual(health);
+      }
+      const initialized = partial.getAppHealth();
+      expect(initialized.state).not.toBe(APP_HEALTH_STATE.BOOTING);
+      expect(initialized.sensors.byId).toHaveProperty('process');
+      expect(initialized.populationReliable).toBe(false);
+      expect(partial.getStats().appHealth).toEqual(initialized);
+    } finally {
+      Module._load = previousLoad;
+      require_.cache[mainPath] = previousMain;
+    }
+  });
+  it('21. answers BOOTING before the deferred modules load, and does not throw', () => {
+    const stats = main.getStats();
+    expect(stats.appHealth.state).toBe(APP_HEALTH_STATE.BOOTING);
+    expect(stats.appHealth.reasons).toEqual([]);
+  });
+
+  it('22. monitoringPaused is a SIBLING of appHealth, never inside it', () => {
+    const stats = main.getStats();
+    expect(stats).toHaveProperty('monitoringPaused');
+    expect(typeof stats.monitoringPaused).toBe('boolean');
+    // The orthogonality that the whole model rests on: a deliberate silence must stay
+    // distinguishable from a broken sensor, so operator control never enters the enum.
+    expect(stats.appHealth).not.toHaveProperty('monitoringPaused');
+    expect(Object.values(APP_HEALTH_STATE)).not.toContain('PAUSED');
+  });
+
+  it('23. populationState rides beside populationReliable and populationAsOf', () => {
+    const health = main.getAppHealth();
+    expect(health).toHaveProperty('populationState');
+    expect(health).toHaveProperty('populationReliable');
+    expect(health).toHaveProperty('populationAsOf');
+    // Null, not a guessed 'STARTING'. No leaf record exists yet, and "not observed" is
+    // a different fact from "observed and starting" — the renderer gates the
+    // "population unknown" copy on this field, so it must not be invented here.
+    expect(health.populationState).toBeNull();
+    expect(health.populationReliable).toBe(false);
+    expect(health.populationAsOf).toBeNull();
+  });
+
+  it('the BOOTING payload is fully shaped — a reader needs no undefined guards', () => {
+    const health = main.getAppHealth();
+    expect(health.sensors).toEqual({ byId: {}, raw: null, effective: null, projections: [] });
+    expect(health.watchPlan).toBeNull();
+    expect(health.identityDegraded).toBe(false);
+    expect(health.identityQuality).toBeNull();
+    expect(main.getStats().scanCadence).toEqual({
+      skippedProcessTicks: 0,
+      lastSkippedAt: null,
+      maxProcessGapMs: null,
+    });
+  });
+
+  it('both getStats branches carry the same appHealth key set', () => {
+    // The pre-load branch is a separate literal in main.js, so it can drift from the
+    // loaded one silently. This pins the two together at the only point they are both
+    // reachable — the payload contract, not the values.
+    const keys = Object.keys(main.getStats().appHealth).sort();
+    expect(keys).toEqual([
+      'identityDegraded',
+      'identityQuality',
+      'populationAsOf',
+      'populationReliable',
+      'populationState',
+      'reasons',
+      'sensors',
+      'state',
+      'watchPlan',
+    ]);
+  });
+
+  it('the legacy stats fields are untouched', () => {
+    // appHealth is additive: nothing that already rode this payload may move or vanish.
+    const stats = main.getStats();
+    for (const key of [
+      'totalFiles',
+      'totalSensitive',
+      'aiSensitive',
+      'uptimeMs',
+      'monitoringStarted',
+      'peakAgents',
+      'currentAgents',
+      'aiAgentCount',
+      'otherAgentCount',
+      'uniqueAgents',
+      'permissionDeniedScans',
+      'attribution',
+    ]) {
+      expect(stats, `missing legacy field ${key}`).toHaveProperty(key);
+    }
+  });
+
+  it('the loaded stats branch keeps cadence shape before scan-loop initialization', () => {
+    main._setScannerForTest({
+      activityLog: [],
+      monitoringStarted: Date.now(),
+      peakAgents: 0,
+      uniqueAgentNames: new Set(),
+      permissionDeniedScans: 0,
+    });
+    try {
+      expect(main.getStats().scanCadence).toEqual({
+        skippedProcessTicks: 0,
+        lastSkippedAt: null,
+        maxProcessGapMs: null,
+      });
+    } finally {
+      main._setScannerForTest(null);
+    }
+  });
+
+  it('carries nonzero audit delivery in both normal stats branches', () => {
+    const delivery = { droppedEntries: 2, bufferDepth: 3, writeFailed: true };
+    main._setAuditForTest({ getDeliveryStatus: () => ({ ...delivery }) });
+    try {
+      expect(main.getStats().auditDelivery).toEqual(delivery);
+      main._setScannerForTest({
+        activityLog: [],
+        monitoringStarted: Date.now(),
+        peakAgents: 0,
+        uniqueAgentNames: new Set(),
+        permissionDeniedScans: 0,
+      });
+      expect(main.getStats().auditDelivery).toEqual(delivery);
+    } finally {
+      main._setScannerForTest(undefined);
+      main._setAuditForTest(undefined);
+    }
+  });
+
+  it('pushes failed, overflowed, and recovered audit delivery without a scan', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'Date'] });
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-audit-live-'));
+    const auditDir = path.join(tmpDir, 'audit-logs');
+    const send = vi.fn();
+    const logError = vi.spyOn(operationalLogger, 'error').mockImplementation(() => {});
+    try {
+      main._setAuditForTest(auditLogger);
+      main._setMainWindowForTest({ isDestroyed: () => false, webContents: { send } });
+      auditLogger.init({
+        ...main._auditInitOptionsForTest(tmpDir),
+        bufferCap: 2,
+        loadSqlite: () => null,
+      });
+      await auditLogger._awaitIndexForTest();
+      vi.advanceTimersByTime(1000);
+      expect(send).toHaveBeenCalledWith(
+        'stats-update',
+        expect.objectContaining({
+          auditDelivery: { droppedEntries: 0, bufferDepth: 0, writeFailed: false },
+        }),
+      );
+      send.mockClear();
+
+      expect(path.dirname(auditDir)).toBe(tmpDir);
+      fs.rmSync(auditDir, { recursive: true, force: true });
+      auditLogger.log('file-access', { agent: 'PRIVATE_AGENT_CANARY' });
+      auditLogger.flush();
+      vi.advanceTimersByTime(1000);
+      expect(send).toHaveBeenCalledOnce();
+      expect(send.mock.calls[0][0]).toBe('stats-update');
+      expect(send.mock.calls[0][1].auditDelivery).toEqual({
+        droppedEntries: 0,
+        bufferDepth: 1,
+        writeFailed: true,
+      });
+      expect(JSON.stringify(send.mock.calls)).not.toContain('PRIVATE_AGENT_CANARY');
+
+      send.mockClear();
+      auditLogger.log('file-access', { agent: 'B' });
+      auditLogger.log('file-access', { agent: 'C' });
+      vi.advanceTimersByTime(1000);
+      expect(send).toHaveBeenCalledOnce();
+      expect(send.mock.calls[0][1].auditDelivery).toEqual({
+        droppedEntries: 1,
+        bufferDepth: 2,
+        writeFailed: true,
+      });
+
+      send.mockClear();
+      fs.mkdirSync(auditDir, { recursive: true });
+      auditLogger.flush();
+      vi.advanceTimersByTime(1000);
+      expect(send).toHaveBeenCalledOnce();
+      expect(send.mock.calls[0][1].auditDelivery).toEqual({
+        droppedEntries: 1,
+        bufferDepth: 0,
+        writeFailed: false,
+      });
+
+      send.mockClear();
+      main._setMainWindowForTest(undefined);
+      auditLogger.log('file-access', { agent: 'D' });
+      vi.advanceTimersByTime(1000);
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      auditLogger.shutdown();
+      main._setMainWindowForTest?.(undefined);
+      main._setAuditForTest(undefined);
+      logError.mockRestore();
+      vi.useRealTimers();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('delivers a nonzero cadence snapshot on both stats branches', () => {
+    const cadence = {
+      skippedProcessTicks: 2,
+      lastSkippedAt: 1_700_000_000_000,
+      maxProcessGapMs: 40000,
+    };
+    main._setScanLoopForTest({ getScanCadence: () => ({ ...cadence }) });
+    try {
+      expect(main.getStats().scanCadence).toEqual(cadence);
+      main._setScannerForTest({
+        activityLog: [],
+        monitoringStarted: Date.now(),
+        peakAgents: 0,
+        uniqueAgentNames: new Set(),
+        permissionDeniedScans: 0,
+      });
+      expect(main.getStats().scanCadence).toEqual(cadence);
+    } finally {
+      main._setScannerForTest(null);
+      main._setScanLoopForTest(undefined);
+    }
+  });
+});

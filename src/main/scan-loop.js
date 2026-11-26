@@ -1,0 +1,1470 @@
+/**
+ * @file scan-loop.js
+ * @description Periodic scan intervals, staggered startup, and event dedup
+ *   for process, file-handle, and network scanning. Extracted from main.js.
+ * @since v0.3.0
+ */
+'use strict';
+
+const { randomUUID } = require('node:crypto');
+const sessionTracker = require('./session-tracker');
+const ideExtensionDetector = require('./ide-extension-detector');
+const resourceMonitor = require('./resource-monitor');
+const { createResourceSampler } = require('./resource-sampler');
+const resourceSampler = createResourceSampler((targets) =>
+  resourceMonitor.getResourcesForPids(targets),
+);
+let resourceScanGeneration = 0;
+const tokenTracker = require('./token-tracker');
+const { collectTokenCosts, getTokenCostDelivery } = require('./token-cost-collector');
+const blocklist = require('./blocklist');
+const { EVIDENCE, makeAttribution } = require('./attribution');
+const { projectToolContext, toolContextKey } = require('./tool-context-record');
+const { projectAuditIdentity } = require('./audit-observation-identity');
+const { identify } = require('./process-identity');
+const { STARTUP_MS, WARMUP_MS, warmupProcessSchedule } = require('./scan-schedule');
+const FILE_EVENT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+
+let scanInterval = null;
+let fileScanInterval = null;
+let netInterval = null;
+let hotReadInterval = null;
+let wslInventoryInterval = null;
+const WSL_INVENTORY_INTERVAL_MS = 30000;
+/**
+ * Fast hot read-detect cadence (win32 RM only): ~10s, vs the 30s full file scan.
+ * Shrinks the read-blind window on the crown-jewel secret dirs (HOT_DIRS). 10s is
+ * the safe `-TypeDefinition` cadence (no precompiled-DLL spawn optimization).
+ * @type {number}
+ */
+const HOT_READ_INTERVAL_MS = 10000;
+/** @type {Object} Injected dependencies */
+let deps = {};
+/** @type {{ollama: {running: boolean, models: string[]}, lmstudio: {running: boolean, models: string[]}}} */
+let latestLocalModels = {
+  ollama: { running: false, models: [] },
+  lmstudio: { running: false, models: [] },
+};
+// Suppress equivalent observations of one stamped instance within 30s; track repeats.
+// F-E03: never key on display name / PID / empty agent (cross-instance + unattributed collapse).
+const eventDedupMap = new Map();
+const auditIdentities = new WeakMap();
+// Conservative lower bound: a sweep cannot remove anything before this time is 60s old.
+let oldestEventDedupSentAt = Infinity;
+/** Dedup window for equivalent observations of one instance and path (ms). */
+const FILE_EVENT_DEDUP_WINDOW_MS = 30000;
+let activeScanCount = 0;
+let _lastTriggeredNetScan = 0;
+// C-02: reentrancy guard — block overlapping doProcessScan runs so a slow scan
+// can't be clobbered by the next interval tick (last-writer-wins on the snapshot).
+let processScanRunning = false;
+// Planned timer spacing, not evidence of a successful scan. The renderer binds
+// this bound to a reliable batch; stats-only deliveries never renew its age.
+let maxProcessGapMs = null;
+// A slow scan can span interval ticks. Count the scheduled observations that
+// could not start; this is cadence evidence, not a count of missed events.
+let skippedProcessTicks = 0;
+let lastSkippedAt = null;
+// A network poll may overlap process enumeration or the asynchronous identity
+// stamp. The old published list is not a trustworthy scope during that interval.
+let networkScopePending = false;
+// Increment before every process observation, including one that republishes the
+// same array. Weak PID/millisecond identities cannot survive that boundary.
+let networkScopeRevision = 0;
+// Unlike the per-process-pass revision, this invalidates even strong witnesses
+// across stop/reinit; old promises must not deliver into a new monitoring run.
+let networkScopeLifetime = 0;
+// One replacement scan for an in-flight poll invalidated by a newer process
+// observation. The retry waits for identity stamping and a reliable population.
+let networkRescanQueued = false;
+// One audit pair per continuous loss of the process population. Reset by init(),
+// not by each scan or timer restart; a paused loop has not observed a recovery.
+let processPopulationUnavailable = false;
+// One audit pair per continuous failure of the network provider. Skipped scans
+// cannot prove recovery; only init() resets this latch.
+let networkProviderUnavailable = false;
+
+/**
+ * Record only a provider-observed population transition, before session reconcile.
+ * A fixed cause/state pair describes the evidence gap without copying the provider
+ * error, process list or any agent identity into the audit journal. The audit logger
+ * buffers writes; flush is an immediate best-effort attempt, not a durability promise
+ * if storage remains unavailable.
+ * @param {boolean} reliable
+ * @param {{log: Function, flush?: Function}} audit
+ * @returns {void}
+ * @since v0.16.0-alpha
+ */
+function auditProcessPopulationTransition(reliable, audit) {
+  const unavailable = !reliable;
+  if (unavailable === processPopulationUnavailable) return;
+  audit.log('observation-gap', {
+    agent: '',
+    pid: null,
+    instanceId: null,
+    action: unavailable ? 'process-population-unavailable' : 'process-population-restored',
+    path: '',
+    severity: 'normal',
+    attribution: null,
+    extra: { cause: 'process-enumeration', state: unavailable ? 'unavailable' : 'restored' },
+  });
+  processPopulationUnavailable = unavailable;
+  audit.flush?.();
+}
+
+/**
+ * Record only a direct network-provider rejection or fulfillment, with fixed
+ * codes and no connection, agent, endpoint or provider-error data.
+ * @param {boolean} unavailable
+ * @param {{log: Function, flush?: Function}} audit
+ * @returns {void}
+ * @since v0.16.0-alpha
+ */
+function auditNetworkProviderTransition(unavailable, audit) {
+  if (unavailable === networkProviderUnavailable) return;
+  audit.log('observation-gap', {
+    agent: '',
+    pid: null,
+    instanceId: null,
+    action: unavailable ? 'network-provider-unavailable' : 'network-provider-restored',
+    path: '',
+    severity: 'normal',
+    attribution: null,
+    extra: { cause: 'network-provider', state: unavailable ? 'unavailable' : 'restored' },
+  });
+  networkProviderUnavailable = unavailable;
+  audit.flush?.();
+}
+
+/** @param {boolean} entering — true when scan starts, false when ends @since v0.4.0 */
+function updateScanStatus(entering) {
+  activeScanCount += entering ? 1 : -1;
+  if (deps.sendToRenderer) {
+    deps.sendToRenderer('scan-status', { scanning: activeScanCount > 0 });
+  }
+}
+
+/**
+ * Dedup equivalent file observations by stamped process instance and file path.
+ *
+ * Equivalence also requires the same action, classification and attribution evidence.
+ * A stronger or different observation must reach audit and sequence consumers even
+ * within 30s. Display name and PID must not define the key (F-E03).
+ *
+ * Unattributed (`instanceId` null/empty): bypass instance-scoped dedup entirely —
+ * do not use `null|file` / `''|file` (that collapses independent observations).
+ *
+ * @param {Object} ev
+ * @returns {Object|null}
+ * @since v0.3.0
+ */
+function dedupFileEvent(ev, sensor = 'file-watch') {
+  // The security pipeline receives sensitive observations before display dedup.
+  // Give every ingress observation an identity before that admission.
+  auditIdentities.delete(ev);
+  try {
+    if (typeof ev.eventId !== 'string' || !FILE_EVENT_ID.test(ev.eventId))
+      ev.eventId = randomUUID();
+    const identity = projectAuditIdentity(deps.prepareFileObservation?.(ev));
+    if (identity) auditIdentities.set(ev, identity);
+  } catch {
+    // Live-custody failure must not prevent an audit admission.
+  }
+  if (ev.toolContext !== undefined) ev.toolContext = projectToolContext(ev.toolContext);
+  // Audit admission precedes live display/sequence dedup. Historical delivery
+  // must not alter which observations the live sequence state machine consumes.
+  if (ev.sensitive === true && deps.securityEvents) logAuditForFile(ev, true, sensor);
+  const instanceId =
+    typeof ev.instanceId === 'string' && ev.instanceId.length > 0 ? ev.instanceId : null;
+  // F-E03: no genuine process key → no shared process bucket.
+  if (instanceId === null) {
+    if (ev.repeatCount == null) ev.repeatCount = 1;
+    return ev;
+  }
+  const contextKey = toolContextKey(ev.toolContext);
+  if (contextKey === null) {
+    if (ev.repeatCount == null) ev.repeatCount = 1;
+    return ev;
+  }
+  // Evidence order carries no meaning; copy before sorting so the audit record is untouched.
+  const attribution = ev.attribution;
+  const evidence = Array.isArray(attribution?.evidence)
+    ? [...new Set(attribution.evidence)].sort()
+    : (attribution?.evidence ?? null);
+  const key = JSON.stringify([
+    instanceId,
+    typeof ev.createTime100ns === 'string' ? ev.createTime100ns : null,
+    ev.file,
+    ev.action,
+    ev.sensitive,
+    ev.selfAccess,
+    ev.reason,
+    ev.source,
+    ev.category,
+    attribution?.status,
+    evidence,
+    contextKey,
+  ]);
+  const now = Date.now();
+  const prev = eventDedupMap.get(key);
+  if (prev && now >= prev.lastSent && now - prev.lastSent < FILE_EVENT_DEDUP_WINDOW_MS) {
+    prev.count++;
+    return null;
+  }
+  ev.repeatCount = prev ? prev.count : 1;
+  eventDedupMap.set(key, { lastSent: now, count: 1 });
+  oldestEventDedupSentAt = Math.min(oldestEventDedupSentAt, now);
+  if (eventDedupMap.size > 500 && now - oldestEventDedupSentAt > 60000) {
+    let oldestRemaining = Infinity;
+    for (const [k, v] of eventDedupMap) {
+      if (now - v.lastSent > 60000) eventDedupMap.delete(k);
+      else oldestRemaining = Math.min(oldestRemaining, v.lastSent);
+    }
+    oldestEventDedupSentAt = oldestRemaining;
+  }
+  if (eventDedupMap.size > 1000) {
+    eventDedupMap.clear();
+    oldestEventDedupSentAt = Infinity;
+  }
+  return ev;
+}
+
+/** @param {Object} ev @param {boolean} [securityAdmission] @param {string} [sensor] @since v0.3.0 */
+function logAuditForFile(ev, securityAdmission = false, sensor = 'file-watch') {
+  const type =
+    ev.reason && ev.reason.startsWith('AI agent config') ? 'config-access' : 'file-access';
+  const identity = auditIdentities.get(ev);
+  const details = {
+    agent: ev.agent,
+    pid: ev.pid ?? null,
+    // Carried from the event, never re-derived: null means the event itself has no
+    // key (unattributed, or an owner that was never stamped).
+    instanceId: ev.instanceId ?? null,
+    ...(typeof ev.createTime100ns === 'string' ? { createTime100ns: ev.createTime100ns } : {}),
+    action: ev.action,
+    path: ev.file,
+    severity: ev.sensitive ? 'sensitive' : 'normal',
+    // The FULL {status, evidence[]} at top level. v0 put only the derived status string
+    // in `details` and lost the evidence array, on the belief that a changed field set
+    // would break the hash chain. It does not: verifyChain rebuilds each record's
+    // preimage from that record's own fields, so v0 and v1 lines coexist in one file.
+    attribution: ev.attribution ?? null,
+    ...(identity ? { auditIdentity: identity } : {}),
+    ...(ev.toolContext === undefined ? {} : { toolContext: projectToolContext(ev.toolContext) }),
+  };
+  if (ev.sensitive === true && deps.securityEvents) {
+    if (!securityAdmission) return;
+    deps.securityEvents.push({
+      type,
+      sensor,
+      timestamp: Number.isSafeInteger(ev.timestamp) ? ev.timestamp : Date.now(),
+      details: { ...details, repeatCount: ev.repeatCount ?? 1 },
+    });
+  } else deps.audit.log(type, details);
+}
+
+/**
+ * Offer one live carrier to the sequence engine — the taps of
+ * docs/roadmap/sequence-rules.md §5, fed the SAME record the audit / baseline call
+ * beside each tap receives, after the existing dedup. The engine is an injected
+ * collaborator like every other one here (`deps.sequenceEngine`, wired in main.js);
+ * absent — a test that stubs only the collaborator its assertions are about — the tap
+ * is a no-op and the scan runs as before.
+ *
+ * Deliberately no try/catch: `ingest` carries its own error boundary
+ * (sequence-engine.js — an unrecognised shape or a throwing matcher is counted and
+ * dropped, never rethrown), and a second boundary here would hide a defect of the
+ * first. Records without an `instanceId` (file and network events in Schema v1) are
+ * passed through unfiltered: the engine's null policy skips and COUNTS them, and a
+ * pre-filter here would turn that count into silence (roadmap §4).
+ * @param {Object} carrier - a `FileEvent`, a `NetworkConnection` or a session record.
+ * @returns {void}
+ * @since v0.14.0
+ */
+function ingestSequence(carrier) {
+  const engine = deps.sequenceEngine;
+  if (engine && typeof engine.ingest === 'function') engine.ingest(carrier);
+}
+
+/**
+ * The score the sequence engine still holds for one instance (roadmap §5 "Visibility"),
+ * or 0 with no engine or an engine without `scoreFor` — the same optional-collaborator
+ * shape as {@link ingestSequence}, so a test that stubs only the taps sees the anomaly
+ * scores exactly as the detector gave them.
+ * @param {string} instanceId
+ * @returns {number}
+ * @since v0.14.0
+ */
+function sequenceScoreFor(instanceId) {
+  const engine = deps.sequenceEngine;
+  return engine && typeof engine.scoreFor === 'function' ? engine.scoreFor(instanceId) : 0;
+}
+
+function stopScanIntervals() {
+  deps.onLivePopulationIntervalsStopped?.();
+  maxProcessGapMs = null;
+  if (wslInventoryInterval) {
+    clearInterval(wslInventoryInterval);
+    wslInventoryInterval = null;
+  }
+  deps.cancelWslInventory?.();
+  deps.cancelDockerDiscovery?.();
+  deps.cancelPodmanDiscovery?.();
+  networkScopePending = true;
+  networkScopeRevision++;
+  networkScopeLifetime++;
+  networkRescanQueued = false;
+  deps.sequenceEngine?.observePopulation?.([], false);
+  resourceScanGeneration++;
+  resourceSampler.invalidate();
+  for (const t of startupTimers) clearTimeout(t);
+  startupTimers = [];
+  if (warmupTimer) {
+    clearTimeout(warmupTimer);
+    warmupTimer = null;
+  }
+  if (scanInterval) {
+    clearInterval(scanInterval);
+    scanInterval = null;
+  }
+  if (fileScanInterval) {
+    clearInterval(fileScanInterval);
+    fileScanInterval = null;
+  }
+  if (netInterval) {
+    clearInterval(netInterval);
+    netInterval = null;
+  }
+  if (hotReadInterval) {
+    clearInterval(hotReadInterval);
+    hotReadInterval = null;
+  }
+}
+
+/** Reason recorded by every surface that refuses to observe an untrusted population. */
+const SCOPE_UNAVAILABLE = 'process-observation-unavailable';
+
+/**
+ * Reason the file read leaf records when a trusted population is empty: a scoped
+ * success, the same string `doNetworkScan` hands the network leaf (§10 B4).
+ */
+const CONFIRMED_ZERO = 'confirmed-zero-agents';
+
+/** Primitive owner fields frozen before an asynchronous sensor query. */
+function ownerScopeRow(a) {
+  return [
+    a.pid,
+    a.instanceId ?? null,
+    a.instanceIdSource ?? null,
+    a.generationWitness ?? null,
+    a.generationWitnessSource ?? null,
+    a.agent ?? null,
+    a.parentEditor ?? null,
+    a.cwd ?? null,
+    a.category ?? null,
+    a.process ?? null,
+  ];
+}
+
+/** The network owner population, captured before TCP awaits. */
+function networkOwnerScope(agents) {
+  return agents.filter((a) => Number.isInteger(a.pid) && a.pid > 0).map(ownerScopeRow);
+}
+
+/** A precise generation witness can survive a new publication of the same process. */
+function hasStrongNetworkWitness(row) {
+  return (
+    typeof row[3] === 'string' &&
+    row[3].length > 0 &&
+    (row[4] === 'sequence' || row[4] === 'createTime100ns')
+  );
+}
+
+/** Start one queued replacement only after the new process scope is usable. */
+function flushQueuedNetworkRescan() {
+  if (!networkRescanQueued || networkScopePending) return;
+  const { network, scanner, logger } = deps;
+  try {
+    if (network.isNetworkScanRunning() || !isPopulationReliable(scanner)) return;
+    networkRescanQueued = false;
+    // This replacement is the process-triggered scan for the current scope;
+    // doProcessScan must not start a duplicate when it reaches its normal trigger.
+    _lastTriggeredNetScan = Date.now();
+    doNetworkScan();
+  } catch {
+    logger.error('main', 'Network scan scheduling failed', { error: 'network-schedule-failed' });
+  }
+}
+
+/**
+ * Whether the agent population may be used as an observation scope right now.
+ *
+ * Reads the ProcessCapabilities contract (design §3) and NOTHING else — not the
+ * plane enum, not `agents.length`. The two older APIs are kept as an ordered
+ * fallback so a caller that injected only part of the scanner surface keeps working.
+ *
+ * A scanner exposing none of the three is treated as reliable: that is the shape a
+ * collaborator stub takes, and defaulting to "unknown" there would silently disable
+ * every sensor rather than gate a stale list.
+ * @param {Object|undefined} scanner
+ * @returns {boolean}
+ * @since 0.12.0
+ */
+function isPopulationReliable(scanner) {
+  if (!scanner) return true;
+  if (typeof scanner.getProcessCapabilities === 'function') {
+    return scanner.getProcessCapabilities().populationReliable === true;
+  }
+  if (typeof scanner.isProcessPopulationReliable === 'function') {
+    return scanner.isProcessPopulationReliable() === true;
+  }
+  if (typeof scanner.getProcessSensorHealth === 'function') {
+    return scanner.getProcessSensorHealth().state === 'HEALTHY';
+  }
+  return true;
+}
+
+/**
+ * Whether this tick's identity keys are degraded relative to what the platform can
+ * observe — a birth-time platform whose process-table observation produced nothing.
+ * See process-scanner.js `isIdentityDegraded` for why that is not the same question
+ * as `identityQuality === 'unknown'`.
+ *
+ * A scanner that does not publish the question is NOT degraded, and that default is
+ * the opposite of a guess: this flag freezes every session on the machine, so a
+ * collaborator stub that cannot answer must never be able to trigger it. The
+ * population gate above defaults the same way and for the same reason.
+ * @param {Object|undefined} scanner
+ * @returns {boolean}
+ * @since 0.12.0
+ */
+function isIdentityDegraded(scanner) {
+  if (!scanner || typeof scanner.isIdentityDegraded !== 'function') return false;
+  return scanner.isIdentityDegraded() === true;
+}
+
+/**
+ * Read per-PID birth-time loss from the same stamped pass, if the scanner supports it.
+ * @param {Object|undefined} scanner
+ * @param {Array<Object>} agents
+ * @returns {Set<number>}
+ * @since 0.17.0
+ */
+function getUnwitnessedPids(scanner, agents) {
+  const pids = scanner?.getUnwitnessedPids?.(agents);
+  return pids instanceof Set ? pids : new Set();
+}
+
+function doNetworkScan() {
+  const { network, baselines, audit, logger, getLatestAgents, sendToRenderer, scanner } = deps;
+  const agents = getLatestAgents();
+  if (network.isNetworkScanRunning()) return;
+  // G′: the stale-population gate, evaluated BEFORE cardinality. After a hard
+  // enumeration failure `setAgents` never ran, so `latestAgents` still holds the
+  // previous population — querying the TCP table for those pids would resolve
+  // dead/recycled pids and stamp OS_TCP_OWNER_PID (`confirmed`) off an agent record
+  // the process sensor cannot vouch for. The list is NOT cleared (§2.3 — clearing
+  // re-creates B-S01); the consumer is gated instead.
+  if (networkScopePending || !isPopulationReliable(scanner)) {
+    // Retry when the next trustworthy, fully annotated process scope is ready,
+    // even if its population is unchanged. Repeated skipped polls share one retry.
+    networkRescanQueued = true;
+    logger.debug('scan', 'network-skip', { reason: SCOPE_UNAVAILABLE, agents: agents.length });
+    if (typeof network.noteNetworkSkip === 'function') {
+      network.noteNetworkSkip(SCOPE_UNAVAILABLE);
+    }
+    return;
+  }
+  // A regular poll on the recovered scope also satisfies a queued replacement.
+  networkRescanQueued = false;
+  // B-S08: agent-scoped network sensor — a reliable but empty population still skips
+  // the TCP provider, and that skip is a scoped SUCCESS, not a degradation.
+  if (agents.length === 0) {
+    logger.debug('scan', 'network-skip', { reason: 'confirmed-zero-agents', agents: 0 });
+    if (typeof network.noteNetworkSkip === 'function') {
+      network.noteNetworkSkip('confirmed-zero-agents');
+    }
+    return;
+  }
+  const capturedScope = networkOwnerScope(agents);
+  const capturedRevision = networkScopeRevision;
+  const capturedLifetime = networkScopeLifetime;
+  const hasWeakOwner = capturedScope.some((row) => !hasStrongNetworkWitness(row));
+  const isScopeCurrent = () => {
+    try {
+      if (
+        networkScopeLifetime !== capturedLifetime ||
+        networkScopePending ||
+        !isPopulationReliable(scanner)
+      )
+        return false;
+      const currentAgents = getLatestAgents();
+      if (hasWeakOwner && (currentAgents !== agents || networkScopeRevision !== capturedRevision))
+        return false;
+      const currentScope = networkOwnerScope(currentAgents);
+      return (
+        currentScope.length === capturedScope.length &&
+        currentScope.every((row, i) => row.every((value, j) => value === capturedScope[i][j]))
+      );
+    } catch {
+      // A failed health or population read cannot validate an owner claim.
+      return false;
+    }
+  };
+  network.setNetworkScanRunning(true);
+  const t0 = performance.now();
+  network
+    .scanNetworkConnections(agents, { isScopeCurrent })
+    .then(
+      (connections) => {
+        // This fulfillment proves the provider recovered even if a later
+        // baseline, audit write or renderer delivery fails.
+        auditNetworkProviderTransition(false, audit);
+        // A process scan can publish or restamp after the monitor's final check
+        // but before this continuation. Never publish a partial/empty stale scope.
+        if (connections === null || !isScopeCurrent()) {
+          if (connections !== null) network.noteNetworkSkip?.('population-changed-during-scan');
+          if (
+            networkScopeLifetime === capturedLifetime &&
+            networkScopeRevision !== capturedRevision
+          )
+            networkRescanQueued = true;
+          logger.debug('scan', 'network-skip', {
+            reason: 'population-changed-during-scan',
+            agents: agents.length,
+          });
+          return;
+        }
+        deps.setLatestNetConnections(connections);
+        for (const conn of connections) {
+          if (conn.httpUnencrypted) {
+            logger.warn(
+              'network',
+              'Unencrypted HTTP connection detected: ' + (conn.domain || conn.remoteIp),
+            );
+          }
+          // Key first, name second — both from the connection this scan matched. A socket
+          // that matched no agent carries no key and enters no baseline, which also retires
+          // the phantom `sessionData['']` bucket the empty name used to create.
+          baselines.recordNetworkEndpoint(
+            conn.instanceId,
+            conn.agent,
+            conn.remoteIp,
+            conn.remotePort,
+          );
+          if (conn.toolContext !== undefined)
+            conn.toolContext = projectToolContext(conn.toolContext);
+          const connectionAudit = {
+            agent: conn.agent,
+            pid: conn.pid ?? null,
+            // Carried from the connection, never re-resolved from its pid: null means the
+            // socket matched no agent in that scan.
+            instanceId: conn.instanceId ?? null,
+            action: conn.state,
+            ...(conn.toolContext === undefined ? {} : { toolContext: conn.toolContext }),
+            path: `${conn.remoteIp}:${conn.remotePort}`,
+            severity: conn.flagged ? 'high' : 'normal',
+            // The owner came from the OS connection table and was matched inside this same
+            // call, so it is `confirmed` — the same strength as a handle-scan pid. An
+            // unmatched connection keeps no agent and says so.
+            attribution:
+              conn.attribution ??
+              makeAttribution([conn.agent ? EVIDENCE.OS_TCP_OWNER_PID : EVIDENCE.NO_OWNER_MATCH]),
+            extra: {
+              domain: conn.domain,
+              flagged: conn.flagged,
+              ...(typeof conn.remoteIp === 'string' ? { remoteIp: conn.remoteIp } : {}),
+              ...(Number.isInteger(conn.remotePort) ? { remotePort: conn.remotePort } : {}),
+              ...(typeof conn.state === 'string' ? { state: conn.state } : {}),
+              ...(typeof conn.verdict === 'string' ? { verdict: conn.verdict } : {}),
+              ...(typeof conn.verdictReason === 'string'
+                ? { verdictReason: conn.verdictReason }
+                : {}),
+              ...(conn.localIp != null || conn.localPort != null
+                ? { localIp: conn.localIp ?? null, localPort: conn.localPort ?? null }
+                : {}),
+            },
+          };
+          if (conn.agent && deps.securityEvents)
+            deps.securityEvents.push({
+              type: 'network-connection',
+              sensor: 'network',
+              timestamp: Number.isSafeInteger(conn.timestamp) ? conn.timestamp : Date.now(),
+              details: connectionAudit,
+            });
+          else audit.log('network-connection', connectionAudit);
+          // Tap 3 (roadmap §5): the connection object itself, keyless ones included.
+          ingestSequence(conn);
+        }
+        sendToRenderer('network-update', connections);
+        logger.debug('scan', 'network', {
+          ms: Math.round(performance.now() - t0),
+          connections: connections.length,
+        });
+      },
+      (err) => {
+        // Provider-observation ownership boundary (Stage-1 step A). This rejection handler
+        // is attached to `scanNetworkConnections` ITSELF, so it sees provider rejections
+        // only — a throw raised in the fulfilment continuation above (baselines, audit
+        // write, renderer send) cannot reach it and therefore cannot rewrite a successful
+        // TCP observation into FAILED.
+        //
+        // B-S05: provider failure health is owned by network-monitor.scanNetworkConnections
+        // (markFailed before rethrow). Fallback note only if the inject path omitted it.
+        try {
+          if (
+            typeof network.noteNetworkScanHardFailure === 'function' &&
+            typeof network.getNetworkSensorHealth === 'function' &&
+            network.getNetworkSensorHealth().state !== 'FAILED'
+          ) {
+            network.noteNetworkScanHardFailure(err);
+          }
+        } finally {
+          // Health gets its existing chance even if audit storage fails; a
+          // throwing health fallback cannot erase the provider-gap attempt.
+          auditNetworkProviderTransition(true, audit);
+        }
+        throw err;
+      },
+    )
+    .catch(() => {
+      // Reached by BOTH a provider rejection (rethrown above, health already owned) and a
+      // downstream continuation throw (health deliberately untouched). Log only: the
+      // `network` leaf names the TCP observation, and delivery/persistence failures belong
+      // to the pipeline axis, which no leaf here represents.
+      logger.error('main', 'Network scan failed', { error: 'network-scan-failed' });
+    })
+    .finally(() => {
+      network.setNetworkScanRunning(false);
+      if (networkScopeLifetime === capturedLifetime) flushQueuedNetworkRescan();
+    });
+}
+
+/**
+ * Append synthetic agents that have no Windows process and so are invisible to
+ * the process scanner: editor-extension agents (Kilo Code, Cline). Reads the
+ * detector's throttled cache synchronously; directory scans run in the background.
+ * Running WSL distribution names carry no agent authority. Dedups by
+ * agent name so a real process (if any) already in the list wins.
+ *
+ * These entries are appended AFTER `enrichWithParentChains` — the process
+ * scanner's only `instanceId` stamp — so they are stamped here instead, which is
+ * what makes "every agent in scan-batch carries an instanceId" true.
+ *
+ * The identity is derived from the DISPLAY name, with `process` deliberately
+ * withheld from `identify()`. For these detectors `process` is not the agent: the
+ * IDE detector emits the editor host exe (`code.exe` for BOTH Kilo Code and
+ * Cline),
+ * so keying on it would collapse two distinct pid-0 agents onto one synthetic
+ * key — the exact collision the synthetic space exists to prevent. The display
+ * name IS the identity here, and it is what the detector already dedups on.
+ * @param {Array} agents
+ * @param {Map<number, {name: string}>} [processMap] Fresh, reliable process snapshot
+ * @returns {void} @since v0.11.0-alpha
+ */
+function injectDetectedExternalAgents(agents, processMap) {
+  const external = ideExtensionDetector.getCachedExtensionAgents(processMap);
+  for (const ext of external) {
+    if (agents.some((a) => a.agent === ext.agent)) continue;
+    const identity = identify({ pid: ext.pid, agent: ext.agent });
+    ext.instanceId = identity.instanceId;
+    ext.instanceIdSource = identity.instanceIdSource;
+    agents.push(ext);
+  }
+}
+
+async function doProcessScan() {
+  const {
+    scanner,
+    procUtil,
+    watcher,
+    anomaly,
+    audit,
+    tray,
+    logger,
+    sendToRenderer,
+    getStats,
+    getResourceUsage,
+    setAgents,
+  } = deps;
+  // Early-return BEFORE updateScanStatus(true): a blocked re-entrant call must not
+  // bump activeScanCount, whose only decrement lives in the finally below.
+  if (processScanRunning) {
+    deps.onLivePopulationScanSkipped?.();
+    skippedProcessTicks++;
+    lastSkippedAt = Date.now();
+    // The in-flight scan may remain pending, so publish the cadence change now.
+    deps.statsUpdateBatcher?.pushLazy?.(getStats);
+    return;
+  }
+  processScanRunning = true;
+  networkScopePending = true;
+  networkScopeRevision++;
+  const resourceGeneration = resourceScanGeneration;
+  const lifecycleGeneration = deps.beginLivePopulationScan?.();
+  let networkIdentityReady = false;
+  updateScanStatus(true);
+  const t0 = performance.now();
+  try {
+    // Runtime metadata has its own bounded refresh and never owns host-process
+    // identity. Each collaborator is isolated so a synchronous throw or rejected
+    // CLI query cannot delay the other runtime or this population pass.
+    for (const refresh of [deps.refreshDockerDiscovery, deps.refreshPodmanDiscovery]) {
+      try {
+        if (deps.isMonitoringPaused?.() !== true) Promise.resolve(refresh?.()).catch(() => {});
+      } catch {
+        // An optional discovery collaborator cannot invalidate another observation.
+      }
+    }
+    // Stage-1 step A: this inner try encloses scanProcesses, whose provider call is
+    // followed by catalog matching and tracking callbacks. Existing health handling
+    // marks any rejection of that call; only errors tagged inside the scanner's
+    // provider boundary may produce a process-population outage audit record. A throw
+    // at or after setAgents below cannot enter this catch. The original rejection is
+    // rethrown so the outer catch keeps the single error log.
+    // B5 straddle witness: a SNAPSHOT of the observation gap taken before the provider
+    // await, compared with a second one after the identity stamp below. `suspendCount`
+    // moving between the two means the OS slept while this tick's evidence was being
+    // gathered — the list may describe the machine before the sleep, and every clock
+    // read from here on is after it. Deliberately not a live read of the module's
+    // state: the honest first tick AFTER resume also finds the flag armed, and a live
+    // read would freeze that tick too, which is the one that must clear it.
+    // Optional collaborator, same shape as `sequenceEngine`: absent, nothing here runs.
+    const gapBefore = deps.observationGap ? deps.observationGap.snapshot() : null;
+    let result;
+    try {
+      result = await scanner.scanProcesses({ sharedObservation: true });
+    } catch (err) {
+      // B-S02: scanProcesses rejected. EPERM inside the provider normally returns
+      // reliable:false instead. Compatibility leaves latestAgents unchanged here;
+      // setAgents has not run. The provenance predicate excludes post-provider
+      // catalog/track callback failures from the new audit marker.
+      if (scanner && typeof scanner.noteProcessScanHardFailure === 'function') {
+        scanner.noteProcessScanHardFailure(err);
+      }
+      if (scanner?.isPopulationProviderFailure?.(err) === true) {
+        auditProcessPopulationTransition(false, audit);
+      }
+      throw err;
+    }
+    // The population provider has answered (possibly with `reliable:false`). Mark its
+    // transition here so downstream enrichment or renderer failures cannot be mistaken
+    // for provider outages, and restoration precedes any inferred session exit.
+    auditProcessPopulationTransition(result.reliable !== false, audit);
+    // Capture only the preceding publication's own stamps before setAgents replaces
+    // it. This local snapshot is compared with the new pass after enrichment; it is
+    // never a source of birth time for the new agents.
+    const publishedAgents = deps.getLatestAgents?.();
+    const previousAgents = Array.isArray(publishedAgents)
+      ? publishedAgents.map((agent) => ({
+          pid: agent.pid,
+          instanceId: agent.instanceId,
+          createTime100ns: agent.createTime100ns,
+          generationWitness: agent.generationWitness,
+          generationWitnessSource: agent.generationWitnessSource,
+        }))
+      : [];
+    // Publish the fresh population before parent enrichment can await a slow OS
+    // query. Timed sensors must not keep using an older agent after PID reuse.
+    setAgents(result.agents);
+    const agents = result.agents;
+    // Process IDENTITY first. This attaches the OS birth time and the derived
+    // `instanceId`, which the session key is built from — so it MUST precede
+    // reconcile, or every session would key on a degraded `"<pid>:u"` and a
+    // recycled pid running the same executable would silently continue the dead
+    // process's session. That ordering is the correctness boundary: the fresh
+    // identity observation MUST finish before sessionTracker.reconcile below.
+    //
+    // Windows population and identity consume the same fresh observation. The map
+    // is local to this pass, including an empty failed observation; no birth time
+    // is taken from a cache and enrichment must not make a second provider call.
+    await procUtil.enrichWithParentChains(agents, {
+      forceRefresh: result.changed === true,
+      ...(result.processMap instanceof Map ? { processMap: result.processMap } : {}),
+    });
+    networkIdentityReady = true;
+    // The second half of the straddle witness — after the identity stamp, so a sleep
+    // inside `enrichWithParentChains` is caught as well as one inside the enumeration.
+    const gapStraddled =
+      gapBefore !== null && deps.observationGap.snapshot().suspendCount !== gapBefore.suspendCount;
+    // Read AFTER the identity stamp, never before. The snapshot leaf's health
+    // describes the process-table observation `enrichWithParentChains` just made;
+    // read at the top of the tick it would report the PREVIOUS pass's provider, and
+    // on the first tick a leaf that had never been written at all.
+    const identityDegraded = isIdentityDegraded(scanner);
+    const unwitnessedPids = getUnwitnessedPids(scanner, agents);
+    if (identityDegraded) {
+      // A frozen reconcile emits nothing by design, so without this line an outage
+      // is indistinguishable from a quiet machine in the log.
+      logger.debug('scan', 'session-freeze', {
+        reason: 'identity-degraded',
+        agents: agents.length,
+      });
+    } else if (unwitnessedPids.size > 0) {
+      logger.debug('scan', 'session-partial-freeze', {
+        reason: 'birth-time-unavailable',
+        affectedPids: unwitnessedPids.size,
+      });
+    } else if (gapStraddled) {
+      logger.debug('scan', 'session-freeze', {
+        reason: 'suspend-straddle',
+        agents: agents.length,
+      });
+    }
+    // Eager-enter / lazy-exit session reconciliation: an agent seen in even ONE
+    // scan logs session-start immediately, and a flickering or permission-denied
+    // scan never spawns a duplicate session. `identityDegraded` freezes the same way
+    // an unreliable scan does: when the birth-time observation is gone, every live
+    // agent's key changes without any process having started or stopped, and acting
+    // on that would report a fleet-wide exit that never happened. `gapStraddled`
+    // freezes for the third reason: the evidence predates a sleep that `now` does
+    // not, so no stamp this tick could write would be true. See session-tracker.js.
+    const reliable = result.reliable !== false;
+    const { entered, exited } = sessionTracker.reconcile(agents, {
+      reliable,
+      identityDegraded,
+      gapStraddled,
+      unwitnessedPids,
+    });
+    // The ONLY thing that clears a resumed observation gap: a tick whose reconcile was
+    // not frozen. A permission-denied enumeration, a degraded identity or a straddled
+    // tick ran, but observed nothing — the gap stays armed until something does. Placed
+    // before the audit writes below so a downstream throw cannot leave a real
+    // observation uncredited.
+    const observed = reliable && !identityDegraded && unwitnessedPids.size === 0 && !gapStraddled;
+    // The sequence engine ignores unwitnessed identities itself. Keep its witnessed
+    // peers live when one PID loses birth time, while the global gap stays armed.
+    const sequenceObserved =
+      reliable &&
+      !identityDegraded &&
+      !gapStraddled &&
+      resourceGeneration === resourceScanGeneration;
+    deps.sequenceEngine?.observePopulation?.(agents, sequenceObserved);
+    if (observed && deps.observationGap) deps.observationGap.noteObserved(Date.now());
+    // Reconcile alone decides exits. Outages/suspend produce none, so no baseline
+    // is retired without reliable evidence. Persist once for the whole exit batch.
+    const retired = exited.filter((session) => !sessionTracker.hasInstance(session.instanceId));
+    if (retired.length > 0) {
+      deps.baselines?.finalizeInstances?.(retired);
+      anomaly.forgetInstances?.(retired.map((session) => session.instanceId));
+    }
+    for (const s of entered) {
+      const enterAudit = {
+        agent: s.agent,
+        // pid and instanceId are TOP-LEVEL in v1. They were in `extra` on the belief that
+        // a changed field set would break the chain; it does not — each record's hash
+        // covers only its own fields, so v0 files stay verifiable regardless.
+        pid: s.pid,
+        instanceId: s.instanceId,
+        action: 'started',
+        path: '',
+        severity: 'normal',
+        // No attribution: this event IS the scanner's own observation that a session
+        // began. There is no owner to resolve — the agent is the event's subject, not an
+        // inferred owner — so `null` means "question does not apply", NOT "owner unknown".
+        attribution: null,
+        extra: { startTime: s.firstSeen },
+      };
+      if (deps.securityEvents)
+        deps.securityEvents.push({
+          type: 'agent-enter',
+          sensor: 'process',
+          timestamp: Number.isSafeInteger(s.firstSeen) ? s.firstSeen : Date.now(),
+          details: enterAudit,
+        });
+      else audit.log('agent-enter', enterAudit);
+      // Tap 4 (roadmap §5): the session record as session-tracker returned it — no
+      // `lastSeen` on an enter, which is how the normalizer tells the two apart.
+      ingestSequence(s);
+    }
+    for (const s of exited) {
+      audit.log('agent-exit', {
+        agent: s.agent,
+        pid: s.pid,
+        instanceId: s.instanceId,
+        action: 'exited',
+        path: '',
+        severity: 'normal',
+        // Same reasoning as agent-enter: the session tracker's own conclusion, no owner
+        // resolution step to describe.
+        attribution: null,
+      });
+      // Tap 4 (roadmap §5): `lastSeen` present ⇒ `agent-exit`, which the engine first
+      // offers as a step and then uses to close the instance's open states.
+      ingestSequence(s);
+    }
+    // A partial identity pass can prune witnessed peers, but the unknown PID
+    // cannot prove its former holder disappeared. A full outage proves neither.
+    if (reliable && !identityDegraded && !gapStraddled)
+      watcher.pruneKnownHandles(agents, { preservePids: unwitnessedPids, previousAgents });
+    procUtil.annotateHostApps(agents);
+    // Same `forceRefresh` contract as the identity stamp at the top of this scan:
+    // a pid new to the set must not be annotated out of a cached entry belonging
+    // to the dead process that held that pid. `cwd` is the field the renderer's
+    // instance key is built from and the one CWD_CONTAINMENT attribution matches
+    // on, so a stale value there poisons both.
+    // The local runtime HTTP probes are independent of CWD. Start them before
+    // the OS query, but defer every agents/latestLocalModels mutation until CWD
+    // settles. Handle early rejection now so a slow/failed CWD cannot leave an
+    // unhandled probe rejection behind.
+    const modelProbe = probeLocalModels().then(
+      (models) => ({ models }),
+      (error) => ({ error }),
+    );
+    await procUtil.annotateWorkingDirs(agents, { forceRefresh: result.changed === true });
+    // Surface extension-only (Kilo/Cline) agents
+    // before the batch so the renderer sees them; cache-backed, non-blocking.
+    // CWD lookup can also cross system sleep, after the session's earlier witness.
+    // Check freshness again before the IDE cache might accept the process map.
+    const snapshotCurrent =
+      gapBefore === null || deps.observationGap.snapshot().suspendCount === gapBefore.suspendCount;
+    injectDetectedExternalAgents(
+      agents,
+      result.reliable === true && snapshotCurrent ? result.processMap : undefined,
+    );
+    // Local LLM runtimes (Ollama / LM Studio) MUST be attached and stamped BEFORE
+    // scan-batch. Structured clone happens at sendToRenderer — a post-batch push
+    // never reaches the UI, and unstamped synthetics poison instance-keyed maps
+    // (baselines, risk, ack). Stamp is identify() space 2, same as injectDetectedExternalAgents.
+    const modelResult = await modelProbe;
+    if ('error' in modelResult) throw modelResult.error;
+    attachLocalModels(agents, modelResult.models);
+    // The owner stamp and the fields a network connection exports are now settled.
+    // A replacement query started before CWD/host annotation could invalidate
+    // itself without another process revision to trigger a new retry.
+    if (resourceGeneration === resourceScanGeneration) {
+      networkScopePending = false;
+      flushQueuedNetworkRescan();
+    }
+    tray.updateTrayIcon();
+    const deviations = anomaly.checkDeviations();
+    if (deviations.length > 0) {
+      for (const d of deviations)
+        audit.log('anomaly-alert', {
+          agent: d.agent,
+          // A deviation is now computed from ONE INSTANCE's live session bucket
+          // (baselines.js `sessionData`, keyed on `instanceId`), so the key is a real
+          // observation the detector made and it is recorded. `pid` stays null: the
+          // detector never held a process object, and splitting the pid back out of the
+          // key would be parsing an identity instead of reading one.
+          pid: null,
+          instanceId: d.instanceId ?? null,
+          action: d.type,
+          path: '',
+          severity: 'high',
+          // `d.agent` is an INPUT to the deviation check, not the output of an attribution
+          // step. Stamping a status here would label a tautology.
+          attribution: null,
+          extra: { message: d.message, anomalyScore: d.anomalyScore },
+        });
+    }
+    // Anomaly scores are computed per INSTANCE now (baselines.js `sessionData` is keyed
+    // on `instanceId`), and go out in two shapes.
+    //
+    // `anomalyScoresByInstance` is the lossless one: one entry per live instance, under
+    // the same key that instance carries in this very batch, so a consumer can select a
+    // specific instance.
+    //
+    // `anomalyScores` stays keyed by NAME because the renderer still is: risk.ts reads
+    // `$anomalies[name]`, App.svelte prints the KEY as the agent name in its toast, and
+    // SummaryCards averages `Object.values(...)` — one union map would print
+    // `1234:1699887…` and double-count every instance. MAX, not sum or mean, is the
+    // aggregation: the name-keyed card draws the highest-risk instance as its
+    // representative (AgentPanel `_instances`), so max is the only value that matches
+    // what is on screen — a sum would invent a score no instance has, a mean would hide
+    // the one instance that is misbehaving. The information max discards is not lost, it
+    // is in `anomalyScoresByInstance`.
+    //
+    // An agent with no key scores 0 and still gets its name entry, exactly as an agent
+    // with no baseline always did — the name map's key set is unchanged.
+    //
+    // A completed sequence (roadmap §5 "Visibility") reaches the renderer on THIS value:
+    // the engine's `scoreFor(instanceId)` — 90/70/55/30 by level, held ten minutes after
+    // the last detection — is merged as max, so the existing toast threshold (50) and the
+    // risk store pick it up by instanceId with no channel of their own. Max, not sum: the
+    // two scores are two claims about the same instance, and the louder one is the one
+    // on screen.
+    const scores = Object.create(null);
+    const scoresByInstance = {};
+    for (const a of agents) {
+      const score = a.instanceId
+        ? Math.max(
+            anomaly.calculateAnomalyScore(a.instanceId).score,
+            sequenceScoreFor(a.instanceId),
+          )
+        : 0;
+      if (a.instanceId) scoresByInstance[a.instanceId] = score;
+      scores[a.agent] = Math.max(scores[a.agent] || 0, score);
+    }
+
+    // Alert-only watchlist flag (synchronous): set agent.flagged so it rides the
+    // scan-batch below. Advisory only — never stops or restricts any process (C-01:
+    // isFlagged matches the scanned agent's OWN signature + pid).
+    for (const a of agents) a.flagged = blocklist.isFlagged(a);
+
+    // Identity and population health are settled before optional readonly preparation.
+    deps.onAgentsObserved?.();
+    // This pass owns the raw process map and the identity stamps. Never publish
+    // a cached birth/context as authority during a failed/outage pass.
+    const populationCurrent = deps.onProcessScanCommitted?.({
+      agents,
+      processMap: result.processMap,
+      reliable: result.reliable === true,
+      identityDegraded,
+      gapStraddled,
+      observationComplete: observed,
+      lifecycleGeneration,
+      snapshotCurrent:
+        resourceGeneration === resourceScanGeneration &&
+        snapshotCurrent &&
+        (gapBefore === null ||
+          deps.observationGap.snapshot().suspendCount === gapBefore.suspendCount),
+    });
+    // Single batched IPC — renderer updates all stores at once
+    sendToRenderer('scan-batch', {
+      agents,
+      populationCurrent: populationCurrent === true,
+      stats: getStats(),
+      resourceUsage: getResourceUsage(),
+      anomalyScores: scores,
+      anomalyScoresByInstance: scoresByInstance,
+    });
+
+    // Token costs ride a separate channel. Pull any new measured per-PID token
+    // deltas from the feed and fold them into the tracker, then emit the full
+    // retained records and explicit archive aggregate. Runs inside this C-02-guarded scan (released only in the
+    // finally below). Retention uses confirmed session exits, including their grace
+    // window, and freezes during provider/identity outages or suspend gaps.
+    await collectTokenCosts(agents);
+    tokenTracker.compactCosts(
+      (instanceId) => sessionTracker.hasInstance(instanceId),
+      observed &&
+        resourceGeneration === resourceScanGeneration &&
+        (!gapBefore || deps.observationGap.snapshot().suspendCount === gapBefore.suspendCount),
+    );
+    sendToRenderer('token-costs', getTokenCostDelivery());
+
+    // Per-agent CPU/RAM/GPU is fetched fire-and-forget AFTER the batch so its
+    // spawn (~0.4–8s, 5s-cached) never delays getting agents on screen. The
+    // result is pushed on its own `agent-resource-usage` channel — named apart from
+    // the app's OWN load, which rides `scan-batch.resourceUsage` and is a different
+    // measurement entirely.
+    //
+    // The pid → instanceId pairing is read off THIS tick's `agents`, which the identity
+    // stamp above (procUtil.enrichWithParentChains) has already filled, and is captured
+    // here rather than re-resolved when the sample lands: a second lookup could straddle
+    // a pid recycle and label one process's load with another's key (ai-mistakes #19).
+    // pid ≤ 0 is dropped because the OS has nothing to sample for a synthetic agent, not
+    // because it lacks a key. An agent whose stamp is missing rides along with
+    // `instanceId: null` — unattributed, and kept distinct from every other such record
+    // rather than pooled under one key.
+    const resourceTargets = agents
+      .filter((a) => Number.isInteger(a.pid) && a.pid > 0)
+      .map((a) => ({
+        pid: a.pid,
+        instanceId: typeof a.instanceId === 'string' && a.instanceId !== '' ? a.instanceId : null,
+      }));
+    // One OS query at a time; busy ticks leave freshness to the next scan.
+    // A scan already awaiting the provider when paused must not start new sampling.
+    if (resourceGeneration === resourceScanGeneration) {
+      resourceSampler
+        .sample(resourceTargets)
+        .then((records) => {
+          if (records !== null && resourceGeneration === resourceScanGeneration) {
+            sendToRenderer('agent-resource-usage', records);
+          }
+        })
+        .catch(() =>
+          logger.error('main', 'Resource usage scan failed', { error: 'resource-scan-failed' }),
+        );
+    }
+
+    if (result.changed && Date.now() - _lastTriggeredNetScan > 15000) {
+      _lastTriggeredNetScan = Date.now();
+      doNetworkScan();
+    }
+    // Tap 5 (roadmap §5): once per process tick, after this tick's session taps —
+    // expired open sequences and stale exit marks leave without waiting for the next
+    // event of the same key. Same optional-collaborator shape as `ingestSequence`.
+    if (deps.sequenceEngine && typeof deps.sequenceEngine.sweep === 'function') {
+      deps.sequenceEngine.sweep();
+    }
+    // The first tick(s) after a resume are tagged with the gap they follow, and with
+    // whether THIS tick was the one that cleared it — so a log reader can tell a
+    // post-sleep tick from a quiet one, and a tick that observed from one that did not.
+    const postGap =
+      gapBefore !== null && gapBefore.state === 'RESUMED'
+        ? {
+            suspendedAt: gapBefore.suspendedAt,
+            resumedAt: gapBefore.resumedAt,
+            gapMs: gapBefore.gapMs,
+            cleared: observed,
+          }
+        : undefined;
+    logger.debug('scan', 'process', {
+      ms: Math.round(performance.now() - t0),
+      agents: agents.length,
+      ...(postGap ? { postGap } : {}),
+    });
+  } catch {
+    // A downstream annotation/delivery failure has stopped mutating this pass's
+    // already-stamped owners. Release the network gate on that stable snapshot;
+    // a failure before identity stamping keeps the gate closed.
+    if (networkIdentityReady && resourceGeneration === resourceScanGeneration) {
+      networkScopePending = false;
+      flushQueuedNetworkRescan();
+    }
+    // Reached by BOTH a provider throw (rethrown above, health already owned by the inner
+    // catch) and a downstream pipeline throw (health deliberately untouched — the
+    // observation succeeded). Log only: no leaf here names delivery or persistence, and
+    // inventing one would answer a question this record was never asked.
+    deps.sequenceEngine?.observePopulation?.([], false);
+    deps.onProcessObservationUnavailable?.();
+    logger.error('main', 'Process scan failed', { error: 'process-scan-failed' });
+  } finally {
+    updateScanStatus(false);
+    processScanRunning = false;
+  }
+}
+
+/**
+ * Probe independent local runtime APIs while CWD enrichment runs.
+ * @returns {Promise<Array>} Ollama and LM Studio results in stable order.
+ * @since v0.17.0-alpha
+ */
+async function probeLocalModels() {
+  const { detectOllamaModels, detectLMStudioModels } = require('./llm-runtime-detector');
+  return Promise.all([detectOllamaModels(), detectLMStudioModels()]);
+}
+
+/** Attach completed probe results after CWD and before the one scan batch.
+ * A responding runtime with no matching process gets a stamped synthetic agent.
+ * @param {Array} agents Current scan population.
+ * @param {Array} models Ollama and LM Studio results in stable order.
+ * @returns {void}
+ * @since v0.17.0-alpha
+ */
+function attachLocalModels(agents, [ollama, lmstudio]) {
+  latestLocalModels = { ollama, lmstudio };
+  attachModels(agents, 'Ollama', ollama);
+  attachModels(agents, 'LM Studio', lmstudio);
+}
+
+/**
+ * Stamp a missing instanceId without re-deriving a present one (read-if-stamped).
+ * Pid-0 uses the display name only — same contract as injectDetectedExternalAgents —
+ * so a host process field cannot collapse two distinct synthetic agents.
+ * @param {Object} agent
+ * @param {string} displayName
+ */
+function stampLocalRuntimeIfMissing(agent, displayName) {
+  if (typeof agent.instanceId === 'string' && agent.instanceId.length > 0) return;
+  const input =
+    agent.pid === 0
+      ? { pid: 0, agent: agent.agent || displayName }
+      : {
+          pid: agent.pid,
+          agent: agent.agent || displayName,
+          process: agent.process,
+          startTime: agent.startTime,
+        };
+  const identity = identify(input);
+  agent.instanceId = identity.instanceId;
+  agent.instanceIdSource = identity.instanceIdSource;
+}
+
+/**
+ * Attach model list to a matching agent, or inject a stamped pid-0 synthetic.
+ * Does not invent identity from name for an already-stamped agent.
+ * @param {Array} agents
+ * @param {string} name
+ * @param {{running:boolean,models:string[]}} info
+ */
+function attachModels(agents, name, info) {
+  if (!info.running) return;
+  const existing = agents.find((a) => a.agent === name);
+  if (existing) {
+    existing.localModels = info.models;
+    stampLocalRuntimeIfMissing(existing, name);
+    return;
+  }
+  const synthetic = {
+    agent: name,
+    process: name.toLowerCase().replace(/\s/g, '-'),
+    pid: 0,
+    status: 'running',
+    category: 'local-llm-runtime',
+    localModels: info.models,
+  };
+  // Display name only (process withheld from identify) — mirrors injectDetectedExternalAgents.
+  const identity = identify({ pid: 0, agent: name });
+  synthetic.instanceId = identity.instanceId;
+  synthetic.instanceIdSource = identity.instanceIdSource;
+  agents.push(synthetic);
+}
+
+async function doFileScan() {
+  const { watcher, tray, logger, getStats, getLatestAgents, scanner } = deps;
+  const agents = getLatestAgents();
+  // G′: RM and the handle pool both map a live holder pid onto an agent record and
+  // stamp RM_HOLDER_PID / HANDLE_SCAN_PID — `confirmed` attribution. Against a
+  // population the process sensor cannot vouch for, that is a confirmed claim about
+  // a possibly-dead agent, written into the audit log. Do not scan, do not attribute;
+  // the ACTIVE read mechanism records the refusal (§2.4).
+  if (!isPopulationReliable(scanner) || (networkScopePending && agents.length === 0)) {
+    logger.debug('scan', 'file-skip', { reason: SCOPE_UNAVAILABLE, agents: agents.length });
+    if (typeof watcher.noteFileScanSkip === 'function') {
+      watcher.noteFileScanSkip(SCOPE_UNAVAILABLE);
+    }
+    return;
+  }
+  // #328: a trusted population with no agent is an observed zero, not a skipped tick —
+  // the ACTIVE read leaf records the scoped success the network leaf records at
+  // `doNetworkScan`, or it stays STARTING for as long as the machine stays idle.
+  if (agents.length === 0) {
+    logger.debug('scan', 'file-skip', { reason: CONFIRMED_ZERO, agents: 0 });
+    if (typeof watcher.noteFileScanSkip === 'function') {
+      watcher.noteFileScanSkip(CONFIRMED_ZERO);
+    }
+    return;
+  }
+  const capturedRevision = networkScopeRevision;
+  const capturedLifetime = networkScopeLifetime;
+  const capturedRows = new Map(agents.map((agent) => [agent, ownerScopeRow(agent)]));
+  const isAgentScopeCurrent = (agent) => {
+    try {
+      if (
+        networkScopeLifetime !== capturedLifetime ||
+        networkScopePending ||
+        !isPopulationReliable(scanner)
+      )
+        return false;
+      const captured = capturedRows.get(agent);
+      if (!captured) return false;
+      const currentAgents = getLatestAgents();
+      if (!Array.isArray(currentAgents)) return false;
+      // Without a precise generation witness, a new population pass could reuse
+      // the same PID and millisecond instanceId. Keep only witnessed peers live.
+      if (
+        !hasStrongNetworkWitness(captured) &&
+        (networkScopeRevision !== capturedRevision || currentAgents !== agents)
+      )
+        return false;
+      const owners = currentAgents.filter((current) => current.pid === captured[0]);
+      return (
+        owners.length === 1 &&
+        ownerScopeRow(owners[0]).every((value, index) => value === captured[index])
+      );
+    } catch {
+      return false;
+    }
+  };
+  const isScopeCurrent = () => {
+    try {
+      return (
+        networkScopeLifetime === capturedLifetime &&
+        networkScopeRevision === capturedRevision &&
+        !networkScopePending &&
+        isPopulationReliable(scanner) &&
+        getLatestAgents() === agents
+      );
+    } catch {
+      return false;
+    }
+  };
+  const t0 = performance.now();
+  updateScanStatus(true);
+  try {
+    const rawEvents = await watcher.scanAllFileHandles(agents, {
+      isAgentScopeCurrent,
+      isScopeCurrent,
+    });
+    const events = rawEvents.map((ev) => dedupFileEvent(ev, 'file-handle')).filter(Boolean);
+    if (events.length > 0) {
+      for (const ev of events) deps.recordAcceptedFileEvent?.(ev);
+      for (const ev of events) deps.fileAccessBatcher.push(ev);
+      tray.notifySensitive(events.filter((e) => e.sensitive && e.category === 'ai'));
+      for (const ev of events) logAuditForFile(ev);
+      // Tap 2 (roadmap §5): the deduped handle-scan events, same list the audit saw.
+      for (const ev of events) ingestSequence(ev);
+    }
+    // Producer, not payload: the batcher is 'latest', so a payload built here would be
+    // discarded by the next push inside the same 1000 ms window.
+    deps.statsUpdateBatcher.pushLazy(getStats);
+    tray.updateTrayIcon();
+  } catch {
+    logger.error('main', 'File handle scan failed', { error: 'file-handle-scan-failed' });
+  } finally {
+    updateScanStatus(false);
+    logger.debug('scan', 'file', { ms: Math.round(performance.now() - t0) });
+  }
+}
+
+/**
+ * Fast hot read-detect cycle (win32 RM only, ~10s): a faster RM poll over the
+ * crown-jewel secret dirs (HOT_DIRS + ~/.env*) that shrinks the 30s read-blind
+ * window. Events ride the SAME dedup→batch→audit→tray pipeline as doFileScan and
+ * share knownHandles, so a hold caught here will not re-fire from the 30s scan.
+ * Deliberately does NOT toggle updateScanStatus — a 10s background poll must not
+ * flicker the global "scanning" indicator (process/file scans drive that). RM
+ * catches a HOLD at the tick, never a transient open→read→close.
+ * @since v0.11.0-alpha
+ */
+async function doHotReadScan() {
+  const { watcher, tray, logger, getStats, getLatestAgents, scanner } = deps;
+  const agents = getLatestAgents();
+  // G′: same holder→agent stamp as the 30s scan, ~3× more often. Same refusal.
+  if (!isPopulationReliable(scanner) || (networkScopePending && agents.length === 0)) {
+    logger.debug('scan', 'hot-read-skip', { reason: SCOPE_UNAVAILABLE, agents: agents.length });
+    if (typeof watcher.noteFileScanSkip === 'function') {
+      watcher.noteFileScanSkip(SCOPE_UNAVAILABLE);
+    }
+    return;
+  }
+  // #328: the same observed zero as the 30 s scan, on the fs-rm leaf this cycle owns.
+  if (agents.length === 0) {
+    logger.debug('scan', 'hot-read-skip', { reason: CONFIRMED_ZERO, agents: 0 });
+    if (typeof watcher.noteFileScanSkip === 'function') {
+      watcher.noteFileScanSkip(CONFIRMED_ZERO);
+    }
+    return;
+  }
+  const t0 = performance.now();
+  try {
+    const rawEvents = await watcher.scanHotFileHolders(agents);
+    const events = rawEvents.map((ev) => dedupFileEvent(ev, 'file-handle')).filter(Boolean);
+    if (events.length > 0) {
+      for (const ev of events) deps.recordAcceptedFileEvent?.(ev);
+      for (const ev of events) deps.fileAccessBatcher.push(ev);
+      tray.notifySensitive(events.filter((e) => e.sensitive && e.category === 'ai'));
+      for (const ev of events) logAuditForFile(ev);
+      // Tap 2 (roadmap §5): the same dedup → batch → audit pipeline as doFileScan.
+      for (const ev of events) ingestSequence(ev);
+      deps.statsUpdateBatcher.pushLazy(getStats);
+      tray.updateTrayIcon();
+    }
+  } catch {
+    logger.error('main', 'Hot read scan failed', { error: 'hot-read-scan-failed' });
+  } finally {
+    logger.debug('scan', 'hot-read', { ms: Math.round(performance.now() - t0) });
+  }
+}
+
+/** @param {number} intervalMs @since v0.3.0 */
+function startScanIntervals(intervalMs) {
+  startWslInventoryPolling();
+  // Settings and resume restart the timers after invalidating the old lifetime.
+  // Even an unchanged process publication must replace that discarded TCP poll.
+  // The pending gate keeps this retry behind a fresh, fully annotated population.
+  if (networkScopePending) networkRescanQueued = true;
+  const ms = intervalMs || 10000;
+  maxProcessGapMs = ms;
+  scanInterval = setInterval(doProcessScan, ms);
+  netInterval = setInterval(doNetworkScan, 30000);
+  fileScanInterval = setInterval(doFileScan, Math.max(ms * 3, 30000));
+  // Hot read-detect cycle: win32 + RM only. Not created on darwin/linux (no RM)
+  // so we never run a pointless no-op timer. Started here (post-warmup) only —
+  // never during startWarmup — to keep the heavy boot window quiet.
+  if (deps.watcher && deps.watcher.isHotReadScanActive && deps.watcher.isHotReadScanActive()) {
+    hotReadInterval = setInterval(doHotReadScan, HOT_READ_INTERVAL_MS);
+  }
+}
+
+let warmupTimer = null;
+/** @type {Array<ReturnType<typeof setTimeout>>} */
+let startupTimers = [];
+
+/** Refresh names independently of process enumeration and its reentrancy guard. */
+function refreshWslInventory() {
+  if (deps.isMonitoringPaused?.() === true) return;
+  try {
+    Promise.resolve(deps.refreshWslInventory?.()).catch(() => {});
+  } catch {
+    // Inventory failure cannot invalidate host-process observation.
+  }
+}
+
+/** Start one independent timer; warmup transition keeps the existing cadence. */
+function startWslInventoryPolling() {
+  if (wslInventoryInterval || !deps.refreshWslInventory || deps.isMonitoringPaused?.() === true)
+    return;
+  refreshWslInventory();
+  wslInventoryInterval = setInterval(refreshWslInventory, WSL_INVENTORY_INTERVAL_MS);
+}
+
+/** @param {number} targetMs @since v0.4.0 */
+function startWarmup(targetMs) {
+  const schedule = warmupProcessSchedule(targetMs);
+  maxProcessGapMs = schedule.maxGapMs;
+  scanInterval = setInterval(doProcessScan, schedule.intervalMs);
+  netInterval = setInterval(doNetworkScan, 60000);
+  fileScanInterval = setInterval(doFileScan, 60000);
+  warmupTimer = setTimeout(() => {
+    clearInterval(scanInterval);
+    clearInterval(netInterval);
+    clearInterval(fileScanInterval);
+    scanInterval = null;
+    netInterval = null;
+    fileScanInterval = null;
+    startScanIntervals(targetMs);
+  }, WARMUP_MS);
+}
+
+/** @param {number} intervalMs @param {boolean} paused @since v0.3.0 */
+function staggeredStartup(intervalMs, paused) {
+  maxProcessGapMs = paused ? null : warmupProcessSchedule(intervalMs).maxGapMs;
+  if (!paused) startupTimers.push(setTimeout(startWslInventoryPolling, 15000));
+  startupTimers.push(setTimeout(() => doProcessScan(), STARTUP_MS.process));
+  startupTimers.push(setTimeout(() => doFileScan(), STARTUP_MS.files));
+  startupTimers.push(
+    setTimeout(() => {
+      doNetworkScan();
+      if (!paused) startWarmup(intervalMs);
+    }, STARTUP_MS.polling),
+  );
+}
+
+/** @param {Object} injected @since v0.3.0 */
+function init(injected) {
+  maxProcessGapMs = null;
+  resourceScanGeneration++;
+  resourceSampler.invalidate();
+  deps = injected;
+  skippedProcessTicks = 0;
+  lastSkippedAt = null;
+  processPopulationUnavailable = false;
+  networkProviderUnavailable = false;
+  networkScopePending = false;
+  networkScopeRevision = 0;
+  networkScopeLifetime++;
+  networkRescanQueued = false;
+  deps.baselines?.init?.({
+    isInstanceActive: (instanceId) =>
+      sessionTracker.hasInstance(instanceId) ||
+      (deps.getLatestAgents?.() || []).some(
+        (agent) => agent.pid <= 0 && agent.instanceId === instanceId,
+      ),
+  });
+}
+
+/** @returns {{skippedProcessTicks: number, lastSkippedAt: number|null, maxProcessGapMs: number|null}} @since v0.17.0-alpha */
+function getScanCadence() {
+  return { skippedProcessTicks, lastSkippedAt, maxProcessGapMs };
+}
+
+/** @returns {{ollama: {running:boolean,models:string[]}, lmstudio: {running:boolean,models:string[]}}} */
+function getLatestLocalModels() {
+  return latestLocalModels;
+}
+
+module.exports = {
+  init,
+  startScanIntervals,
+  stopScanIntervals,
+  doNetworkScan,
+  staggeredStartup,
+  dedupFileEvent,
+  logAuditForFile,
+  getLatestLocalModels,
+  getScanCadence,
+};

@@ -1,0 +1,142 @@
+/**
+ * @file token-feed.js
+ * @module main/token-feed
+ * @description Extensible per-PID token-feed CORE. A thin registry that fans a
+ *   list of live processes out to each registered token adapter and concatenates
+ *   the measured (`estimated:false`) token deltas they return. The core holds NO
+ *   agent-specific knowledge — every detail of where usage lives on disk, how to
+ *   tail it, and how to attribute it per-PID belongs to an adapter. Adding a new
+ *   self-logging agent is one `require` appended to {@link adapters}.
+ *
+ *   Each adapter implements the contract:
+ *     { id: string,
+ *       agentNames?: readonly string[], // exact scanner display names; absent = all
+ *       readUsage(procs: Proc[]) => Promise<UsageDelta[]>,
+ *       getCollectionStatus?(): {state, reason, retryAt},
+ *       _resetForTest(): void }
+ *
+ *   An adapter that throws or finds no source contributes nothing — a single bad
+ *   adapter can never crash the feed or starve the others. The companion
+ *   accounting sink is `token-tracker.js`. The scan loop passes the current
+ *   process snapshot through `token-cost-collector.js`, which preserves stamped
+ *   process-instance attribution while collecting measured deltas from this feed.
+ * @author AEGIS Contributors
+ * @license MIT
+ * @version 0.1.0
+ */
+'use strict';
+
+const logger = require('./logger');
+const claudeCode = require('./token-adapters/claude-code');
+
+/**
+ * @typedef {import('./token-adapters/claude-code').Proc} Proc
+ * @typedef {import('./token-adapters/claude-code').UsageDelta} UsageDelta
+ */
+
+/** Default adapter registry. Append a module here to support a new agent. */
+const DEFAULT_ADAPTERS = [claudeCode];
+const KNOWN_ADAPTER_IDS = new Set(DEFAULT_ADAPTERS.map((adapter) => adapter.id));
+
+/** @type {Array<{ id: string, agentNames?: readonly string[], readUsage: Function, getCollectionStatus?: Function, _resetForTest?: Function }>} */
+let adapters = DEFAULT_ADAPTERS.slice();
+
+/**
+ * Read new measured token deltas for the given live processes across every
+ * registered adapter, in registration order.
+ * @param {Proc[]} procs - live processes enriched with OS `startTime` (see adapter).
+ * @returns {Promise<UsageDelta[]>} flat array of measured deltas (possibly empty).
+ * @since v0.10.0-alpha
+ */
+async function readUsageByPid(procs) {
+  const out = [];
+  for (const adapter of adapters) {
+    let deltas;
+    try {
+      // Legacy callers may omit the family. Keep those eligible, while avoiding
+      // another agent's registry paths for processes the scanner has identified.
+      const eligible = adapter.agentNames
+        ? procs.filter((proc) => !proc?.agent || adapter.agentNames.includes(proc.agent))
+        : procs;
+      if (eligible.length === 0) continue;
+      deltas = await adapter.readUsage(eligible);
+    } catch {
+      // One adapter failing never crashes the feed or starves the others.
+      logger.debug('token-feed', 'adapter failed', {
+        adapter: KNOWN_ADAPTER_IDS.has(adapter.id) ? adapter.id : 'unknown-adapter',
+        error: 'token-adapter-failed',
+      });
+      continue;
+    }
+    if (Array.isArray(deltas)) {
+      for (const d of deltas) {
+        // A corrupt adapter row must not abort the collector before its valid siblings.
+        if (!d || typeof d !== 'object' || !Number.isInteger(d.pid) || d.pid <= 0) continue;
+        out.push(d);
+      }
+    }
+  }
+  return out;
+}
+
+/** Read adapter startup baselines before live collection, even with no live agents.
+ * @returns {Array} Historical numeric aggregates. @since 0.19.2
+ */
+function getHistoricalUsage() {
+  return adapters.flatMap((adapter) => {
+    if (!KNOWN_ADAPTER_IDS.has(adapter.id) || typeof adapter.getHistoricalUsage !== 'function')
+      return [];
+    try {
+      const usage = adapter.getHistoricalUsage();
+      return usage ? [{ ...usage, adapter: adapter.id }] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+/** Report bounded, allowlisted collection health independently of usage deltas.
+ * @returns {Array<{adapter: string, state: string, reason: string|null, retryAt: number|null}>} @since 0.19.2
+ */
+function getCollectionStatus() {
+  return adapters.flatMap((adapter) => {
+    if (!KNOWN_ADAPTER_IDS.has(adapter.id) || typeof adapter.getCollectionStatus !== 'function')
+      return [];
+    try {
+      const status = adapter.getCollectionStatus();
+      if (status?.state !== 'storage-paused')
+        return [{ adapter: adapter.id, state: 'ready', reason: null, retryAt: null }];
+      return [
+        {
+          adapter: adapter.id,
+          state: 'storage-paused',
+          reason: status.reason === 'capacity' ? 'capacity' : 'unavailable',
+          retryAt: Number.isFinite(status.retryAt) ? status.retryAt : null,
+        },
+      ];
+    } catch {
+      return [
+        { adapter: adapter.id, state: 'storage-paused', reason: 'unavailable', retryAt: null },
+      ];
+    }
+  });
+}
+
+/** @internal Swap the adapter registry (tests). @param {Array} arr */
+function _setAdaptersForTest(arr) {
+  adapters = arr;
+}
+
+/** @internal Restore the default registry and reset each adapter (tests). @returns {void} */
+function _resetForTest() {
+  adapters = DEFAULT_ADAPTERS.slice();
+  for (const a of DEFAULT_ADAPTERS) if (typeof a._resetForTest === 'function') a._resetForTest();
+}
+
+module.exports = {
+  getHistoricalUsage,
+  readUsageByPid,
+  getCollectionStatus,
+  _setAdaptersForTest,
+  _resetForTest,
+};

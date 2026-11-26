@@ -1,0 +1,155 @@
+/**
+ * @file token-feed.test.js
+ * @description Unit suite for the extensible token-feed CORE — a thin registry
+ *   that fans a `procs` list out to each registered adapter and concatenates the
+ *   measured deltas. Adapters are faked via DI so the core is tested in isolation
+ *   from any disk I/O.
+ */
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { createRequire } from 'node:module';
+import feed from '../../src/main/token-feed.js';
+
+const require_ = createRequire(import.meta.url);
+const logger = require_('../../src/main/logger.js');
+const { readUsageByPid, _setAdaptersForTest, _resetForTest } = feed;
+
+const delta = (pid, inputTokens) => ({
+  pid,
+  model: 'claude-opus-4-8',
+  inputTokens,
+  outputTokens: 1,
+  estimated: false,
+});
+
+const fakeAdapter = (id, impl) => ({
+  id,
+  readUsage: vi.fn(impl),
+  _resetForTest: vi.fn(),
+});
+
+beforeEach(() => {
+  _resetForTest();
+});
+
+describe('token-feed core — default registry', () => {
+  it('ships the claude-code adapter and returns [] for empty procs', async () => {
+    // default registry, no procs → no adapter does any disk I/O
+    expect(await readUsageByPid([])).toEqual([]);
+  });
+});
+
+describe('token-feed core — fan-out & concatenation', () => {
+  it('flattens the deltas returned by a single adapter', async () => {
+    _setAdaptersForTest([fakeAdapter('a', async () => [delta(1, 10), delta(2, 20)])]);
+    expect(await readUsageByPid([{ pid: 1, startTime: 0 }])).toEqual([delta(1, 10), delta(2, 20)]);
+  });
+
+  it('concatenates results from multiple adapters in registration order', async () => {
+    _setAdaptersForTest([
+      fakeAdapter('a', async () => [delta(1, 10)]),
+      fakeAdapter('b', async () => [delta(2, 20)]),
+    ]);
+    expect(await readUsageByPid([{ pid: 1, startTime: 0 }])).toEqual([delta(1, 10), delta(2, 20)]);
+  });
+
+  it('forwards the same procs to every adapter', async () => {
+    const a = fakeAdapter('a', async () => []);
+    const b = fakeAdapter('b', async () => []);
+    _setAdaptersForTest([a, b]);
+    const procs = [{ pid: 7, startTime: 123 }];
+    await readUsageByPid(procs);
+    expect(a.readUsage).toHaveBeenCalledWith(procs);
+    expect(b.readUsage).toHaveBeenCalledWith(procs);
+  });
+});
+
+describe('token-feed core — adapter failure isolation', () => {
+  it('keeps adapter exceptions and unknown ids out of durable diagnostics', async () => {
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    try {
+      _setAdaptersForTest([
+        fakeAdapter('PRIVATE_ADAPTER_ID_CANARY', async () => {
+          throw new Error('PRIVATE_TRANSCRIPT_PATH_CANARY');
+        }),
+        fakeAdapter('ok', async () => [delta(3, 30)]),
+      ]);
+      expect(await readUsageByPid([{ pid: 3, startTime: 0 }])).toEqual([delta(3, 30)]);
+      expect(debug).toHaveBeenCalledWith('token-feed', 'adapter failed', {
+        adapter: 'unknown-adapter',
+        error: 'token-adapter-failed',
+      });
+      expect(JSON.stringify(debug.mock.calls)).not.toContain('PRIVATE_');
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  it('isolates a throwing adapter so others still contribute', async () => {
+    _setAdaptersForTest([
+      fakeAdapter('boom', async () => {
+        throw new Error('adapter exploded');
+      }),
+      fakeAdapter('ok', async () => [delta(3, 30)]),
+    ]);
+    expect(await readUsageByPid([{ pid: 3, startTime: 0 }])).toEqual([delta(3, 30)]);
+  });
+
+  it('ignores a non-array adapter return without crashing', async () => {
+    _setAdaptersForTest([
+      fakeAdapter('weird', async () => null),
+      fakeAdapter('ok', async () => [delta(4, 40)]),
+    ]);
+    expect(await readUsageByPid([{ pid: 4, startTime: 0 }])).toEqual([delta(4, 40)]);
+  });
+});
+
+describe('token-feed core — reset', () => {
+  it('_resetForTest restores the default registry (fake no longer called)', async () => {
+    const fake = fakeAdapter('fake', async () => [delta(9, 99)]);
+    _setAdaptersForTest([fake]);
+    _resetForTest();
+    await readUsageByPid([]);
+    expect(fake.readUsage).not.toHaveBeenCalled();
+  });
+});
+
+it.each([null, undefined, 'adapter-failure'])(
+  'isolates a non-Error adapter rejection (%s) and still reads the following adapter',
+  async (error) => {
+    _setAdaptersForTest([
+      fakeAdapter('broken', async () => {
+        throw error;
+      }),
+      fakeAdapter('working', async () => [delta(3, 30)]),
+    ]);
+    await expect(readUsageByPid([{ pid: 3, startTime: 1000 }])).resolves.toEqual([delta(3, 30)]);
+  },
+);
+
+describe('token-feed family routing', () => {
+  it('routes known families exactly and preserves unlabelled legacy callers', async () => {
+    const claude = {
+      ...fakeAdapter('claude', async () => [delta(1, 10)]),
+      agentNames: ['Claude Code'],
+    };
+    const other = { ...fakeAdapter('other', async () => [delta(2, 20)]), agentNames: ['Codex'] };
+    _setAdaptersForTest([claude, other]);
+    const procs = [
+      { pid: 1, startTime: 1000, agent: 'Claude Code' },
+      { pid: 2, startTime: 2000, agent: 'Codex' },
+      { pid: 3, startTime: 3000 },
+      { pid: 4, startTime: 4000, agent: 'Claude Desktop' },
+    ];
+    expect(await readUsageByPid(procs)).toEqual([delta(1, 10), delta(2, 20)]);
+    expect(claude.readUsage).toHaveBeenCalledWith([procs[0], procs[2]]);
+    expect(other.readUsage).toHaveBeenCalledWith([procs[1], procs[2]]);
+    expect(procs).toHaveLength(4);
+  });
+
+  it('does not invoke a family adapter when all processes belong to other agents', async () => {
+    const adapter = { ...fakeAdapter('claude', async () => []), agentNames: ['Claude Code'] };
+    _setAdaptersForTest([adapter]);
+    expect(await readUsageByPid([{ pid: 1, startTime: 1000, agent: 'Cursor' }])).toEqual([]);
+    expect(adapter.readUsage).not.toHaveBeenCalled();
+  });
+});

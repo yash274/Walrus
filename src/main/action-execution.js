@@ -1,0 +1,286 @@
+'use strict';
+
+const path = require('node:path');
+const { actionReport, runProtectedAction } = require('./action-protected-execution');
+const { spawn } = require('node:child_process');
+const { isExecutionRuntimeSupported } = require('./execution-runtime');
+const { isExecutionApprovalActive, consumeExecutionApproval } = require('./execution-approval');
+const LIMITS = Object.freeze({
+  prepareMs: 1500,
+  runtimeMs: 5000,
+  outputBytes: 65536,
+  cleanupMs: 1000,
+  protectedCleanupMs: 2000,
+  isolationStartupMs: 10000,
+});
+let testDeps = null;
+
+function ownLaunch(launch) {
+  if (
+    !launch ||
+    typeof launch.executable !== 'string' ||
+    !path.isAbsolute(launch.executable) ||
+    launch.executable.includes('\0') ||
+    typeof launch.cwd !== 'string' ||
+    !path.isAbsolute(launch.cwd) ||
+    launch.cwd.includes('\0') ||
+    !Array.isArray(launch.args) ||
+    !launch.args.every((arg) => typeof arg === 'string' && !arg.includes('\0')) ||
+    !launch.env ||
+    typeof launch.env !== 'object' ||
+    Array.isArray(launch.env) ||
+    ![null, Object.prototype].includes(Object.getPrototypeOf(launch.env)) ||
+    !Object.entries(launch.env).every(
+      ([key, value]) =>
+        key && !/[=\0]/.test(key) && typeof value === 'string' && !value.includes('\0'),
+    )
+  )
+    return null;
+  return {
+    executable: launch.executable,
+    cwd: launch.cwd,
+    args: [...launch.args],
+    env: Object.assign(Object.create(null), launch.env),
+  };
+}
+
+/**
+ * Evaluate one selected request then launch only that allowed child. The trusted
+ * Windows Job opt-in holds ordinary Job-member descendants until verified cleanup. No shell or
+ * inherited environment is used. Child output is counted, never returned.
+ * @param {string} policyPath Explicit selected policy file.
+ * @param {string} requestPath Explicit selected request file.
+ * @param {{signal?: AbortSignal, binding?: object, approval?: object, protectedDescendants?: boolean, appContainer?: boolean, importInput?: object, executableSnapshot?: object}} [options] Owned cancellation, revision, one-use approval and Windows Job opt-in.
+ * @returns {Promise<object>} Fixed decision and direct-child outcome metadata.
+ * @since v0.15.1
+ */
+async function executeAction(policyPath, requestPath, options = {}) {
+  const { signal, binding, approval } = options;
+  const appContainer = options.appContainer === true;
+  const input = options.importInput || null;
+  const suppliedExecutable = options.executableSnapshot || null;
+  const protectedJob = appContainer || options.protectedDescendants === true;
+  const protection = { appContainer, protectedDescendants: protectedJob, importInput: !!input };
+  const localReport = (decision, reason, execution) =>
+    actionReport(decision, reason, execution, protection);
+  const pinned = Object.hasOwn(options, 'binding');
+  const approved = Object.hasOwn(options, 'approval');
+  if (
+    ['protectedDescendants', 'appContainer'].some(
+      (key) => Object.hasOwn(options, key) && typeof options[key] !== 'boolean',
+    )
+  )
+    return actionReport(
+      'deny',
+      'protected-option-invalid',
+      {},
+      { ...protection, protectedDescendants: true },
+    );
+  if (protectedJob && process.platform !== 'win32')
+    return localReport('deny', 'protected-runtime-unsupported');
+  if (appContainer && !approved) return localReport('deny', 'approval-unavailable');
+  if (input && (!appContainer || !approved || !Object.isFrozen(input)))
+    return localReport('deny', 'input-unavailable');
+  if (suppliedExecutable && (!appContainer || !approved || !Object.isFrozen(suppliedExecutable)))
+    return localReport('deny', 'executable-unavailable');
+  if (appContainer && approved && !suppliedExecutable)
+    return localReport('deny', 'executable-unavailable');
+  if (signal?.aborted) return localReport('deny', 'action-cancelled');
+  if (
+    approved &&
+    (!pinned ||
+      !isExecutionApprovalActive(approval, binding, input, suppliedExecutable) ||
+      !require('./execution-binding').isExecutionBindingActive(binding, policyPath, requestPath))
+  )
+    return localReport('deny', 'approval-unavailable');
+  if (!isExecutionRuntimeSupported()) return localReport('deny', 'runtime-unsupported');
+  const deps = testDeps || {};
+  const prepare =
+    deps.prepare ||
+    ((p, r) =>
+      require('./execution-policy').prepareExecution(p, r, {
+        ...(pinned ? { binding } : {}),
+        ...(approved ? { review: true } : {}),
+      }));
+  const launchChild = deps.spawn || spawn;
+  const now = deps.now || (() => performance.now());
+  const started = now();
+  let prepareTimer;
+  let prepared;
+  let onPrepareAbort;
+  try {
+    prepared = await Promise.race([
+      Promise.resolve().then(() => (signal?.aborted ? null : prepare(policyPath, requestPath))),
+      new Promise((resolve) => {
+        onPrepareAbort = () => resolve(null);
+        signal?.addEventListener('abort', onPrepareAbort, { once: true });
+        if (signal?.aborted) resolve(null);
+      }),
+      new Promise((resolve) => {
+        prepareTimer = setTimeout(() => resolve(null), LIMITS.prepareMs);
+      }),
+    ]);
+  } catch (_) {
+    return localReport('deny', 'preparation-failed');
+  } finally {
+    clearTimeout(prepareTimer);
+    signal?.removeEventListener('abort', onPrepareAbort);
+  }
+  if (signal?.aborted) return localReport('deny', 'action-cancelled');
+  if (now() - started >= LIMITS.prepareMs || !prepared)
+    return localReport('deny', 'preparation-unavailable');
+  if (!['allow', 'ask', 'deny'].includes(prepared.decision))
+    return localReport('deny', 'decision-invalid');
+  if (prepared.decision !== 'allow' && !(approved && prepared.decision === 'ask'))
+    return localReport(
+      prepared.decision,
+      ['configuration-changed', 'configuration-unavailable', 'review-required'].includes(
+        prepared.reason,
+      )
+        ? prepared.reason
+        : `policy-${prepared.decision}`,
+    );
+  let launch;
+  try {
+    launch = ownLaunch(prepared.launch);
+  } catch (_) {
+    return localReport('deny', 'launch-invalid');
+  }
+  if (!launch) return localReport('deny', 'launch-invalid');
+  if (
+    pinned &&
+    !require('./execution-binding').isExecutionBindingActive(binding, policyPath, requestPath)
+  )
+    return localReport('deny', 'configuration-changed');
+  if (signal?.aborted) return localReport('deny', 'action-cancelled');
+  if (now() - started >= LIMITS.prepareMs) return localReport('deny', 'preparation-unavailable');
+  const executableSnapshot = suppliedExecutable;
+  if (appContainer && executableSnapshot.path !== launch.executable)
+    return localReport('deny', 'executable-unavailable');
+  if (signal?.aborted) return localReport('deny', 'action-cancelled');
+  if (approved && !consumeExecutionApproval(approval, binding, input, executableSnapshot))
+    return localReport('deny', 'approval-unavailable');
+
+  if (input) launch.input = input;
+  if (executableSnapshot) launch.executableSnapshot = executableSnapshot;
+
+  if (protectedJob)
+    return runProtectedAction(
+      launch,
+      signal,
+      approved ? { authorization: 'operator-confirmed', policyDecision: prepared.decision } : null,
+      appContainer
+        ? deps.spawnIsolated || require('./mcp-gateway-windows-job').spawnActionInAppContainer
+        : deps.spawnProtected || require('./mcp-gateway-windows-job').spawnActionInWindowsJob,
+      LIMITS,
+      protection,
+    );
+
+  return new Promise((resolve) => {
+    let child;
+    let runtimeTimer;
+    let cleanupTimer;
+    let settled = false;
+    let interrupted = false;
+    let exitObserved = false;
+    let exitCode = null;
+    let reason = 'child-exited';
+    let outputTruncated = false;
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let totalBytes = 0;
+    const finish = (outputComplete, spawnFailed = false) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(runtimeTimer);
+      clearTimeout(cleanupTimer);
+      signal?.removeEventListener('abort', onAbort);
+      child?.stdout?.destroy();
+      child?.stderr?.destroy();
+      if (interrupted && !exitObserved) child?.unref?.();
+      resolve({
+        ...localReport('allow', spawnFailed ? 'spawn-failed' : reason, {
+          state: spawnFailed ? 'spawn-failed' : interrupted ? 'interrupted' : 'exited',
+          exitCode,
+          termination: interrupted ? (exitObserved ? 'confirmed' : 'unconfirmed') : 'not-requested',
+          stdoutBytes,
+          stderrBytes,
+          outputComplete: outputComplete && !outputTruncated,
+        }),
+        ...(approved
+          ? { authorization: 'operator-confirmed', policyDecision: prepared.decision }
+          : {}),
+      });
+    };
+    const cleanup = () => {
+      if (!cleanupTimer) cleanupTimer = setTimeout(() => finish(false), LIMITS.cleanupMs);
+    };
+    const interrupt = (why) => {
+      if (settled || interrupted) return;
+      interrupted = true;
+      reason = why;
+      clearTimeout(runtimeTimer);
+      cleanup();
+      try {
+        child.kill('SIGKILL');
+      } catch (_) {
+        /* Confirmation requires an exit event. */
+      }
+    };
+    const onAbort = () => interrupt('action-cancelled');
+    const count = (kind, chunk) => {
+      if (settled || interrupted) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+      const retained = Math.min(bytes, LIMITS.outputBytes - totalBytes);
+      if (kind === 'stdout') stdoutBytes += retained;
+      else stderrBytes += retained;
+      totalBytes += retained;
+      if (bytes > retained) {
+        outputTruncated = true;
+        interrupt('output-limit');
+      }
+    };
+    try {
+      child = launchChild(launch.executable, launch.args, {
+        cwd: launch.cwd,
+        env: launch.env,
+        shell: false,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      runtimeTimer = setTimeout(() => interrupt('runtime-timeout'), LIMITS.runtimeMs);
+      child.on('error', () => {
+        if (settled) return;
+        if (typeof child.pid === 'number') interrupt('child-error');
+        else finish(false, true);
+      });
+      child.once('exit', (code) => {
+        if (settled) return;
+        exitObserved = true;
+        exitCode = Number.isInteger(code) ? code : null;
+        clearTimeout(runtimeTimer);
+        cleanup();
+      });
+      child.once('close', () => finish(true));
+      child.stdout.on('data', (chunk) => count('stdout', chunk));
+      child.stderr.on('data', (chunk) => count('stderr', chunk));
+      child.stdout.on('error', () => interrupt('output-unavailable'));
+      child.stderr.on('error', () => interrupt('output-unavailable'));
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    } catch (_) {
+      if (child) interrupt('launch-failed');
+      else finish(false, true);
+    }
+  });
+}
+
+/** @param {object} deps Trusted test prepare/spawn/clock. @returns {void} @since v0.15.1 */
+function _setDepsForTest(deps) {
+  testDeps = deps;
+}
+/** @returns {void} @since v0.15.1 */
+function _resetForTest() {
+  testDeps = null;
+}
+module.exports = { executeAction, LIMITS, _setDepsForTest, _resetForTest };

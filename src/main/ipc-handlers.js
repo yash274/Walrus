@@ -1,0 +1,988 @@
+/**
+ * @file ipc-handlers.js
+ * @description All IPC handlers for renderer ↔ main communication.
+ * @since v0.1.0
+ */
+'use strict';
+const { ipcMain, app, dialog, shell, Notification } = require('electron');
+const path = require('path');
+const { pathToFileURL } = require('node:url');
+const fs = require('fs');
+const config = require('./config-manager');
+const { readBoundedConfigFile } = require('./bounded-config-file');
+const scanner = require('./process-scanner');
+const analysis = require('./ai-analysis');
+const exporter = require('./exports');
+const audit = require('./audit-logger');
+const { createAuditIntegrityReview } = require('./audit-integrity-review');
+const { killProcess, suspendProcess, resumeProcess, getParentProcessMap } = require('./platform');
+const { writeAuditExport } = require('./audit-export-stream');
+const { getAllRules, reloadRules } = require('./rule-loader');
+const blocklist = require('./blocklist');
+const logger = require('./logger');
+const {
+  isReservedPermissionKey,
+  validateSettings,
+  validateFalsePositive,
+} = require('./settings-validation');
+const { resolveProcessRequest } = require('../shared/process-request');
+const localSecurity = require('./local-security-ipc');
+const {
+  parseExternalUrl,
+  isTrustedSetupGuide,
+  ownsTopLevelRenderer,
+  resolveRendererDocument,
+} = require('./external-url-boundary');
+const { writePrivateReport } = require('./private-report-temp');
+const { createQuitAppHandler } = require('./app-quit');
+
+let deps = {};
+let analysisConfirmationPending = false;
+const reviewAuditIntegrity = createAuditIntegrityReview({ getLogDir: () => audit.getLogDir() });
+
+/**
+ * Keep known input validation actionable without exposing native write failures.
+ * @param {unknown} error
+ * @returns {string}
+ */
+function watchlistErrorMessage(error) {
+  const message = error instanceof TypeError ? error.message : '';
+  if (
+    message === 'signature must be a non-empty string' ||
+    message === 'pid must be a positive integer or null'
+  )
+    return message;
+  return 'Unable to update watchlist';
+}
+
+/**
+ * Escape HTML special characters to prevent injection.
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * @param {Object} injected — { getWindow, getStats, getResourceUsage }
+ * @since v0.1.0
+ */
+function init(injected) {
+  const { url: rendererUrl } = resolveRendererDocument(
+    app.isPackaged,
+    process.env.VITE_DEV_SERVER_URL,
+  );
+  deps = { ...injected, rendererUrl };
+  analysisConfirmationPending = false;
+  localSecurity.init({
+    getWindow: deps.getWindow,
+    dialog,
+    rendererUrl,
+  });
+}
+
+/**
+ * Require an owned renderer and a native, Cancel-default decision before activity
+ * metadata leaves the machine. The dialog contains fixed categories, never paths,
+ * endpoints, prompts or API credentials from the request.
+ * @param {Electron.IpcMainInvokeEvent} event
+ * @returns {Promise<{success:false,error:string}|null>}
+ * @since v0.16.0-alpha
+ */
+async function confirmAnalysisEgress(event) {
+  const window = deps.getWindow?.();
+  const stillOwned = () =>
+    deps.getWindow?.() === window && ownsTopLevelRenderer(event, window, deps.rendererUrl);
+  if (!stillOwned()) return { success: false, error: 'Renderer request denied' };
+  if (!config.getSettings().anthropicApiKey) {
+    return { success: false, error: 'Set your Anthropic API key in Settings' };
+  }
+  if (analysisConfirmationPending) {
+    return { success: false, error: 'Analysis confirmation in progress' };
+  }
+  analysisConfirmationPending = true;
+  try {
+    let answer;
+    try {
+      answer = await dialog.showMessageBox(window, {
+        type: 'question',
+        title: 'AEGIS AI analysis / Análise de IA',
+        message:
+          'Send activity to Anthropic for analysis? / Enviar atividade à Anthropic para análise?',
+        detail:
+          'Destination / Destino: api.anthropic.com\n\nData / Dados: observed file paths, network endpoints and agent activity metadata / caminhos de arquivos observados, destinos de rede e metadados de atividade dos agentes.',
+        buttons: ['Cancel / Cancelar', 'Send for analysis / Enviar para análise'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+    } catch (_) {
+      return { success: false, error: 'Analysis confirmation unavailable' };
+    }
+    if (!stillOwned()) return { success: false, error: 'Renderer request denied' };
+    if (answer?.response !== 1) return { success: false, error: 'Analysis cancelled' };
+    return null;
+  } finally {
+    analysisConfirmationPending = false;
+  }
+}
+
+/** @returns {void} @since v0.1.0 */
+function register() {
+  ipcMain.handle(
+    'app:quit',
+    createQuitAppHandler({
+      app,
+      getWindow: () => deps.getWindow?.(),
+      rendererUrl: deps.rendererUrl,
+    }),
+  );
+  const ownedRead = (event, read) =>
+    event && ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl)
+      ? read()
+      : { success: false, error: 'Renderer request denied' };
+  const isOwned = (event, window = deps.getWindow?.()) =>
+    Boolean(event) && ownsTopLevelRenderer(event, window, deps.rendererUrl);
+  const denied = () => ({ success: false, error: 'Renderer request denied' });
+  const stillOwned = (event, window) => deps.getWindow?.() === window && isOwned(event, window);
+  ipcMain.handle('project-watch:control', async (event, action) => {
+    const window = deps.getWindow?.();
+    if (!isOwned(event, window)) return denied();
+    if (!['status', 'select', 'clear'].includes(action))
+      return { success: false, error: 'Invalid project-watch operation' };
+    try {
+      const result = await deps.projectWatchSelection?.handle(action, () =>
+        stillOwned(event, window),
+      );
+      if (!stillOwned(event, window)) return denied();
+      if (result?.success !== true)
+        return { success: false, error: 'Project selection is unavailable' };
+      return {
+        success: true,
+        code: [
+          'SELECTED',
+          'UNSELECTED',
+          'UNAVAILABLE',
+          'DIRECTORY_REFUSED',
+          'STORE_UNAVAILABLE',
+          'CANCELLED',
+          'BUSY',
+        ].includes(result.code)
+          ? result.code
+          : 'STORE_UNAVAILABLE',
+        selected: result.selected === true,
+        available: result.available === true,
+      };
+    } catch {
+      return { success: false, error: 'Project selection could not complete' };
+    }
+  });
+  ipcMain.handle('claude-hook:review', async (event, action) => {
+    const window = deps.getWindow?.();
+    if (!isOwned(event, window)) return denied();
+    if (
+      ![
+        'status',
+        'install',
+        'install-project-policy',
+        'remove',
+        'open-profile',
+        'guard-start',
+        'guard-start-snapshot',
+        'guard-stop',
+      ].includes(action)
+    )
+      return { success: false, error: 'Invalid profile operation' };
+    try {
+      const result = await deps.claudeHookProfile?.handle(action, () => stillOwned(event, window));
+      if (!stillOwned(event, window)) return denied();
+      return result ?? { success: false, error: 'Claude profile review is unavailable' };
+    } catch {
+      return { success: false, error: 'Claude profile review could not complete' };
+    }
+  });
+  ipcMain.handle('gemini-hook:review', async (event, action) => {
+    const window = deps.getWindow?.();
+    if (!isOwned(event, window)) return denied();
+    if (!['status', 'install', 'remove', 'open-profile'].includes(action))
+      return { success: false, error: 'Invalid profile operation' };
+    try {
+      const result = await deps.geminiHookProfile?.handle(action, () => stillOwned(event, window));
+      if (!stillOwned(event, window)) return denied();
+      return result ?? { success: false, error: 'Gemini profile review is unavailable' };
+    } catch {
+      return { success: false, error: 'Gemini profile review could not complete' };
+    }
+  });
+  ipcMain.handle('tool-context:explain', async (event, eventId) => {
+    const window = deps.getWindow?.();
+    if (!isOwned(event, window)) return denied();
+    if (
+      typeof eventId !== 'string' ||
+      !/^(?:audit:)?[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(
+        eventId,
+      )
+    )
+      return { success: false, error: 'Invalid observation' };
+    try {
+      const result = await deps.explainToolContext?.(eventId);
+      if (!stillOwned(event, window)) return denied();
+      return result ?? { success: false, error: 'Local history is unavailable' };
+    } catch {
+      return { success: false, error: 'Local history is unavailable' };
+    }
+  });
+  ipcMain.handle('file-reads:control', (event, request) => {
+    if (!isOwned(event)) return denied();
+    try {
+      return (
+        deps.controlFileReads?.(request) ?? {
+          success: false,
+          error: 'File read monitoring is unavailable',
+        }
+      );
+    } catch {
+      return { success: false, error: 'File read monitoring could not start' };
+    }
+  });
+  ipcMain.handle('local-security:review', (event, request) => localSecurity.handle(event, request));
+  // Only the owned top-level renderer may request an update operation. No URLs,
+  // file paths, versions, command arguments or updater options cross this boundary.
+  const updateAction = (event, action) => {
+    const window = deps.getWindow?.();
+    if (
+      !window ||
+      window.isDestroyed() ||
+      event.sender !== window.webContents ||
+      event.senderFrame !== window.webContents.mainFrame
+    )
+      throw new Error('Update request denied');
+    return deps.updates[action]();
+  };
+  ipcMain.handle('updates:status', (event) => updateAction(event, 'snapshot'));
+  ipcMain.handle('updates:check', (event) => updateAction(event, 'check'));
+  ipcMain.handle('updates:download', (event) => updateAction(event, 'download'));
+  ipcMain.handle('updates:install', (event) => updateAction(event, 'install'));
+  ipcMain.handle('get-stats', (event) => ownedRead(event, () => deps.getStats()));
+  ipcMain.handle('sensitive-alerts:list', (event) =>
+    ownedRead(event, () => deps.sensitiveAlertJournal.list()),
+  );
+  ipcMain.handle('sensitive-alerts:set-reviewed', async (event, eventId, reviewed) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    const result = await deps.sensitiveAlertJournal.setReviewed(eventId, reviewed, () =>
+      stillOwned(event, window),
+    );
+    return stillOwned(event, window) ? result : denied();
+  });
+  ipcMain.handle('get-resource-usage', (event) => ownedRead(event, () => deps.getResourceUsage()));
+  ipcMain.handle('export-log', async (event) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    try {
+      const data = await exporter.exportLog(() => stillOwned(event, window));
+      if (!stillOwned(event, window)) return denied();
+      return data;
+    } catch (_) {
+      logger.error('IPC export-log failed');
+      return { success: false, error: 'Activity log export failed' };
+    }
+  });
+  ipcMain.handle('export-csv', async (event) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    try {
+      const data = await exporter.exportCsv(() => stillOwned(event, window));
+      if (!stillOwned(event, window)) return denied();
+      return data;
+    } catch (_) {
+      logger.error('IPC export-csv failed');
+      return { success: false, error: 'CSV export failed' };
+    }
+  });
+  ipcMain.handle('generate-report', async (event) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    try {
+      const data = await exporter.generateReport();
+      if (!stillOwned(event, window)) return denied();
+      return data;
+    } catch (_) {
+      logger.error('IPC generate-report failed');
+      return { success: false, error: 'Session report could not be opened' };
+    }
+  });
+  ipcMain.handle('get-settings', (event) =>
+    ownedRead(event, () => {
+      const rendererSettings = { ...config.getSettings() };
+      const anthropicApiKeyConfigured = Boolean(rendererSettings.anthropicApiKey);
+      const anthropicApiKeyMigrationPending = config.hasPendingLegacyApiKey();
+      delete rendererSettings.anthropicApiKey;
+      delete rendererSettings._encryptedApiKey;
+      return { ...rendererSettings, anthropicApiKeyConfigured, anthropicApiKeyMigrationPending };
+    }),
+  );
+
+  ipcMain.handle('save-settings', (event, newSettings, options) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    const check = validateSettings(newSettings);
+    if (!check.valid) {
+      logger.warn('ipc-handlers', 'save-settings rejected: invalid settings');
+      return { success: false, error: check.error };
+    }
+    const hadRuleOverrides =
+      Object.keys(config.getSettings().ruleEnabledOverrides || {}).length > 0;
+    if (options === undefined) config.saveSettings(newSettings);
+    else config.saveSettings(newSettings, options);
+    if (
+      Object.hasOwn(newSettings, 'ruleEnabledOverrides') ||
+      (options?.patch !== true && hadRuleOverrides)
+    )
+      reloadRules();
+    config.applySettings();
+    deps.updates?.preferencesChanged();
+    return { success: true };
+  });
+
+  ipcMain.handle('test-notification', (event) => {
+    if (!isOwned(event)) return denied();
+    if (!Notification.isSupported())
+      return { success: false, error: 'Notifications not supported on this system' };
+    new Notification({
+      title: 'AEGIS \u2014 Test Notification',
+      body: 'Desktop notifications are working correctly.',
+    }).show();
+    return { success: true };
+  });
+
+  ipcMain.handle('analyze-agent', async (event, selection) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    try {
+      const target = analysis.captureAgentTarget(selection);
+      if (!target) return { success: false, error: 'Selected process instance is unavailable' };
+      const refusal = await confirmAnalysisEgress(event);
+      if (refusal) return refusal;
+      return await analysis.analyzeAgentActivity(target);
+    } catch (_) {
+      logger.error('IPC analyze-agent failed');
+      return { success: false, error: 'Analysis failed' };
+    }
+  });
+
+  ipcMain.handle('analyze-session', async (event) => {
+    const refusal = await confirmAnalysisEgress(event);
+    if (refusal) return refusal;
+    try {
+      return await analysis.analyzeSessionActivity();
+    } catch (_) {
+      logger.error('IPC analyze-session failed');
+      return { success: false, error: 'Analysis failed' };
+    }
+  });
+
+  ipcMain.handle('open-threat-report', async (event, data) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    try {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return { success: false, error: 'Invalid report data' };
+      }
+      const summary = data.summary ?? '';
+      const findings = data.findings ?? [];
+      const recommendations = data.recommendations ?? [];
+      const { counts } = data;
+      const riskRating = data.riskRating ?? data.riskLevel ?? 'UNKNOWN';
+      const validItems = (items) =>
+        items === undefined ||
+        (Array.isArray(items) &&
+          items.length <= 64 &&
+          items.every((item) => typeof item === 'string' && item.length <= 4096));
+      if (
+        typeof summary !== 'string' ||
+        summary.length > 32768 ||
+        typeof riskRating !== 'string' ||
+        riskRating.length > 32 ||
+        !validItems(findings) ||
+        !validItems(recommendations)
+      )
+        return { success: false, error: 'Invalid report data' };
+      const safe = {
+        riskRating: escapeHtml(riskRating || 'UNKNOWN'),
+        summary: escapeHtml(summary || '').replace(/\n/g, '<br>'),
+        findings: Array.isArray(findings) ? findings.map((f) => escapeHtml(f)) : [],
+        recs: Array.isArray(recommendations) ? recommendations.map((r) => escapeHtml(r)) : [],
+        totalFiles: Number(counts?.totalFiles) || 0,
+        totalSensitive: Number(counts?.totalSensitive) || 0,
+        totalAgents: Number(counts?.totalAgents) || 0,
+        totalNet: Number(counts?.totalNet) || 0,
+      };
+      const colors = {
+        CLEAR: '#38A169',
+        LOW: '#38A169',
+        MEDIUM: '#ED8936',
+        HIGH: '#ED8936',
+        CRITICAL: '#E53E3E',
+      };
+      const rc = colors[riskRating] || '#ED8936';
+      const now = new Date().toLocaleString();
+      const findingsHtml = safe.findings.length
+        ? `<div class="sec"><div class="t">FINDINGS</div><ul>${safe.findings.map((f) => `<li>${f}</li>`).join('')}</ul></div>`
+        : '';
+      const recsHtml = safe.recs.length
+        ? `<div class="sec"><div class="t">RECOMMENDATIONS</div><ul>${safe.recs.map((r) => `<li>${r}</li>`).join('')}</ul></div>`
+        : '';
+      const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>AEGIS Threat Report</title>
+<style>body{font-family:'Segoe UI',sans-serif;background:#0a0e17;color:#E0E5EC;margin:0;padding:24px}
+h1{color:#7a8a9e;font-size:28px;margin-bottom:4px}.meta{color:#8896A6;font-size:12px;margin-bottom:20px}
+.g{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}
+.s{text-align:center;padding:12px;background:#12162b;border-radius:8px}
+.sv{font-size:24px;font-weight:700}.sl{font-size:10px;color:#8896A6;letter-spacing:1px}
+.sec{background:#12162b;border-radius:10px;padding:16px;margin-bottom:16px}
+.t{font-size:12px;letter-spacing:2px;color:#8896A6;margin-bottom:8px;font-weight:700}
+.r{display:inline-block;padding:6px 20px;border-radius:12px;font-weight:800;font-size:18px;letter-spacing:2px;color:#fff;background:${rc}}
+ul{margin:8px 0;padding-left:20px}li{margin:4px 0;color:#c8d0da}
+.f{margin-top:20px;text-align:center;color:#8896A6;font-size:11px}
+@media print{body{background:#fff;color:#222}.sec,.s{background:#f5f5f5;border:1px solid #ddd}h1{color:#2a9d8f}.r{border:2px solid ${rc}}}</style></head>
+<body><h1>AEGIS Threat Analysis Report</h1><div class="meta">Generated: ${now}</div>
+<div class="g">
+<div class="s"><div class="sv" style="color:#7a8a9e">${safe.totalFiles}</div><div class="sl">FILES ACCESSED</div></div>
+<div class="s"><div class="sv" style="color:#c87a7a">${safe.totalSensitive}</div><div class="sl">SENSITIVE ALERTS</div></div>
+<div class="s"><div class="sv" style="color:#7a8a9e">${safe.totalAgents}</div><div class="sl">AGENTS DETECTED</div></div>
+<div class="s"><div class="sv" style="color:#7a8a9e">${safe.totalNet}</div><div class="sl">NETWORK CONNECTIONS</div></div>
+</div>
+<div class="sec"><div class="t">THREAT LEVEL</div><span class="r">${safe.riskRating}</span></div>
+<div class="sec"><div class="t">SUMMARY</div><p>${safe.summary}</p></div>
+${findingsHtml}${recsHtml}
+<div class="f">Generated by AEGIS — AI Agent Privacy Shield</div></body></html>`;
+      const fp = writePrivateReport(app.getPath('temp'), 'threat-report', html);
+      await shell.openExternal(pathToFileURL(fp).href);
+      return { success: true, path: fp };
+    } catch (_) {
+      logger.error('IPC open-threat-report failed');
+      return { success: false, error: 'Threat report could not be opened' };
+    }
+  });
+
+  ipcMain.handle('get-all-permissions', (event) =>
+    ownedRead(event, () => {
+      const settings = config.getSettings();
+      const agentPerms = {};
+      const instancePerms = {};
+      for (const [key, val] of Object.entries(settings.agentPermissions)) {
+        if (key.includes('::')) {
+          instancePerms[key] = val;
+        } else {
+          agentPerms[key] = val;
+        }
+      }
+      return {
+        permissions: agentPerms,
+        instancePermissions: instancePerms,
+        seenAgents: settings.seenAgents,
+      };
+    }),
+  );
+
+  ipcMain.handle('save-agent-permissions', (event, permMap) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    config.saveSettings({ ...config.getSettings(), agentPermissions: permMap });
+    return { success: true };
+  });
+
+  ipcMain.handle('save-instance-permissions', (event, request) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    const { agentName, parentEditor, permissions, cwd } = request;
+    config.saveInstancePermissions(agentName, parentEditor, permissions, cwd);
+    return { success: true };
+  });
+
+  ipcMain.handle('reset-permissions-to-defaults', (event) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    const settings = config.getSettings();
+    const newPerms = {};
+    for (const agent of settings.seenAgents) {
+      if (!isReservedPermissionKey(agent)) newPerms[agent] = config.getDefaultPermissions(agent);
+    }
+    config.saveSettings({ ...settings, agentPermissions: newPerms });
+    return { success: true, permissions: newPerms, seenAgents: settings.seenAgents };
+  });
+
+  ipcMain.handle('get-agent-database', (event) => ownedRead(event, () => scanner.agentDb));
+  ipcMain.handle('get-custom-agents', (event) => ownedRead(event, () => config.getCustomAgents()));
+  ipcMain.handle('save-custom-agents', (event, agents) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    config.saveCustomAgents(agents);
+    return { success: true };
+  });
+
+  ipcMain.handle('export-agent-database', async (event) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    try {
+      const merged = { ...scanner.agentDb, customAgents: config.getCustomAgents() };
+      const { filePath } = await dialog.showSaveDialog(window, {
+        title: 'Export Agent Database',
+        defaultPath: path.join(app.getPath('downloads'), 'aegis-agents.json'),
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!stillOwned(event, window)) return denied();
+      if (!filePath) return { success: false };
+      fs.writeFileSync(filePath, JSON.stringify(merged, null, 2));
+      return { success: true, path: filePath };
+    } catch (_) {
+      logger.error('IPC export-agent-database failed');
+      return { success: false, error: 'Agent database export failed' };
+    }
+  });
+
+  ipcMain.handle('import-agent-database', async (event) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    try {
+      const { filePaths } = await dialog.showOpenDialog(window, {
+        title: 'Import Agent Database',
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+        properties: ['openFile'],
+      });
+      if (!stillOwned(event, window)) return denied();
+      if (!filePaths || filePaths.length === 0) return { success: false };
+      const raw = JSON.parse(readBoundedConfigFile(filePaths[0]));
+      return { success: true, agents: raw.customAgents || raw.agents || [] };
+    } catch (_) {
+      logger.error('IPC import-agent-database failed');
+      return { success: false, error: 'Agent database import failed' };
+    }
+  });
+
+  // ── Audit ──
+  // AuditLog.svelte has always called window.aegis.getAuditStats(); until this handler
+  // existed the method was undefined, so the call threw synchronously inside $effect —
+  // before .catch() was attached — and the panel never left its loading state outside
+  // demo mode.
+  ipcMain.handle('get-audit-stats', (event) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    return audit.getStats();
+  });
+  ipcMain.handle('audit:review-integrity', async (event, date) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    const result = await reviewAuditIntegrity(date);
+    return stillOwned(event, window) ? result : denied();
+  });
+  ipcMain.handle('audit:custody-revision', (event) =>
+    ownedRead(event, () => deps.auditCustodyRevision?.() ?? null),
+  );
+  ipcMain.handle(
+    'get-audit-entries-before',
+    async (event, beforeTs, limit, types, boundaryOffset) => {
+      const window = deps.getWindow?.();
+      if (!ownsTopLevelRenderer(event, window, deps.rendererUrl))
+        return { success: false, error: 'Renderer request denied' };
+      const rows = audit.getEntriesBefore(
+        beforeTs,
+        limit,
+        types,
+        ...(boundaryOffset === undefined ? [] : [boundaryOffset]),
+      );
+      if (!Array.isArray(rows)) return rows;
+      let proof = null;
+      try {
+        proof = (await deps.captureAuditCustodyProof?.(rows)) ?? null;
+      } catch {
+        /* history remains available */
+      }
+      if (!stillOwned(event, window)) return { success: false, error: 'Renderer request denied' };
+      return rows.map((row) => {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) return row;
+        const projected = { ...row };
+        // Historical JSON is not authority to select a live event on its own.
+        delete projected.eventId;
+        delete projected.auditLookupId;
+        delete projected.auditRevokedLookupId;
+        delete projected.auditCustodyRevision;
+        if (!['file-access', 'config-access'].includes(row.type)) return projected;
+        if (row.details && typeof row.details === 'object' && !Array.isArray(row.details)) {
+          projected.details = { ...row.details };
+          delete projected.details.auditIdentity;
+        }
+        try {
+          const token = deps.auditToolContextLookup?.(row, proof);
+          if (
+            typeof token === 'string' &&
+            /^audit:[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+              token,
+            )
+          ) {
+            const revision = deps.auditCustodyRevision?.();
+            if (
+              revision &&
+              typeof revision.epoch === 'string' &&
+              Number.isSafeInteger(revision.revision) &&
+              revision.revision >= 0
+            ) {
+              projected.auditLookupId = token;
+              projected.auditCustodyRevision = revision;
+            }
+          } else if (
+            token &&
+            typeof token === 'object' &&
+            typeof token.revoked === 'string' &&
+            /^audit:[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+              token.revoked,
+            )
+          )
+            projected.auditRevokedLookupId = token.revoked;
+        } catch {
+          // Unavailable custody never prevents history from being read.
+        }
+        return projected;
+      });
+    },
+  );
+  ipcMain.handle('open-audit-log-dir', async (event) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    try {
+      const error = await shell.openPath(audit.getLogDir());
+      if (!stillOwned(event, window)) return denied();
+      return error
+        ? { success: false, error: 'Audit log folder could not be opened' }
+        : { success: true };
+    } catch (_) {
+      return { success: false, error: 'Audit log folder could not be opened' };
+    }
+  });
+
+  ipcMain.handle('export-full-audit', async (event) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    try {
+      const defaultName = `aegis-retained-audit-${new Date().toISOString().slice(0, 10)}.json`;
+      const { filePath } = await dialog.showSaveDialog(window, {
+        title: 'Export Retained Audit Records',
+        defaultPath: path.join(app.getPath('downloads'), defaultName),
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!stillOwned(event, window)) return denied();
+      if (!filePath) return { success: false };
+      const result = await writeAuditExport({
+        filePath,
+        files: audit.prepareExport(),
+        canComplete: () => stillOwned(event, window),
+      });
+      if (!stillOwned(event, window)) return denied();
+      return result;
+    } catch (_) {
+      if (!stillOwned(event, window)) return denied();
+      logger.error('IPC export-full-audit failed');
+      return { success: false, error: 'Audit export incomplete' };
+    }
+  });
+
+  // ── Config export/import ──
+  ipcMain.handle('export-config', async (event) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    try {
+      const { filePath } = await dialog.showSaveDialog(window, {
+        title: 'Export Config',
+        defaultPath: path.join(app.getPath('downloads'), 'aegis-config.json'),
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!stillOwned(event, window)) return denied();
+      if (!filePath) return { success: false };
+      const exported = { ...config.getSettings() };
+      delete exported.anthropicApiKey;
+      delete exported._encryptedApiKey;
+      delete exported.apiKey;
+      fs.writeFileSync(filePath, JSON.stringify(exported, null, 2));
+      return { success: true, path: filePath };
+    } catch (_) {
+      logger.error('IPC export-config failed');
+      return { success: false, error: 'Config export failed' };
+    }
+  });
+
+  ipcMain.handle('import-config', async (event) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    try {
+      const { filePaths } = await dialog.showOpenDialog(window, {
+        title: 'Import Config',
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+        properties: ['openFile'],
+      });
+      if (!stillOwned(event, window)) return denied();
+      if (!filePaths || filePaths.length === 0) return { success: false };
+      const raw = JSON.parse(readBoundedConfigFile(filePaths[0]));
+      const check = validateSettings(raw);
+      if (!check.valid) {
+        logger.warn('ipc-handlers', 'import-config rejected: invalid settings');
+        return { success: false, error: 'Invalid imported settings' };
+      }
+      const hadRuleOverrides =
+        Object.keys(config.getSettings().ruleEnabledOverrides || {}).length > 0;
+      config.saveSettings({
+        ...raw,
+        anthropicApiKey: raw.anthropicApiKey ?? config.getSettings().anthropicApiKey,
+      });
+      if (hadRuleOverrides || Object.hasOwn(raw, 'ruleEnabledOverrides')) reloadRules();
+      config.applySettings();
+      deps.updates?.preferencesChanged();
+      return { success: true };
+    } catch (_) {
+      if (!stillOwned(event, window)) return denied();
+      return { success: false, error: 'Config import failed' };
+    }
+  });
+
+  ipcMain.handle('reveal-in-explorer', (event, filePath) => {
+    if (!isOwned(event)) return denied();
+    if (typeof filePath !== 'string' || !filePath) {
+      return { success: false, error: 'Invalid path' };
+    }
+    if (/^[\\/]{2}/.test(filePath)) {
+      logger.warn('ipc-handlers', 'reveal-in-explorer rejected: UNC or device path');
+      return { success: false, error: 'Path not allowed' };
+    }
+    const normalized = path.resolve(filePath);
+    if (normalized !== filePath && filePath.includes('..')) {
+      logger.warn('ipc-handlers', 'reveal-in-explorer rejected: path traversal');
+      return { success: false, error: 'Path traversal not allowed' };
+    }
+    const userData = app.getPath('userData');
+    const isInsideUserData = normalized.startsWith(userData + path.sep) || normalized === userData;
+    const pathExists = fs.existsSync(normalized);
+    if (!isInsideUserData && !pathExists) {
+      logger.warn('ipc-handlers', 'reveal-in-explorer rejected: path outside allowed scope');
+      return { success: false, error: 'Path not allowed' };
+    }
+    shell.showItemInFolder(normalized);
+    return { success: true };
+  });
+
+  // ── App info ──
+  ipcMain.handle('get-app-version', () => app.getVersion());
+
+  // ── Zip export ──
+  ipcMain.handle('export-zip', async (event) => {
+    const window = deps.getWindow?.();
+    if (!stillOwned(event, window)) return denied();
+    try {
+      const defaultName = `aegis-export-${new Date().toISOString().slice(0, 10)}.zip`;
+      const { filePath } = await dialog.showSaveDialog(window, {
+        title: 'Export All Data (ZIP)',
+        defaultPath: path.join(app.getPath('downloads'), defaultName),
+        filters: [{ name: 'ZIP', extensions: ['zip'] }],
+      });
+      if (!stillOwned(event, window)) return denied();
+      if (!filePath) return { success: false };
+      const settingsCopy = { ...config.getSettings() };
+      delete settingsCopy.anthropicApiKey;
+      delete settingsCopy._encryptedApiKey;
+      delete settingsCopy.apiKey;
+      const extraEntries = [
+        {
+          name: 'activity-log.json',
+          data: scanner.activityLog.slice(-5000),
+        },
+        { name: 'config.json', data: settingsCopy },
+      ];
+      const result = await writeAuditExport({
+        filePath,
+        files: audit.prepareExport(),
+        zip: true,
+        extraEntries,
+        canComplete: () => stillOwned(event, window),
+      });
+      if (!stillOwned(event, window)) return denied();
+      return result;
+    } catch (_) {
+      if (!stillOwned(event, window)) return denied();
+      logger.error('IPC export-zip failed');
+      return { success: false, error: 'Audit export incomplete' };
+    }
+  });
+
+  // ── Process control ──
+  let processControlInFlight = false;
+  const controlProcess = async (event, request, action) => {
+    const window = deps.getWindow?.();
+    const stillOwned = () =>
+      deps.getWindow?.() === window && ownsTopLevelRenderer(event, window, deps.rendererUrl);
+    if (!stillOwned()) return { success: false, error: 'Renderer request denied' };
+    if (request && typeof request === 'object' && request.pid === process.pid) {
+      logger.warn('Process control refused: AEGIS own PID');
+      return { success: false, error: 'Refusing to act on AEGIS itself' };
+    }
+    // A concurrent snapshot falls back to a full CIM query. Reject overlap across
+    // all three actions immediately, including while the native action settles.
+    if (processControlInFlight)
+      return { success: false, error: 'Process control is already in progress' };
+    processControlInFlight = true;
+    try {
+      const scanIntervalSec = Number(config.getSettings()?.scanIntervalSec);
+      const maxObservationAgeMs =
+        Number.isFinite(scanIntervalSec) && scanIntervalSec > 0
+          ? Math.min(300000, Math.max(30000, scanIntervalSec * 2000 + 10000))
+          : 30000;
+      const target = await resolveProcessRequest(request, {
+        ...deps,
+        getParentProcessMap,
+        maxObservationAgeMs,
+      });
+      if (target.error) return { success: false, error: target.error };
+      if (!stillOwned()) return { success: false, error: 'Renderer request denied' };
+      return target.createTime100ns
+        ? await action(target.pid, target.createTime100ns)
+        : await action(target.pid, target.linuxWitness);
+    } finally {
+      processControlInFlight = false;
+    }
+  };
+  ipcMain.handle('kill-process', (event, request) => controlProcess(event, request, killProcess));
+  ipcMain.handle('suspend-process', (event, request) =>
+    controlProcess(event, request, suspendProcess),
+  );
+  ipcMain.handle('resume-process', (event, request) =>
+    controlProcess(event, request, resumeProcess),
+  );
+
+  // ── False positives ──
+  ipcMain.handle('get-false-positives', (event) =>
+    ownedRead(event, () => config.getFalsePositives()),
+  );
+  ipcMain.handle('add-false-positive', (event, entry) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    const check = validateFalsePositive(entry);
+    if (!check.valid) {
+      logger.warn(`IPC add-false-positive rejected: ${check.error}`);
+      return { success: false, error: check.error };
+    }
+    config.addFalsePositive(entry);
+    return { success: true };
+  });
+
+  // ── Open external URL ──
+  ipcMain.handle('open-external-url', async (event, url) => {
+    const window = deps.getWindow?.();
+    const stillOwned = () =>
+      deps.getWindow?.() === window && ownsTopLevelRenderer(event, window, deps.rendererUrl);
+    if (!stillOwned()) return { success: false, error: 'Renderer request denied' };
+    const target = parseExternalUrl(url);
+    if (!target) return { success: false, error: 'Invalid external URL' };
+    if (!isTrustedSetupGuide(target.href)) {
+      let answer;
+      try {
+        answer = await dialog.showMessageBox(window, {
+          type: 'question',
+          title: 'AEGIS external link / Link externo',
+          message: 'Open this website in your browser? / Abrir este site no navegador?',
+          detail: `Origin / Origem: ${target.origin}\n\nFull URL / URL completa:\n${target.href}`,
+          buttons: ['Cancel / Cancelar', 'Open website / Abrir site'],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        });
+      } catch (_) {
+        return { success: false, error: 'External URL confirmation unavailable' };
+      }
+      if (!stillOwned()) return { success: false, error: 'Renderer request denied' };
+      if (answer?.response !== 1) return { success: false, error: 'External URL cancelled' };
+    }
+    try {
+      await shell.openExternal(target.href);
+      return { success: true };
+    } catch (_) {
+      return { success: false, error: 'External URL could not be opened' };
+    }
+  });
+
+  // ── Rules (YAML rulesets) ──
+  ipcMain.handle('rules:getAll', (event) =>
+    ownedRead(event, () => {
+      const rules = getAllRules();
+      return Array.from(rules.values()).map((r) => ({
+        id: r.id,
+        name: r.name,
+        category: r.category,
+        risk: r.risk,
+        reason: r.reason,
+        enabled: r.enabled,
+      }));
+    }),
+  );
+
+  ipcMain.handle('rules:reload', (event) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    reloadRules();
+    const rules = getAllRules();
+    return { success: true, count: rules.size };
+  });
+
+  ipcMain.handle('rules:setEnabled', (event, id, enabled) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    const rule = typeof id === 'string' ? getAllRules().get(id) : null;
+    if (!rule || typeof enabled !== 'boolean')
+      return { success: false, error: 'Unknown rule or invalid state' };
+    try {
+      config.saveSettings(
+        {
+          ruleEnabledOverrides: {
+            ...config.getSettings().ruleEnabledOverrides,
+            [id]: enabled,
+          },
+        },
+        { patch: true },
+      );
+      rule.enabled = enabled;
+      return { success: true, id, enabled };
+    } catch {
+      logger.warn('ipc-handlers', 'Rule state could not be saved', {
+        code: 'rule-state-save-failed',
+      });
+      return { success: false, error: 'Rule state could not be saved' };
+    }
+  });
+
+  // ── Alert-only agent watchlist (advisory flag only — never affects monitoring) ──
+  ipcMain.handle('blocklist-add', (event, entry) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    try {
+      return { success: true, entry: blocklist.add(entry) };
+    } catch (error) {
+      logger.warn('IPC blocklist-add failed');
+      return { success: false, error: watchlistErrorMessage(error) };
+    }
+  });
+  ipcMain.handle('blocklist-remove', (event, entry) => {
+    if (!ownsTopLevelRenderer(event, deps.getWindow?.(), deps.rendererUrl))
+      return { success: false, error: 'Renderer request denied' };
+    try {
+      return { success: true, removed: blocklist.remove(entry) };
+    } catch (error) {
+      logger.warn('IPC blocklist-remove failed');
+      return { success: false, error: watchlistErrorMessage(error) };
+    }
+  });
+  ipcMain.handle('blocklist-list', (event) => ownedRead(event, () => blocklist.list()));
+}
+
+module.exports = { init, register };

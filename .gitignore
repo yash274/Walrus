@@ -1,0 +1,226 @@
+node_modules/
+# Disposable local agent/tool output; these rules do not remove or rotate files.
+/.tmp/
+/__pycache__/
+/%SystemDrive%/
+.serena/
+/tools/development/local.json
+dist/
+out/
+coverage/
+# Compiled snapshot sidecar — built from sidecar/procsnap, never committed
+build/sidecar/
+/build/hook-review/
+/build/etw-file/
+/sidecar/etw-file/bin/
+/sidecar/etw-file/obj/
+# Raw bench run output written by bench/run.js (manifest, ndjson, reports).
+# Never commit it: it is machine-local. The committed, redacted copies live in
+# tests/fixtures/bench/ (see that README). Gold-image numbers go in docs/bench/.
+bench/runs/
+# Replay output written by bench/trace/replay-trace.js (the product's own records, plus
+# the Electron profile they were written into). Unlike a run, a replay is a pure
+# function of the trace and the tree, so this is reproducible rather than evidence —
+# and it is replaced on every run. A verdict kept as a target lives in
+# tests/fixtures/bench/goldens/.
+bench/traces-runs/
+# Throwaway mutants written by scripts/verify-witness-gate.mjs and
+# scripts/verify-sequence-gate.mjs (each removes its own in a finally)
+src/main/.mutants/
+# `npx tsc -b` writes one per referenced project, next to the config
+*.tsbuildinfo
+.env
+*.log
+*.json.bak
+.DS_Store
+Thumbs.db
+*.ps1
+!/scripts/installation/protected-gui.ps1
+!/scripts/installation/protected-gui-process.ps1
+!/tests/fixtures/protected-gui/stage.ps1
+!/tests/fixtures/protected-gui-process/stage.ps1
+!/tests/fixtures/protected-installation/gui-stage-composition.ps1
+!/scripts/installation/protected-journal.ps1
+!/tests/fixtures/protected-journal/registration.ps1
+!/tests/fixtures/protected-journal/lifecycle.ps1
+!scripts/qualification/vm-disk-image-controls.ps1
+!/scripts/qualify-windows-installer.ps1
+!/scripts/qualification/cloud-hyperv-operations.ps1
+!/scripts/qualification/qualify-cloud-hyperv.ps1
+!/scripts/qualification/test-cloud-hyperv.ps1
+!/scripts/qualification/cloud-guest-media.ps1
+!/scripts/qualification/cloud-guest-vm.ps1
+!/scripts/qualification/cloud-guest-lab.ps1
+!/scripts/qualification/cloud-guest-bootstrap.ps1
+!/scripts/qualification/test-cloud-guest.ps1
+!/scripts/qualification/test-cloud-guest-diagnostics.ps1
+!/scripts/qualification/test-cloud-guest-bootstrap.ps1
+!/scripts/qualification/test-cloud-guest-invocation.ps1
+!/scripts/qualification/test-cloud-guest-token.ps1
+!/scripts/qualification/test-cloud-guest-token-cleanup.ps1
+!/sidecar/etw-lifecycle/Capture-SuspendContext.ps1
+cdp_*.js
+# Local assistant tooling — kept on disk, not part of the public tree
+.claude/
+.agents/
+!.mcp.json
+aegis-log-*.json
+aegis-export-*.zip
+aegis-full-audit-*.json
+screenshot_test.png
+screenshot_electron.png
+*.exe
+*.pem
+*.key
+*.p12
+*.pfx
+
+.agent/
+.prompts/
+.env.local
+.env.*.local
+
+# Audit artifacts — local only
+docs/audit/
+scripts/capture-audit-screenshots.mjs
+
+# Design mockups — local only
+design/
+
+# Internal dev files — not for public repo
+_env
+_gitignore
+AEGIS-CONTEXT-*.md
+AEGIS-PERSONA-VAULT.md
+
+# Claude Code hook telemetry (UserPromptSubmit) — not produced by AEGIS
+events.jsonl
+
+# Standalone marketing landing page — external artifact, not part of the product
+aegis_landing.html
+
+# Sensitive production/cert files
+.env.production
+*.cert
+*.crt
+.vscode/settings.json
+
+# Chromium/Chrome user-data profile written into the repository root.
+# NOT produced by AEGIS: the only --user-data-dir in this repo is
+# bench/lib/sensor.js:261, which points at os.tmpdir() (see profileDirFor).
+# A Chrome 151 profile landed here on 2026-08-15 from an external launch flag
+# — a browser started with --user-data-dir set to the clone root. Browser
+# profile data is not ours to publish, so keep a recurrence untracked and
+# visible as ignored rather than one `git add -A` away from a public commit.
+# Every rule is root-anchored: a bare `Default/` or `Variations` would also
+# swallow a same-named directory anywhere under src/ or tests/.
+/ActorSafetyLists/
+/AmountExtractionHeuristicRegexes/
+/BrowserMetrics/
+/CaptchaProviders/
+/CertificateRevocation/
+/component_crx_cache/
+/Crashpad/
+/Crowd Deny/
+/Default/
+/extensions_crx_cache/
+/FileTypePolicies/
+/FirstPartySetsPreloaded/
+/GPUPersistentCache/
+/GrShaderCache/
+/hyphen-data/
+/MEIPreload/
+/OnDeviceHeadSuggestModel/
+/optimization_guide_model_store/
+/OptimizationHints/
+/OriginTrials/
+/PKIMetadata/
+/PrivacySandboxAttestationsPreloaded/
+/RecoveryImproved/
+/Safe Browsing/
+/SafetyTips/
+/segmentation_platform/
+/ShaderCache/
+/SSLErrorAssistant/
+/Subresource Filter/
+/TrustTokenKeyCommitments/
+/WasmTtsEngine/
+/WidevineCdm/
+/ZxcvbnData/
+# These four land as plain files, not directories — no trailing slash, or the
+# rule silently matches nothing (`Variations` is Chrome's seed file).
+/first_party_sets.db*
+/Last Browser
+/Last Version
+/Local State
+/Variations
+
+# Public disposable TLS test fixtures; never deployment credentials.
+!tests/main/fixtures/mcp-tls/ca.pem
+!tests/main/fixtures/mcp-tls/expired.pem
+!tests/main/fixtures/mcp-tls/rotated.pem
+!tests/main/fixtures/mcp-tls/server.key
+!tests/main/fixtures/mcp-tls/server.pem
+!tests/main/fixtures/mcp-tls/untrusted.key
+!tests/main/fixtures/mcp-tls/untrusted.pem
+!tests/main/fixtures/mcp-tls/wrong-name.pem
+!/scripts/qualification/test-cloud-guest-network.ps1
+!/scripts/qualification/test-cloud-guest-runtime.ps1
+!/scripts/qualification/test-cloud-guest-desktop.ps1
+
+!/scripts/qualification/cloud-host-routes.ps1
+!/scripts/qualification/test-host-routes.ps1
+
+!/scripts/qualification/cloud-guest-git.ps1
+!/scripts/qualification/test-cloud-guest-git.ps1
+!/scripts/qualification/test-cloud-guest-git-invocation.ps1
+
+!/scripts/qualification/test-cloud-guest-owner-probe.ps1
+
+!/scripts/qualification/cloud-guest-claude-public.ps1
+
+!/scripts/qualification/cloud-guest-claude-phase.ps1
+
+!/scripts/qualification/cloud-guest-claude-bootstrap.ps1
+
+!/scripts/qualification/test-cloud-guest-claude.ps1
+
+!/scripts/qualification/test-cloud-guest-claude-first-phase.ps1
+
+!/scripts/qualification/claude-public/provenance.ps1
+
+!/scripts/qualification/test-cloud-guest-claude-public.ps1
+
+!scripts/qualification/CloudGuestTestWitness.cs
+!scripts/qualification/CloudGuestTestWitnessFixture.cs
+!scripts/qualification/claude-test-witness-runtime.cjs
+!scripts/qualification/claude-test-witness.cjs
+!scripts/qualification/test-cloud-guest-test-witness.cjs
+!scripts/qualification/test-cloud-guest-test-witness.ps1
+
+!/scripts/qualification/CloudGuestLoaderProbe.cs
+!/scripts/qualification/CloudGuestLoaderProbeFixture.cs
+!/scripts/qualification/test-cloud-guest-loader.ps1
+
+!/scripts/qualification/cloud-guest-cancellation.ps1
+!/scripts/qualification/cloud-guest-cancellation-bootstrap.ps1
+!/scripts/qualification/test-cloud-guest-cancellation.ps1
+!/scripts/qualification/test-cloud-guest-shell-diagnostics.ps1
+
+!/scripts/qualification/test-cloud-guest-stdio.ps1
+!/scripts/qualification/cloud-guest-stdio.ps1
+!/scripts/qualification/cloud-guest-stdio-bootstrap.ps1
+!/scripts/qualification/test-cloud-guest-stdio-cloud.ps1
+
+!/scripts/installation/protected-vm.ps1
+!/scripts/installation/protected-vm-provider.ps1
+!/scripts/qualification/protected-vm-controls.ps1
+!/tests/fixtures/protected-installation/vm-fixture.ps1
+!/scripts/installation/protected-guest.ps1
+!/scripts/installation/protected-guest-agent.ps1
+!/scripts/installation/ProtectedGuestVm.cs
+!/scripts/installation/ProtectedGuestAgent.cs
+!/scripts/installation/ProtectedGuestDesktop.cs
+!/scripts/qualification/protected-guest-controls.ps1
+!/tests/fixtures/protected-installation/guest-fixture.ps1
+!/scripts/qualification/test-windows-candidate-021.ps1

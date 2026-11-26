@@ -1,0 +1,177 @@
+/**
+ * @file platform/darwin.js
+ * @description macOS platform implementation.
+ * @since v0.3.0
+ */
+'use strict';
+
+const { execFile } = require('child_process');
+
+let _execFile = execFile;
+/** @internal Override execFile (for tests). */
+function _setExecFileForTest(fn) {
+  _execFile = fn || require('child_process').execFile;
+}
+
+const {
+  parsePsOutput,
+  parseLsofOutput,
+  parseLsofFileHandles,
+  parseLsofCwd,
+  killProcess,
+  suspendProcess,
+  resumeProcess,
+  parseParentProcessMapFromPs,
+} = require('./posix-shared');
+
+/** @type {RegExp[]} macOS-specific file-path patterns to ignore */
+const IGNORE_FILE_PATTERNS = [
+  /^\/System\//,
+  /^\/Library\/Caches\//,
+  /^\/private\/var\//,
+  /\/\.DS_Store$/,
+  /^\/dev\//,
+  /^\/usr\/share\//,
+  /^\/usr\/lib\//,
+  /\.dylib$/,
+];
+
+/**
+ * List running processes via `ps`.
+ * @returns {Promise<Array<{name: string, pid: number}>>}
+ */
+function listProcesses() {
+  return new Promise((resolve, reject) => {
+    _execFile(
+      'ps',
+      ['-axo', 'comm=,pid='],
+      { timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        const results = parsePsOutput(stdout);
+        // macOS .app bundles: /Applications/Foo.app/Contents/MacOS/Foo → Foo
+        // parsePsOutput extracts basename; override with .app bundle name when present
+        for (const line of stdout.trim().split('\n')) {
+          const appMatch = line.match(/\/([^/]+)\.app\//);
+          if (!appMatch) continue;
+          const lastSpace = line.trimEnd().lastIndexOf(' ');
+          if (lastSpace === -1) continue;
+          const pid = parseInt(line.slice(lastSpace + 1), 10);
+          if (isNaN(pid)) continue;
+          const proc = results.find((r) => r.pid === pid);
+          if (proc) proc.name = appMatch[1];
+        }
+        resolve(results);
+      },
+    );
+  });
+}
+
+/**
+ * Build a map of all processes with their parent PIDs via `ps`.
+ * @returns {Promise<Map<number, {name: string, ppid: number}>>}
+ */
+function getParentProcessMap() {
+  return new Promise((resolve) => {
+    _execFile(
+      'ps',
+      ['-axo', 'pid=,ppid=,comm='],
+      { timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          resolve(new Map());
+          return;
+        }
+        resolve(parseParentProcessMapFromPs(stdout));
+      },
+    );
+  });
+}
+
+/**
+ * Get raw TCP connections for given PIDs via `lsof`.
+ * @param {number[]} pids
+ * @returns {Promise<import("../../shared/types/process").RawTcpConnection[]>}
+ */
+function getRawTcpConnections(pids) {
+  return new Promise((resolve, reject) => {
+    if (pids.length === 0) {
+      resolve([]);
+      return;
+    }
+    _execFile(
+      'lsof',
+      ['-i', 'TCP', '-n', '-P', '-F', 'pcnT'],
+      { timeout: 10000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        // B-S05: hard failure rejects; empty matching set still resolves [].
+        if (err) {
+          reject(err);
+          return;
+        }
+        const pidSet = new Set(pids);
+        resolve(parseLsofOutput(stdout, pidSet));
+      },
+    );
+  });
+}
+
+/**
+ * Get file handles for a process via `lsof -p PID -F n`.
+ * @param {number} pid
+ * @returns {Promise<string[]>}
+ */
+function getFileHandles(pid) {
+  return parseLsofFileHandles(pid);
+}
+
+/**
+ * Get the working directory of a process via lsof.
+ * @param {number} pid
+ * @returns {Promise<string|null>}
+ * @since v0.5.0
+ */
+function getProcessCwd(pid) {
+  return parseLsofCwd(pid);
+}
+
+/**
+ * Batch CWD lookup — calls getProcessCwd for each PID.
+ * On macOS, lsof is fast so no special batching needed.
+ * @param {number[]} pids
+ * @returns {Promise<Map<number, string|null>>}
+ * @since v0.5.0
+ */
+async function getProcessCwds(pids) {
+  const map = new Map();
+  const results = await Promise.all(
+    pids.map((pid) => getProcessCwd(pid).then((cwd) => ({ pid, cwd }))),
+  );
+  for (const { pid, cwd } of results) map.set(pid, cwd);
+  return map;
+}
+
+module.exports = {
+  /**
+   * `getParentProcessMap` entries carry no `startTime` here — `ps` could supply one
+   * at second resolution, but it is not wired. process-utils reads this flag as "no
+   * generation is observable", which keeps its parent-chain and cwd caches on their
+   * plain TTL contract instead of paying a `ps` spawn every scan tick.
+   * @type {boolean}
+   */
+  providesStartTime: false,
+  listProcesses,
+  getParentProcessMap,
+  getRawTcpConnections,
+  getFileHandles,
+  getProcessCwd,
+  getProcessCwds,
+  killProcess,
+  suspendProcess,
+  resumeProcess,
+  IGNORE_FILE_PATTERNS,
+  _setExecFileForTest,
+};

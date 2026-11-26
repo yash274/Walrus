@@ -1,0 +1,68 @@
+name: '🐛 Bug Report'
+description: "Something isn't working"
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a suspected security vulnerability, use [private reporting](https://github.com/antropos17/Aegis/security/advisories/new).
+        Remove credentials, private file contents and sensitive paths from public reports and screenshots.
+  - type: input
+    id: aegis-version
+    attributes:
+      label: AEGIS version or source commit
+      description: Include whether this is an installed build, a source checkout or the simulated preview.
+      placeholder: 'e.g. installer version or source commit SHA'
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Windows 10
+        - Windows 11
+        - macOS
+        - Linux
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: Only needed for source checkouts; the project requires Node.js 24.x.
+      placeholder: 'e.g. 24.11.1'
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error logs
+      description: Remove API keys, tokens, private file contents and sensitive paths before posting.
+      render: shell
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots

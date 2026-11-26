@@ -1,0 +1,186 @@
+/* Controls stay still. Live radar and pending work retain bounded motion. */
+.dashboard-grid .chart-column {
+  animation: none;
+}
+:root {
+  --ease-settle: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-press: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --surface-shadow: 0 3px 12px #0002;
+  --control-shadow: 0 5px 12px #0003;
+}
+:root[data-theme^='light'] {
+  --surface-shadow: 0 3px 12px #26352c0b;
+  --control-shadow: 0 5px 12px #26352c1c;
+}
+.radar-clarity > .panel,
+.monitoring-summary > .summary-stat {
+  box-shadow: var(--surface-shadow);
+}
+.radar-layers {
+  display: inline-grid;
+  grid-template-columns: repeat(3, 1fr);
+  position: relative;
+  isolation: isolate;
+  gap: 0;
+  padding: 3px;
+}
+.radar-layers::before {
+  content: '';
+  position: absolute;
+  inset: 3px auto 3px 3px;
+  width: calc((100% - 6px) / 3);
+  border: 1px solid var(--selection-border);
+  border-radius: 6px;
+  background: var(--selection);
+  box-shadow: 0 2px 5px #0002;
+  transform: translateX(calc(var(--layer-index) * 100%));
+  pointer-events: none;
+  z-index: -1;
+}
+.radar-layers button,
+.radar-layers button[aria-pressed='true'] {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  justify-content: center;
+}
+.radar-layers button:not([aria-pressed='true']) {
+  color: var(--muted);
+}
+.radar-clarity .radar-blip::after {
+  content: none;
+}
+.radar-clarity .radar-blip.low {
+  --marker-color: var(--green);
+}
+.radar-clarity .radar-blip.medium {
+  --marker-color: var(--amber);
+}
+.radar-clarity .radar-blip.high {
+  --marker-color: var(--red);
+}
+.action-control .button {
+  position: relative;
+}
+.action-control .button[aria-busy='true']::before {
+  content: '';
+  position: absolute;
+  inset: 2px 2px auto auto;
+  width: 8px;
+  height: 8px;
+  border: 2px solid var(--border);
+  border-top-color: currentColor;
+  border-radius: 50%;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .observatory-app
+    :is(
+      .button,
+      .icon-button,
+      .history-arrow,
+      .tab-close,
+      .nav,
+      .resource-node,
+      .summary-stat.attention,
+      .radar-agent-card,
+      .radar-blip
+    ) {
+    transition:
+      background-color 140ms ease,
+      border-color 140ms ease,
+      box-shadow 140ms ease,
+      color 140ms ease;
+  }
+  .observatory-app :is(.button, .icon-button, .radar-agent-card):hover:not(:disabled) {
+    border-color: var(--strong-border);
+  }
+  .radar-clarity .radar-blip:hover {
+    background: var(--panel);
+    border-color: var(--strong-border);
+    box-shadow: none;
+  }
+  .radar-clarity .dial-sweep {
+    animation-duration: 6s;
+    background: conic-gradient(
+      from 0deg,
+      transparent 0deg 270deg,
+      rgba(var(--sweep-rgb), 0.035) 300deg,
+      rgba(var(--sweep-rgb), 0.2) 346deg,
+      rgba(var(--sweep-rgb), 0.5) 359deg,
+      transparent 360deg
+    );
+  }
+  .radar-layers button {
+    transition: color 140ms ease;
+  }
+  dialog[open],
+  dialog[open]::backdrop {
+    animation: backdrop-arrive 120ms ease-out;
+  }
+  .action-control .button[aria-busy='true']::before {
+    animation: feedback-spin 800ms linear infinite;
+  }
+  .live-badge > .icon {
+    animation: observation-breathe 2.8s ease-in-out infinite;
+  }
+}
+
+.observatory-app:is(.paused, .stale) .live-badge > .icon,
+.observatory-app.paused .radar-blip::after,
+.radar-stage.stale .radar-blip::after {
+  animation-play-state: paused !important;
+}
+:root:is([data-motion='reduce'], .no-motion)
+  :is(
+    .radar-blip,
+    .radar-agent-card,
+    .button,
+    .icon-button,
+    .nav,
+    .nav > .icon,
+    .radar-agent-card > .icon,
+    .resource-node,
+    .history-arrow,
+    .tab-close
+  ) {
+  scale: none;
+  translate: none;
+}
+:root:is([data-motion='reduce'], .no-motion)::view-transition-group(*),
+:root:is([data-motion='reduce'], .no-motion)::view-transition-old(*),
+:root:is([data-motion='reduce'], .no-motion)::view-transition-new(*) {
+  animation: none !important;
+}
+@keyframes observation-echo {
+  0% {
+    opacity: 0.65;
+    transform: scale(1);
+  }
+  12%,
+  100% {
+    opacity: 0;
+    transform: scale(1.75);
+  }
+}
+@keyframes observation-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@keyframes backdrop-arrive {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes feedback-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

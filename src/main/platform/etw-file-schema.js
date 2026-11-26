@@ -1,0 +1,363 @@
+'use strict';
+
+// Closed ETW diagnostic schemas, separate from framing and session validation.
+const PROTOCOL = 'etw-file/10';
+const { validMainLease } = require('./etw-file-custody');
+const PROFILE = 'home-26200-diagnostic-v1';
+const MAX_FRAME_BYTES = 256 * 1024;
+const MAX_DEPTH = 16;
+const SCHEMAS = Object.freeze(['10:0', '12:1', '13:1', '14:1', '15:1']);
+const ERROR_CODES = Object.freeze([
+  'launch-failed',
+  'protocol-failed',
+  'session-failed',
+  'lease-expired',
+  'stop-unverified',
+  'stream-ended',
+  'consumer-failed',
+  'collector-exited',
+  'broker-recovery-pending',
+  'broker-recovery-unverified',
+]);
+const REASONS = Object.freeze([
+  'mapping-uncertain',
+  'identity-uncertain',
+  'population-unavailable',
+  'schema-gap',
+]);
+const oneOf =
+  (...values) =>
+  (v) =>
+    values.includes(v);
+const uint32 = (v) => Number.isInteger(v) && v >= 0 && v <= 0xffffffff;
+const uint64 = (v) =>
+  typeof v === 'string' && /^(0|[1-9]\d{0,19})$/.test(v) && BigInt(v) <= 0xffffffffffffffffn;
+const positive64 = (v) => uint64(v) && v !== '0';
+const nullable = (test) => (v) => v === null || test(v);
+const text = (max) => (v) =>
+  typeof v === 'string' &&
+  v.length > 0 &&
+  v.isWellFormed() &&
+  !/\p{Cc}/u.test(v) &&
+  Buffer.byteLength(v) <= max;
+/** Check a bounded protocol identifier.
+ * @param {unknown} v - Proposed identifier.
+ * @returns {boolean} Whether the identifier is valid.
+ * @since v0.14.2
+ */
+const id = (v) => typeof v === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(v);
+const array = (test, max) => (v) => Array.isArray(v) && v.length <= max && v.every(test);
+const unique = (test, max) => (v) => array(test, max)(v) && new Set(v).size === v.length;
+const shape = (fields) => (v) =>
+  v !== null &&
+  typeof v === 'object' &&
+  !Array.isArray(v) &&
+  Object.keys(v).length === Object.keys(fields).length &&
+  Object.entries(fields).every(([key, test]) => Object.hasOwn(v, key) && test(v[key]));
+const clock = shape({ qpc: uint64, unixMs: uint64, uncertaintyQpc: uint64 });
+const interval = shape({ fromQpc: uint64, toQpc: uint64 });
+const intervalOrdered = (v) => interval(v) && BigInt(v.fromQpc) <= BigInt(v.toQpc);
+const issuerTarget = shape({
+  pid: (v) => uint32(v) && v > 0 && v < 0xffffffff,
+  createTime100ns: positive64,
+});
+const issuerList = (v) =>
+  array(issuerTarget, 16)(v) && new Set(v.map((row) => row.pid)).size === v.length;
+const preparedIssuer = shape({
+  pid: (v) => uint32(v) && v > 0 && v < 0xffffffff,
+  createTime100ns: positive64,
+  threads: (v) => Number.isInteger(v) && v > 0 && v <= 128,
+});
+const preparation = (v) =>
+  shape({ requestId: id, prepared: array(preparedIssuer, 16), asOfQpc: uint64 })(v) &&
+  new Set(v.prepared.map((row) => row.pid)).size === v.prepared.length &&
+  v.prepared.reduce((sum, row) => sum + row.threads, 0) <= 128;
+const counts = shape({
+  eventsLost: nullable(uint64),
+  realTimeBuffersLost: nullable(uint64),
+  logBuffersLost: nullable(uint64),
+  queryStatus: uint32,
+  asOfQpc: uint64,
+});
+const totals = shape({
+  delivered: uint64,
+  filtered: uint64,
+  dropped: uint64,
+  ingressDropped: uint64,
+  outputDropped: uint64,
+  outputOverflowDropped: uint64,
+  outputInvalidatedDropped: uint64,
+  decoderErrors: uint64,
+  mapEpoch: uint64,
+  mapResets: uint64,
+  mapConflicts: uint64,
+});
+const queues = shape({
+  records: uint32,
+  bytes: uint32,
+  highWaterRecords: uint32,
+  highWaterBytes: uint32,
+});
+const boundedQueue = (v) =>
+  queues(v) &&
+  v.records <= v.highWaterRecords &&
+  v.bytes <= v.highWaterBytes &&
+  v.highWaterRecords <= 4096 &&
+  v.highWaterBytes <= 4 * 1024 * 1024;
+const durationShape = shape({
+  calls: uint64,
+  totalTicks: uint64,
+  maxTicks: uint64,
+  failed: uint64,
+});
+const duration = (v) =>
+  durationShape(v) &&
+  BigInt(v.failed) <= BigInt(v.calls) &&
+  BigInt(v.maxTicks) <= BigInt(v.totalTicks) &&
+  BigInt(v.totalTicks) <= BigInt(v.calls) * BigInt(v.maxTicks) &&
+  (v.calls !== '0' || (v.totalTicks === '0' && v.maxTicks === '0'));
+const outputWindowShape = shape({
+  fromQpc: uint64,
+  toQpc: uint64,
+  startRecords: uint32,
+  records: uint32,
+  highWaterRecords: uint32,
+  highWaterBytes: uint32,
+  enqueued: uint64,
+  dequeued: uint64,
+  overflow: uint64,
+  invalidated: uint64,
+});
+const outputWindow = (v) =>
+  outputWindowShape(v) &&
+  BigInt(v.fromQpc) <= BigInt(v.toQpc) &&
+  v.startRecords <= v.highWaterRecords &&
+  v.records <= v.highWaterRecords &&
+  v.highWaterRecords <= 4096 &&
+  v.highWaterBytes <= 4 * 1024 * 1024 &&
+  BigInt(v.startRecords) + BigInt(v.enqueued) ===
+    BigInt(v.records) + BigInt(v.dequeued) + BigInt(v.invalidated);
+const outputFlowShape = shape({
+  asOfQpc: uint64,
+  windowTicks: positive64,
+  evictedWindows: uint64,
+  readyToTake: duration,
+  windows: array(outputWindow, 256),
+});
+const outputFlow = (v) =>
+  outputFlowShape(v) &&
+  v.readyToTake.failed === '0' &&
+  v.windows.length > 0 &&
+  v.windows.every(
+    (w, index, all) =>
+      BigInt(w.fromQpc) % BigInt(v.windowTicks) === 0n &&
+      BigInt(w.toQpc) - BigInt(w.fromQpc) <= BigInt(v.windowTicks) &&
+      BigInt(w.toQpc) <= BigInt(v.asOfQpc) &&
+      (index === 0 ||
+        (BigInt(w.fromQpc) > BigInt(all[index - 1].fromQpc) &&
+          BigInt(w.fromQpc) >= BigInt(all[index - 1].toQpc) &&
+          w.startRecords === all[index - 1].records)),
+  );
+const performanceShape = shape({
+  frequency: positive64,
+  asOfQpc: uint64,
+  pump: duration,
+  outputWrite: duration,
+  idleWait: duration,
+  ingress: boundedQueue,
+  output: boundedQueue,
+  outputFlow,
+  brokerForward: shape({ asOfQpc: uint64, duration }),
+});
+const performance = (v) =>
+  performanceShape(v) &&
+  BigInt(v.outputFlow.asOfQpc) <= BigInt(v.asOfQpc) &&
+  BigInt(v.outputFlow.windowTicks) === BigInt(v.frequency) / 10n &&
+  v.outputFlow.windows.at(-1).records === v.output.records &&
+  BigInt(v.outputWrite.totalTicks) <= BigInt(v.pump.totalTicks) &&
+  BigInt(v.outputWrite.calls) <= BigInt(v.pump.calls);
+const telemetryShape = shape({
+  operational: oneOf(true, false),
+  reasons: unique(oneOf(...REASONS), REASONS.length),
+  counters: counts,
+  totals,
+  queues,
+  performance,
+  coverage: oneOf(PROFILE),
+});
+const telemetry = (v) =>
+  telemetryShape(v) &&
+  v.queues.records <= 4096 &&
+  v.queues.bytes <= 4 * 1024 * 1024 &&
+  v.queues.highWaterRecords <= 4096 &&
+  v.queues.highWaterBytes <= 4 * 1024 * 1024 &&
+  v.queues.records <= v.queues.highWaterRecords &&
+  v.queues.bytes <= v.queues.highWaterBytes &&
+  BigInt(v.totals.filtered) <= BigInt(v.totals.delivered) &&
+  BigInt(v.totals.ingressDropped) + BigInt(v.totals.outputDropped) === BigInt(v.totals.dropped) &&
+  BigInt(v.totals.outputOverflowDropped) + BigInt(v.totals.outputInvalidatedDropped) ===
+    BigInt(v.totals.outputDropped);
+const observationShape = shape({
+  eventSeq: positive64,
+  provider: oneOf('edd08927-9cc4-4e65-b970-c2560fb5c289'),
+  eventId: uint32,
+  version: uint32,
+  qpc: uint64,
+  headerPid: uint32,
+  headerTid: uint32,
+  issuingTid: nullable(uint32),
+  payloadTid: nullable(uint32),
+  path: nullable(text(32 * 1024)),
+  pathEvidence: oneOf(
+    'observed-name',
+    'candidate-object',
+    'candidate-key',
+    'conflict',
+    'unresolved',
+  ),
+  issuerStatus: oneOf('candidate', 'unresolved', 'verified'),
+  issuerPid: nullable(uint32),
+  issuerInterval: nullable(intervalOrdered),
+  generationStatus: oneOf('candidate', 'unresolved', 'verified'),
+  generationWitness: nullable(positive64),
+  generationSource: nullable(oneOf('createTime100ns', 'sequence')),
+  generationInterval: nullable(intervalOrdered),
+  agent: oneOf(null),
+  instanceId: oneOf(null),
+});
+/** Validate one complete native observation without accepting extra fields.
+ * @param {unknown} v Candidate record. @returns {boolean} Validity. @since v0.19.2
+ */
+const observation = (v) =>
+  observationShape(v) &&
+  SCHEMAS.includes(`${v.eventId}:${v.version}`) &&
+  (v.path === null) === ['conflict', 'unresolved'].includes(v.pathEvidence) &&
+  (v.pathEvidence !== 'observed-name' || [10, 12].includes(v.eventId)) &&
+  (v.issuerStatus === 'verified'
+    ? v.eventId === 15 &&
+      v.version === 1 &&
+      v.issuingTid > 0 &&
+      v.issuingTid < 0xffffffff &&
+      v.issuerPid > 0 &&
+      v.issuerPid < 0xffffffff &&
+      v.issuerInterval !== null &&
+      BigInt(v.issuerInterval.fromQpc) < BigInt(v.qpc) &&
+      BigInt(v.qpc) <= BigInt(v.issuerInterval.toQpc) &&
+      v.generationStatus === 'verified' &&
+      v.generationSource === 'createTime100ns' &&
+      v.generationInterval !== null &&
+      BigInt(v.qpc) <= BigInt(v.generationInterval.fromQpc) &&
+      BigInt(v.generationInterval.toQpc) <= BigInt(v.issuerInterval.toQpc)
+    : v.issuerPid === null && v.issuerInterval === null && v.generationStatus !== 'verified') &&
+  (v.generationStatus === 'unresolved'
+    ? v.generationWitness === null && v.generationSource === null && v.generationInterval === null
+    : v.generationWitness !== null && v.generationSource !== null && v.generationInterval !== null);
+const messageData = {
+  hello: shape({
+    build: text(128),
+    profile: oneOf(PROFILE),
+    schemas: unique(oneOf(...SCHEMAS), 5),
+  }),
+  start: shape({ requestId: id, profile: oneOf(PROFILE), buffersMiB: oneOf(16) }),
+  ready: shape({
+    requestId: id,
+    frequency: positive64,
+    clock,
+    buffers: shape({ count: uint32, sizeKiB: uint32 }),
+    telemetry,
+  }),
+  observations: shape({ records: array(observation, 128) }),
+  health: telemetry,
+  heartbeat: telemetry,
+  stop: shape({ requestId: id }),
+  ping: shape({}),
+  'prime-issuers': shape({ requestId: id, issuers: issuerList }),
+  'issuers-primed': preparation,
+  escrow: validMainLease,
+  'escrow-ack': shape({}),
+  'consent-ack': shape({}),
+  rescue: shape({ lease: validMainLease, lastSeq: uint64 }),
+  stopped: shape({
+    requestId: id,
+    drained: oneOf(true, false),
+    stopped: oneOf(true, false),
+    finalEventSeq: uint64,
+    telemetry,
+  }),
+  error: shape({ requestId: nullable(id), code: oneOf(...ERROR_CODES) }),
+  recovering: shape({
+    cause: oneOf('all-three-helpers-exited', 'broker-and-all-helpers-exited'),
+    queryStatus: oneOf(5),
+    consentDeadlineMs: oneOf(120000),
+  }),
+  recovered: shape({
+    cause: oneOf(
+      'collector-exited',
+      'collector-and-guard-exited',
+      'all-three-helpers-exited',
+      'broker-and-all-helpers-exited',
+    ),
+    stopped: oneOf(true),
+    absent: oneOf(true),
+    counters: counts,
+    finalTotals: oneOf(null),
+    observationGap: oneOf(true),
+    collectorExit: (v) => Number.isInteger(v) && v >= -0x80000000 && v <= 0x7fffffff,
+    brokerExit: nullable((v) => Number.isInteger(v) && v >= -0x80000000 && v <= 0x7fffffff),
+    peers: shape({
+      guardExit: (v) => Number.isInteger(v) && v >= -0x80000000 && v <= 0x7fffffff,
+      fallbackExit: (v) => Number.isInteger(v) && v >= -0x80000000 && v <= 0x7fffffff,
+      brokerElevated: oneOf(false),
+      cleanupElevated: oneOf(false, true),
+      accessDenied: oneOf(false, true),
+    }),
+  }),
+};
+
+/** Validate the closed envelope and its message-specific payload.
+ * @param {Object} message - Proposed diagnostic message.
+ * @returns {boolean} Whether fields, ranges and stage loss totals agree.
+ * @since v0.14.2
+ */
+function validEnvelope(message) {
+  const valid = shape({
+    t: (v) => typeof v === 'string' && Object.hasOwn(messageData, v),
+    proto: oneOf(PROTOCOL),
+    launchId: id,
+    sessionId: id,
+    seq: (v) => (message.t === 'escrow' ? v === '0' : positive64(v)),
+    data: (v) => Object.hasOwn(messageData, message.t) && messageData[message.t](v),
+  });
+  if (!valid(message)) return false;
+  if (message.t === 'recovered') {
+    const { peers, cause } = message.data;
+    return (
+      peers.cleanupElevated === peers.accessDenied &&
+      (!peers.cleanupElevated ||
+        ['all-three-helpers-exited', 'broker-and-all-helpers-exited'].includes(cause)) &&
+      (cause === 'broker-and-all-helpers-exited') === (message.data.brokerExit !== null)
+    );
+  }
+  return true;
+}
+
+/** Check the complete native issuer proof before a main-only agent label join.
+ * @param {Object} value Unmodified collector observation.
+ * @returns {boolean} Whether the held-thread/generation contract is valid. @since v0.19.2
+ */
+function verifiedIssuer(value) {
+  return observation(value) && value.issuerStatus === 'verified';
+}
+
+module.exports = {
+  PROTOCOL,
+  PROFILE,
+  MAX_FRAME_BYTES,
+  MAX_DEPTH,
+  SCHEMAS,
+  ERROR_CODES,
+  id,
+  validEnvelope,
+  verifiedIssuer,
+  validObservation: observation,
+};

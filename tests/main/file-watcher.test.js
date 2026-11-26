@@ -1,0 +1,1805 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fileWatcher from '../../src/main/file-watcher.js';
+import Module from 'module';
+import path from 'path';
+import { createRequire } from 'module';
+
+function makeState(overrides = {}) {
+  return {
+    getCustomRules: () => [],
+    getLatestAgents: () => [{ pid: 100, agent: 'Claude Code', category: 'ai' }],
+    getLatestAiAgents: () => [{ pid: 100, agent: 'Claude Code', category: 'ai' }],
+    isMonitoringPaused: () => false,
+    isOtherPanelExpanded: () => false,
+    activityLog: [],
+    knownHandles: new Map(),
+    watchers: [],
+    recordFileAccess: vi.fn(),
+    onFileEvent: vi.fn(),
+    ...overrides,
+  };
+}
+
+const RM_TEST_BIRTH = '133000000000000000';
+function withRmBirth(rows) {
+  return rows.map((row) => ({ createTime100ns: RM_TEST_BIRTH, ...row }));
+}
+function scanRm(state, agents) {
+  const current = withRmBirth(agents);
+  state.getLatestAgents = () => current;
+  return fileWatcher.scanAllFileHandles(current);
+}
+
+describe('file-watcher', () => {
+  describe('classifySensitive()', () => {
+    it('.env → "Environment variables"', () => {
+      expect(fileWatcher.classifySensitive('/home/user/.env')).toBe('Environment variables');
+    });
+
+    it('.ssh/ → "SSH keys/config"', () => {
+      expect(fileWatcher.classifySensitive('/home/user/.ssh/config')).toBe('SSH keys/config');
+    });
+
+    it('.aws/ → "AWS credentials"', () => {
+      expect(fileWatcher.classifySensitive('/home/user/.aws/config')).toBe('AWS credentials');
+    });
+
+    it('.gnupg/ → "GPG keys"', () => {
+      expect(fileWatcher.classifySensitive('/home/user/.gnupg/pubring.kbx')).toBe('GPG keys');
+    });
+
+    it('.kube/ → "Kubernetes config"', () => {
+      expect(fileWatcher.classifySensitive('/home/user/.kube/config')).toBe('Kubernetes config');
+    });
+
+    it('agent config dirs (.claude/, .cursor/)', () => {
+      const claudeResult = fileWatcher.classifySensitive('/home/user/.claude/config.json');
+      expect(claudeResult).toContain('Claude');
+      const cursorResult = fileWatcher.classifySensitive('/home/user/.cursor/settings.json');
+      expect(cursorResult).toContain('Cursor');
+    });
+
+    it('null for non-sensitive', () => {
+      expect(fileWatcher.classifySensitive('/home/user/Documents/readme.txt')).toBeNull();
+    });
+
+    it('Gate ③ config dirs (.config/kilo/, .opencode/, .grok-build/)', () => {
+      expect(fileWatcher.classifySensitive('/home/user/.config/kilo/kilo.jsonc')).toBe(
+        'AI agent config — Kilo Code',
+      );
+      expect(fileWatcher.classifySensitive('/home/user/.opencode/auth.json')).toBe(
+        'AI agent config — opencode',
+      );
+      expect(fileWatcher.classifySensitive('/home/user/.grok-build/settings.json')).toBe(
+        'AI agent config — Grok',
+      );
+    });
+
+    // C-05: SC003/SC004/SC007 anchored to basename (like SC006) — word in a
+    // DIRECTORY name must NOT flag; word in the basename still flags.
+    it('SC003: password in dir name → null (basename-anchored)', () => {
+      expect(
+        fileWatcher.classifySensitive('/home/user/projects/password-manager/README.md'),
+      ).toBeNull();
+    });
+
+    it('SC004: credential in dir name → null (basename-anchored)', () => {
+      expect(
+        fileWatcher.classifySensitive('/home/user/code/credential-helper/index.js'),
+      ).toBeNull();
+    });
+
+    it('SC007: api_key in dir name → null (basename-anchored)', () => {
+      expect(fileWatcher.classifySensitive('/home/user/src/api_key_validator/test.js')).toBeNull();
+    });
+
+    it('SC003: password in basename → "Password file"', () => {
+      expect(fileWatcher.classifySensitive('/home/user/myproj/password.json')).toBe(
+        'Password file',
+      );
+    });
+
+    it('SC004: credentials in basename → "Credentials"', () => {
+      expect(fileWatcher.classifySensitive('/home/user/myproj/credentials.json')).toBe(
+        'Credentials',
+      );
+    });
+
+    it('SC007: api_key in basename → "API key file"', () => {
+      expect(fileWatcher.classifySensitive('/home/user/myproj/my_api_key.txt')).toBe(
+        'API key file',
+      );
+    });
+
+    it('includes custom rules when state is initialized', () => {
+      fileWatcher.init(
+        makeState({
+          getCustomRules: () => [
+            { pattern: /my-internal-project/, reason: 'Custom: my-internal-project' },
+          ],
+        }),
+      );
+      expect(fileWatcher.classifySensitive('/home/my-internal-project/data')).toBe(
+        'Custom: my-internal-project',
+      );
+    });
+
+    it('built-in rules take priority over custom rules', () => {
+      fileWatcher.init(
+        makeState({
+          getCustomRules: () => [{ pattern: /\.ssh/, reason: 'Custom SSH' }],
+        }),
+      );
+      expect(fileWatcher.classifySensitive('/home/user/.ssh/id_rsa')).toBe('SSH keys/config');
+    });
+  });
+
+  describe('shouldIgnore()', () => {
+    it('.tmp files', () => {
+      expect(fileWatcher.shouldIgnore('/home/user/file.tmp')).toBe(true);
+    });
+
+    it.skipIf(process.platform !== 'darwin')('platform-specific patterns (macOS): /System/', () => {
+      expect(fileWatcher.shouldIgnore('/System/Library/something')).toBe(true);
+    });
+
+    it.skipIf(process.platform !== 'darwin')(
+      'platform-specific patterns (macOS): .DS_Store',
+      () => {
+        expect(fileWatcher.shouldIgnore('/Users/test/.DS_Store')).toBe(true);
+      },
+    );
+
+    it('does not ignore normal files', () => {
+      expect(fileWatcher.shouldIgnore('/home/user/project/index.js')).toBe(false);
+    });
+
+    it.skipIf(process.platform !== 'darwin')('/private/var/ on macOS', () => {
+      expect(fileWatcher.shouldIgnore('/private/var/folders/xx/tmp')).toBe(true);
+    });
+
+    it.skipIf(process.platform === 'win32')('/dev/ paths', () => {
+      expect(fileWatcher.shouldIgnore('/dev/null')).toBe(true);
+    });
+  });
+
+  describe('isSelfAccess()', () => {
+    it('Claude → .claude/ is true', () => {
+      expect(fileWatcher.isSelfAccess('Claude Code', '/home/user/.claude/config.json')).toBe(true);
+    });
+
+    it('Cursor → .cursor/ is true', () => {
+      expect(fileWatcher.isSelfAccess('Cursor', '/home/user/.cursor/settings.json')).toBe(true);
+    });
+
+    it('Claude → .cursor/ is false (cross-agent)', () => {
+      expect(fileWatcher.isSelfAccess('Claude Code', '/home/user/.cursor/settings.json')).toBe(
+        false,
+      );
+    });
+
+    it('case-insensitive matching', () => {
+      expect(fileWatcher.isSelfAccess('CLAUDE CODE', '/home/user/.claude/config.json')).toBe(true);
+    });
+
+    it('non-matching agent returns false', () => {
+      expect(fileWatcher.isSelfAccess('SomeAgent', '/home/user/.ssh/id_rsa')).toBe(false);
+    });
+
+    it('Gate ③ agents self-accessing own config is true (suppresses FP)', () => {
+      // Names exactly as the detectors emit them (wsl/ide-extension detectors).
+      expect(fileWatcher.isSelfAccess('Kilo Code', '/home/user/.config/kilo/kilo.jsonc')).toBe(
+        true,
+      );
+      expect(fileWatcher.isSelfAccess('opencode', '/home/user/.opencode/auth.json')).toBe(true);
+      expect(fileWatcher.isSelfAccess('grok', '/home/user/.grok-build/settings.json')).toBe(true);
+    });
+
+    it('Gate ③ cross-agent access stays flagged (not self-access)', () => {
+      // opencode reading Kilo's config is NOT self-access — must remain a threat.
+      expect(fileWatcher.isSelfAccess('opencode', '/home/user/.config/kilo/kilo.jsonc')).toBe(
+        false,
+      );
+      expect(fileWatcher.isSelfAccess('grok', '/home/user/.opencode/auth.json')).toBe(false);
+    });
+  });
+});
+
+describe('file-watcher event handling', () => {
+  let state;
+
+  beforeEach(() => {
+    state = makeState();
+    fileWatcher.init(state);
+    fileWatcher._resetForTest();
+  });
+
+  describe('handleWatcherEvent()', () => {
+    it('creates event with correct structure', () => {
+      // The agent needs a cwd containing the file: without an owner the event is
+      // now UNATTRIBUTED (C-01) instead of being pinned on aiAgents[0].
+      const owner = { pid: 100, agent: 'Claude Code', category: 'ai', cwd: '/home/user/project' };
+      state.getLatestAgents = () => [owner];
+      state.getLatestAiAgents = () => [owner];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/project/index.js');
+      expect(state.activityLog).toHaveLength(1);
+      const event = state.activityLog[0];
+      expect(event.agent).toBe('Claude Code');
+      expect(event.pid).toBe(100);
+      expect(event.action).toBe('modified');
+      expect(event.sensitive).toBe(false);
+      expect(event.reason).toBe('');
+      expect(event.timestamp).toBeGreaterThan(0);
+      expect(event.attribution).toEqual({ status: 'inferred', evidence: ['cwd-containment'] });
+    });
+
+    it('marks sensitive files', () => {
+      fileWatcher.handleWatcherEvent('accessed', '/home/user/.ssh/id_rsa');
+      const event = state.activityLog[0];
+      expect(event.sensitive).toBe(true);
+      expect(event.reason).toBe('SSH keys/config');
+    });
+
+    it('marks self-access correctly', () => {
+      fileWatcher.handleWatcherEvent('modified', '/home/user/.claude/config.json');
+      const event = state.activityLog[0];
+      expect(event.selfAccess).toBe(true);
+      expect(event.sensitive).toBe(false);
+    });
+
+    it('debounces rapid events for same file', () => {
+      fileWatcher.handleWatcherEvent('modified', '/home/user/file.js');
+      fileWatcher.handleWatcherEvent('modified', '/home/user/file.js');
+      fileWatcher.handleWatcherEvent('modified', '/home/user/file.js');
+      expect(state.activityLog).toHaveLength(1);
+    });
+
+    it('admits every sensitive notification before the live pipeline can deduplicate it', () => {
+      for (let i = 0; i < 3; i++)
+        fileWatcher.handleWatcherEvent('accessed', '/home/user/.ssh/id_rsa');
+      expect(state.onFileEvent).toHaveBeenCalledTimes(3);
+      expect(state.activityLog.every((event) => event.sensitive)).toBe(true);
+    });
+
+    it('preserves rapid create, modify, delete and recreate transitions for the same path', () => {
+      const actions = ['created', 'modified', 'deleted', 'created', 'modified'];
+      for (const action of actions)
+        fileWatcher.handleWatcherEvent(action, '/home/user/lifecycle.js');
+      expect(state.activityLog.map((event) => event.action)).toEqual(actions);
+      const ids = state.activityLog.map((event) => event.eventId);
+      expect(new Set(ids).size).toBe(actions.length);
+      for (const id of ids)
+        expect(id).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+        );
+      expect(state.onFileEvent).toHaveBeenCalledTimes(actions.length);
+    });
+
+    it('does not suppress newly available ownership evidence for the same action', () => {
+      state.getLatestAiAgents = () => [];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/project/.env');
+      state.getLatestAiAgents = () => [
+        { pid: 100, agent: 'Codex', cwd: '/home/user/project', instanceId: '100:t1' },
+      ];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/project/.env');
+      expect(state.activityLog).toHaveLength(2);
+      expect(state.activityLog[0].attribution.status).toBe('unattributed');
+      expect(state.activityLog[1].instanceId).toBe('100:t1');
+      expect(state.activityLog[1].attribution.status).toBe('inferred');
+      expect(state.recordFileAccess).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not suppress a notification after the clock moves backwards', () => {
+      const now = vi.spyOn(Date, 'now').mockReturnValue(10000);
+      try {
+        fileWatcher.handleWatcherEvent('modified', '/home/user/clock.js');
+        now.mockReturnValue(9000);
+        fileWatcher.handleWatcherEvent('modified', '/home/user/clock.js');
+        expect(state.activityLog).toHaveLength(2);
+      } finally {
+        now.mockRestore();
+      }
+    });
+
+    it('allows events for different files', () => {
+      fileWatcher.handleWatcherEvent('modified', '/home/user/a.js');
+      fileWatcher.handleWatcherEvent('modified', '/home/user/b.js');
+      expect(state.activityLog).toHaveLength(2);
+    });
+
+    it('skips when monitoring is paused', () => {
+      state.isMonitoringPaused = () => true;
+      fileWatcher.handleWatcherEvent('modified', '/home/user/file.js');
+      expect(state.activityLog).toHaveLength(0);
+    });
+
+    it('F-E02: emits unattributed when zero agents (does not drop the observation)', () => {
+      state.getLatestAgents = () => [];
+      state.getLatestAiAgents = () => [];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/file.js');
+      expect(state.activityLog).toHaveLength(1);
+      const event = state.activityLog[0];
+      expect(event.agent).toBe('');
+      expect(event.pid).toBeNull();
+      expect(event.instanceId).toBeNull();
+      expect(event.attribution).toEqual({
+        status: 'unattributed',
+        evidence: ['no-ai-agents-online'],
+      });
+      expect(state.onFileEvent).toHaveBeenCalledTimes(1);
+      expect(state.recordFileAccess).not.toHaveBeenCalled();
+    });
+
+    it('F-E02: still ignores noise paths when zero agents', () => {
+      state.getLatestAgents = () => [];
+      state.getLatestAiAgents = () => [];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/file.tmp');
+      expect(state.activityLog).toHaveLength(0);
+      expect(state.onFileEvent).not.toHaveBeenCalled();
+    });
+
+    it('skips ignored files', () => {
+      fileWatcher.handleWatcherEvent('modified', '/home/user/file.tmp');
+      expect(state.activityLog).toHaveLength(0);
+    });
+
+    it('calls recordFileAccess for an attributed sensitive event', () => {
+      // ~/.ssh is nobody's cwd and nobody's self-config, so an owner has to be
+      // manufactured for this assertion to be about recordFileAccess at all.
+      const owner = {
+        pid: 100,
+        agent: 'Claude Code',
+        category: 'ai',
+        cwd: '/home/user/.ssh',
+        instanceId: '100:1700000000000',
+      };
+      state.getLatestAgents = () => [owner];
+      state.getLatestAiAgents = () => [owner];
+      fileWatcher.handleWatcherEvent('created', '/home/user/.ssh/key');
+      // Key first: the baseline bucket is per instance, and the key is the owner's own,
+      // carried from the event this call was built from.
+      expect(state.recordFileAccess).toHaveBeenCalledWith(
+        '100:1700000000000',
+        'Claude Code',
+        expect.stringContaining('.ssh'),
+        true,
+        'SSH keys/config',
+      );
+    });
+
+    it('passes a null key for an owner that was never stamped', () => {
+      // An owner with no instanceId (the attachModels pid-0 synthetics) is still passed
+      // through with its name — baselines.js applies the null-key policy and drops it,
+      // rather than the watcher deriving a key of its own (ai-mistakes.md #19).
+      const owner = { pid: 0, agent: 'Ollama', category: 'ai', cwd: '/home/user/.ssh' };
+      state.getLatestAgents = () => [owner];
+      state.getLatestAiAgents = () => [owner];
+      fileWatcher.handleWatcherEvent('created', '/home/user/.ssh/key');
+      expect(state.recordFileAccess).toHaveBeenCalledWith(
+        null,
+        'Ollama',
+        expect.stringContaining('.ssh'),
+        true,
+        'SSH keys/config',
+      );
+    });
+
+    it('does NOT call recordFileAccess for an unattributed event', () => {
+      // Default fixture: one AI agent, no cwd → ~/.ssh/key has no owner. Baselines
+      // must not absorb an event we cannot attribute (C-01).
+      fileWatcher.handleWatcherEvent('created', '/home/user/.ssh/key');
+      expect(state.activityLog[0].attribution.status).toBe('unattributed');
+      expect(state.activityLog[0].sensitive).toBe(true);
+      expect(state.recordFileAccess).not.toHaveBeenCalled();
+    });
+
+    it('calls onFileEvent callback', () => {
+      fileWatcher.handleWatcherEvent('created', '/home/user/file.js');
+      expect(state.onFileEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it('caps activity log at 10000', () => {
+      state.activityLog.length = 9999;
+      state.activityLog.fill({ dummy: true });
+      fileWatcher._resetForTest();
+      fileWatcher.handleWatcherEvent('modified', '/home/user/file.js');
+      expect(state.activityLog.length).toBeLessThanOrEqual(10000);
+    });
+
+    it('prefers the owning AI agent over a generic agent', () => {
+      // The AI agent OWNS the path (cwd containment); the generic one is a decoy.
+      // Previously this test passed with a single cwd-less AI agent, so it could
+      // not tell correct attribution from a blind fallback to aiAgents[0].
+      state.getLatestAgents = () => [{ pid: 50, agent: 'Generic', category: 'other' }];
+      state.getLatestAiAgents = () => [
+        { pid: 100, agent: 'Claude Code', category: 'ai', cwd: '/home/user' },
+      ];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/file.js');
+      expect(state.activityLog[0].agent).toBe('Claude Code');
+      expect(state.activityLog[0].attribution.status).toBe('inferred');
+    });
+
+    it('does not fall back to a generic agent when no AI agent owns the path', () => {
+      state.getLatestAgents = () => [{ pid: 50, agent: 'Generic', category: 'other' }];
+      state.getLatestAiAgents = () => [
+        { pid: 100, agent: 'Claude Code', category: 'ai', cwd: '/home/user/elsewhere' },
+      ];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/file.js');
+      const event = state.activityLog[0];
+      expect(event.agent).toBe('');
+      expect(event.pid).toBeNull();
+      expect(event.attribution).toEqual({ status: 'unattributed', evidence: ['no-owner-match'] });
+    });
+
+    it('attributes a self-config event to the owning agent, not aiAgents[0] (C-01)', () => {
+      // Two AI agents online; the event is opencode accessing its OWN config.
+      // Old code blamed aiAgents[0] (Claude Code) → wrong agent AND a false
+      // sensitive flag, because the self-access check ran against Claude.
+      state.getLatestAiAgents = () => [
+        { pid: 100, agent: 'Claude Code', category: 'ai', cwd: '/home/user/claude-proj' },
+        { pid: 200, agent: 'opencode', category: 'ai', cwd: '/home/user/project' },
+      ];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/.opencode/auth.json');
+      const event = state.activityLog[0];
+      expect(event.agent).toBe('opencode');
+      expect(event.pid).toBe(200);
+      expect(event.selfAccess).toBe(true);
+      expect(event.sensitive).toBe(false);
+    });
+
+    it('attributes a non-config event to the agent whose cwd contains it (C-01)', () => {
+      // A plain (non-sensitive) file inside the SECOND agent's working dir must
+      // attribute to that agent, not aiAgents[0]. Exercises the cwd-ownership
+      // branch (no self-config match is possible for an ordinary source file).
+      state.getLatestAiAgents = () => [
+        { pid: 100, agent: 'Claude Code', category: 'ai', cwd: '/home/user/claude-proj' },
+        { pid: 200, agent: 'opencode', category: 'ai', cwd: '/home/user/project' },
+      ];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/project/src/index.js');
+      const event = state.activityLog[0];
+      expect(event.agent).toBe('opencode');
+      expect(event.pid).toBe(200);
+    });
+  });
+
+  describe('pruneKnownHandles()', () => {
+    it('removes handles for inactive instances', () => {
+      // Keys are stamped instanceIds only — unstamped agents do not keep keys alive.
+      state.knownHandles.set('100:u', new Set(['/a']));
+      state.knownHandles.set('200:u', new Set(['/b']));
+      state.knownHandles.set('300:u', new Set(['/c']));
+      fileWatcher.pruneKnownHandles([
+        { pid: 100, instanceId: '100:u' },
+        { pid: 300, instanceId: '300:u' },
+      ]);
+      expect(state.knownHandles.has('100:u')).toBe(true);
+      expect(state.knownHandles.has('200:u')).toBe(false);
+      expect(state.knownHandles.has('300:u')).toBe(true);
+    });
+
+    it('removes all when no active agents', () => {
+      state.knownHandles.set('100:u', new Set(['/a']));
+      fileWatcher.pruneKnownHandles([]);
+      expect(state.knownHandles.size).toBe(0);
+    });
+
+    // PID reuse: Windows recycles PIDs, so a bare pid is not an identity. The
+    // dedup store must key on instanceId (pid+startTime, process-identity.js):
+    // the LIVE instance's entry survives the prune, the DEAD instance of the
+    // SAME pid is dropped — otherwise the recycled pid inherits "already seen"
+    // and its first .ssh access never fires.
+    it('keeps the live instance entry and drops the dead instance of the same pid', () => {
+      state.knownHandles.set('100:111', new Set(['holding|/home/user/.ssh']));
+      state.knownHandles.set('100:222', new Set(['/a']));
+      fileWatcher.pruneKnownHandles([
+        { pid: 100, agent: 'Claude Code', startTime: 222, instanceId: '100:222' },
+      ]);
+      expect(state.knownHandles.has('100:222')).toBe(true);
+      expect(state.knownHandles.has('100:111')).toBe(false);
+    });
+
+    it('preserves an unwitnessed PID without retaining stale witnessed peers', () => {
+      state.knownHandles.set('100:111', new Set(['holding|/home/user/.ssh']));
+      state.knownHandles.set('100:u', new Set(['holding|/home/user/.ssh']));
+      state.knownHandles.set('200:222', new Set(['/old']));
+      state.knownHandles.set('300:333', new Set(['/gone']));
+      state.knownHandles.set('1000:111', new Set(['/different-pid']));
+      fileWatcher.pruneKnownHandles(
+        [
+          { pid: 100, instanceId: '100:u' },
+          { pid: 200, instanceId: '200:444' },
+        ],
+        { preservePids: new Set([100]) },
+      );
+      expect([...state.knownHandles.keys()].sort()).toEqual(['100:111', '100:u']);
+    });
+
+    it('keeps exact holder history through a millisecond-only fallback for the same instance', () => {
+      const exactKey = '100:1717000000000|133000000000000000';
+      state.knownHandles.set(exactKey, new Set(['holding|/home/user/.ssh']));
+      state.knownHandles.set('200:1717000000000|133000000000000002', new Set(['/old']));
+      fileWatcher.pruneKnownHandles([{ pid: 100, instanceId: '100:1717000000000' }]);
+      expect([...state.knownHandles.keys()]).toEqual([exactKey]);
+
+      fileWatcher.pruneKnownHandles([
+        { pid: 100, instanceId: '100:1717000000000', createTime100ns: '133000000000000001' },
+      ]);
+      expect(state.knownHandles.size).toBe(0);
+    });
+  });
+});
+
+describe('file-watcher scanFileHandles', () => {
+  let state;
+  let mockGetFileHandles;
+
+  beforeEach(() => {
+    mockGetFileHandles = vi.fn();
+    state = makeState();
+    fileWatcher.init(state);
+    fileWatcher._resetForTest();
+    fileWatcher._setDepsForTest({ getFileHandles: mockGetFileHandles });
+  });
+
+  describe('scanAllFileHandles()', () => {
+    it('scans AI agents and returns new events', async () => {
+      mockGetFileHandles.mockResolvedValue([
+        '/home/user/project/file.js',
+        '/home/user/.ssh/id_rsa',
+      ]);
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:u' }];
+      const events = await fileWatcher.scanAllFileHandles(agents);
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      expect(state.activityLog.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('skips ignored files from handle scan', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/file.tmp', '/home/user/real.js']);
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:u' }];
+      const events = await fileWatcher.scanAllFileHandles(agents);
+      expect(events.every((e) => !e.file.endsWith('.tmp'))).toBe(true);
+    });
+
+    it('deduplicates via knownHandles', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/file.js']);
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:u' }];
+
+      await fileWatcher.scanAllFileHandles(agents);
+      const firstLen = state.activityLog.length;
+
+      await fileWatcher.scanAllFileHandles(agents);
+      expect(state.activityLog.length).toBe(firstLen);
+    });
+
+    it('bounds 501 observed paths without repeating activity and admits a replacement after closure', async () => {
+      const paths = Array.from({ length: 501 }, (_, i) => `/home/user/project/f-${i}.js`);
+      const agent = { pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:u' };
+      const onActivityPush = vi.fn();
+      state.onActivityPush = onActivityPush;
+      mockGetFileHandles.mockResolvedValue(paths);
+
+      const first = await fileWatcher.scanAllFileHandles([agent]);
+      expect(first).toHaveLength(500);
+      expect(state.knownHandles.get('100:u').size).toBe(500);
+      expect(fileWatcher.getFileSensorHealth()['fs-handle']).toMatchObject({
+        state: 'DEGRADED',
+        detail: 'handle-path-cap-exceeded',
+        lossCount: 1,
+      });
+
+      const second = await fileWatcher.scanAllFileHandles([agent]);
+      expect(second).toEqual([]); // no false downstream audit or sequence input
+      expect(state.activityLog).toHaveLength(500);
+      expect(state.recordFileAccess).toHaveBeenCalledTimes(500);
+      expect(onActivityPush).toHaveBeenCalledTimes(500);
+      expect(fileWatcher.getFileSensorHealth()['fs-handle'].lossCount).toBe(2);
+
+      mockGetFileHandles.mockResolvedValue([...paths].reverse());
+      expect(await fileWatcher.scanAllFileHandles([agent])).toEqual([]);
+      expect(state.activityLog).toHaveLength(500);
+      expect(fileWatcher.getFileSensorHealth()['fs-handle'].lossCount).toBe(3);
+
+      // The omitted 501st path may disappear before any later scan can emit it.
+      mockGetFileHandles.mockResolvedValue(paths.slice(0, 500));
+      expect(await fileWatcher.scanAllFileHandles([agent])).toEqual([]);
+      expect(fileWatcher.getFileSensorHealth()['fs-handle']).toMatchObject({
+        state: 'DEGRADED',
+        detail: 'residual-loss',
+        lossCount: 3,
+      });
+
+      mockGetFileHandles.mockResolvedValue(paths.slice(1)); // old f-0 closed
+      const recovered = await fileWatcher.scanAllFileHandles([agent]);
+      expect(recovered.map((event) => event.file)).toEqual([paths[500]]);
+      expect(state.knownHandles.get('100:u').size).toBe(500);
+      expect(fileWatcher.getFileSensorHealth()['fs-handle']).toMatchObject({
+        state: 'DEGRADED',
+        detail: 'residual-loss',
+        lastError: null,
+        lossCount: 3,
+      });
+      expect(fileWatcher.getFileSensorHealth()['fs-handle'].lastSuccessAt).toBeTypeOf('number');
+    });
+
+    it('keeps a handle-pool seen-set through raw-birth precision loss', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/.ssh/id_rsa']);
+      const agent = { pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:111' };
+
+      const first = await fileWatcher.scanAllFileHandles([
+        { ...agent, createTime100ns: '133000000000000000' },
+      ]);
+      const fallback = await fileWatcher.scanAllFileHandles([agent]);
+
+      expect(first).toHaveLength(1);
+      expect(fallback).toHaveLength(0);
+      expect(state.knownHandles.size).toBe(1);
+    });
+
+    it('reports a reused same-millisecond PID when fresh precise births differ', async () => {
+      const file = '/home/user/.ssh/id_rsa';
+      const old = {
+        pid: 100,
+        agent: 'Claude Code',
+        category: 'ai',
+        instanceId: '100:1717000000000',
+        createTime100ns: '133000000000000001',
+        generationWitness: '133000000000000001',
+        generationWitnessSource: 'createTime100ns',
+      };
+      const replacement = {
+        ...old,
+        createTime100ns: '133000000000000002',
+        generationWitness: '133000000000000002',
+      };
+      mockGetFileHandles.mockResolvedValue([file]);
+
+      expect(await fileWatcher.scanAllFileHandles([old])).toHaveLength(1);
+      fileWatcher.pruneKnownHandles([replacement], { previousAgents: [old] });
+      const freshEvents = await fileWatcher.scanAllFileHandles([replacement]);
+
+      expect(freshEvents.map((event) => event.file)).toEqual([file]);
+      expect(freshEvents[0].instanceId).toBe(old.instanceId);
+      expect(state.recordFileAccess).toHaveBeenCalledTimes(2);
+    });
+
+    it('preserves the handle history when the next record lacks a precise witness', async () => {
+      const file = '/home/user/.ssh/id_rsa';
+      const old = {
+        pid: 100,
+        agent: 'Claude Code',
+        category: 'ai',
+        instanceId: '100:1717000000000',
+        createTime100ns: '133000000000000001',
+        generationWitness: '133000000000000001',
+        generationWitnessSource: 'createTime100ns',
+      };
+      const fallback = {
+        ...old,
+        createTime100ns: null,
+        generationWitness: null,
+        generationWitnessSource: null,
+      };
+      mockGetFileHandles.mockResolvedValue([file]);
+
+      expect(await fileWatcher.scanAllFileHandles([old])).toHaveLength(1);
+      fileWatcher.pruneKnownHandles([fallback], { previousAgents: [old] });
+      expect(await fileWatcher.scanAllFileHandles([fallback])).toEqual([]);
+      fileWatcher.pruneKnownHandles([old], { previousAgents: [fallback] });
+      expect(await fileWatcher.scanAllFileHandles([old])).toEqual([]);
+      expect(state.recordFileAccess).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not compare different witness sources as if their values shared a scale', async () => {
+      const old = {
+        pid: 100,
+        agent: 'Claude Code',
+        category: 'ai',
+        instanceId: '100:1717000000000',
+        createTime100ns: '133000000000000001',
+        generationWitness: '42',
+        generationWitnessSource: 'sequence',
+      };
+      const sameProcess = {
+        ...old,
+        generationWitness: '133000000000000001',
+        generationWitnessSource: 'createTime100ns',
+      };
+      mockGetFileHandles.mockResolvedValue(['/home/user/.ssh/id_rsa']);
+
+      expect(await fileWatcher.scanAllFileHandles([old])).toHaveLength(1);
+      fileWatcher.pruneKnownHandles([sameProcess], { previousAgents: [old] });
+      expect(await fileWatcher.scanAllFileHandles([sameProcess])).toEqual([]);
+    });
+
+    it('invalidates only the witnessed recycled PID when a peer loses its witness', async () => {
+      const oldReused = {
+        pid: 100,
+        agent: 'Claude Code',
+        category: 'ai',
+        instanceId: '100:1717000000000',
+        generationWitness: '41',
+        generationWitnessSource: 'sequence',
+      };
+      const oldPeer = {
+        pid: 200,
+        agent: 'Cursor',
+        category: 'ai',
+        instanceId: '200:1717000000000',
+        generationWitness: '55',
+        generationWitnessSource: 'sequence',
+      };
+      const replacement = { ...oldReused, generationWitness: '42' };
+      const uncertainPeer = {
+        ...oldPeer,
+        generationWitness: null,
+        generationWitnessSource: null,
+      };
+      mockGetFileHandles.mockResolvedValue(['/home/user/.ssh/id_rsa']);
+
+      expect(await fileWatcher.scanAllFileHandles([oldReused, oldPeer])).toHaveLength(2);
+      fileWatcher.pruneKnownHandles([replacement, uncertainPeer], {
+        previousAgents: [oldReused, oldPeer],
+      });
+      const events = await fileWatcher.scanAllFileHandles([replacement, uncertainPeer]);
+
+      expect(events.map((event) => event.pid)).toEqual([100]);
+      expect(state.recordFileAccess).toHaveBeenCalledTimes(3);
+    });
+
+    // PID reuse: a NEW process on a recycled pid must NOT inherit the dead
+    // process's seen-set — its first sensitive access is a real event. Both
+    // gens carry authoritative stamps (no local buildInstanceId fallback).
+    it('a reused pid does not inherit the dead instance seen-set', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/.ssh/id_rsa']);
+      const gen1 = [
+        { pid: 100, agent: 'Claude Code', category: 'ai', startTime: 111, instanceId: '100:111' },
+      ];
+      const gen2 = [
+        { pid: 100, agent: 'Claude Code', category: 'ai', startTime: 222, instanceId: '100:222' },
+      ];
+      const first = await fileWatcher.scanAllFileHandles(gen1);
+      const second = await fileWatcher.scanAllFileHandles(gen2);
+      expect(first).toHaveLength(1);
+      expect(second).toHaveLength(1); // new instance → first access fires again
+    });
+
+    it('emits events for unstamped agents without inventing a knownHandles key', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/.ssh/id_rsa']);
+      const events = await fileWatcher.scanAllFileHandles([
+        { pid: 100, agent: 'Claude Code', category: 'ai', startTime: 222 },
+      ]);
+      expect(events).toHaveLength(1);
+      expect(events[0].instanceId).toBeNull();
+      // No fabricated map key from partial metadata.
+      expect(state.knownHandles.size).toBe(0);
+    });
+
+    it('returns empty on getFileHandles error but marks fs-handle FAILED (B-S03)', async () => {
+      mockGetFileHandles.mockRejectedValue(new Error('permission denied PRIVATE_HANDLE_CANARY'));
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const events = await fileWatcher.scanAllFileHandles(agents);
+      // Compatibility empty array — health must not look like successful empty.
+      expect(events).toEqual([]);
+      const h = fileWatcher.getFileSensorHealth()['fs-handle'];
+      expect(h.state).toBe('FAILED');
+      expect(h.lastError).toBe('handle-scan-failed');
+      expect(JSON.stringify(h)).not.toContain('PRIVATE_HANDLE_CANARY');
+      expect(h.consecutiveFailures).toBeGreaterThanOrEqual(1);
+    });
+
+    it('returns empty when getFileHandles returns empty and marks HEALTHY', async () => {
+      mockGetFileHandles.mockResolvedValue([]);
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const events = await fileWatcher.scanAllFileHandles(agents);
+      expect(events).toEqual([]);
+      expect(fileWatcher.getFileSensorHealth()['fs-handle'].state).toBe('HEALTHY');
+    });
+
+    it('marks sensitive files in handle scan', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/.ssh/id_rsa']);
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const events = await fileWatcher.scanAllFileHandles(agents);
+      expect(events[0].sensitive).toBe(true);
+      expect(events[0].eventId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+      expect(events[0].reason).toBe('SSH keys/config');
+    });
+
+    it('marks self-access in handle scan', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/.claude/config.json']);
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const events = await fileWatcher.scanAllFileHandles(agents);
+      expect(events[0].selfAccess).toBe(true);
+      expect(events[0].sensitive).toBe(false);
+    });
+
+    it('only scans AI category unless panel expanded', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/file.js']);
+      const agents = [
+        { pid: 100, agent: 'Claude Code', category: 'ai' },
+        { pid: 200, agent: 'Other', category: 'other' },
+      ];
+      await fileWatcher.scanAllFileHandles(agents);
+      expect(mockGetFileHandles).toHaveBeenCalledTimes(1);
+      expect(mockGetFileHandles).toHaveBeenCalledWith(100);
+    });
+
+    it('scans all categories when panel expanded', async () => {
+      state.isOtherPanelExpanded = () => true;
+      mockGetFileHandles.mockResolvedValue(['/home/user/file.js']);
+      const agents = [
+        { pid: 100, agent: 'Claude Code', category: 'ai' },
+        { pid: 200, agent: 'Other', category: 'other' },
+      ];
+      await fileWatcher.scanAllFileHandles(agents);
+      expect(mockGetFileHandles).toHaveBeenCalledTimes(2);
+    });
+
+    it('calls recordFileAccess for each new event, keyed on the scanned instance', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/a.js', '/home/user/b.js']);
+      const agents = [
+        { pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:1700000000000' },
+      ];
+      await fileWatcher.scanAllFileHandles(agents);
+      expect(state.recordFileAccess).toHaveBeenCalledTimes(2);
+      // The scan was run FOR this agent object, so every call carries its key — two
+      // same-named instances therefore fill two different baseline buckets.
+      for (const call of state.recordFileAccess.mock.calls) {
+        expect(call[0]).toBe('100:1700000000000');
+        expect(call[1]).toBe('Claude Code');
+      }
+    });
+
+    it('runs at most FILE_SCAN_CONCURRENCY (5) handle scans concurrently, preserving attribution', async () => {
+      let inFlight = 0;
+      let maxInFlight = 0;
+      mockGetFileHandles.mockImplementation((pid) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            inFlight--;
+            resolve([`/home/user/file-${pid}.js`]);
+          }, 10);
+        });
+      });
+      state.isOtherPanelExpanded = () => true; // scan every agent
+      const agents = Array.from({ length: 12 }, (_, i) => ({
+        pid: 100 + i,
+        agent: `Agent${i}`,
+        category: 'ai',
+      }));
+      const events = await fileWatcher.scanAllFileHandles(agents);
+
+      // Caps AND saturates: a serial loop gives 1, an uncapped Promise.all gives 12.
+      expect(fileWatcher.FILE_SCAN_CONCURRENCY).toBe(5);
+      expect(maxInFlight).toBe(fileWatcher.FILE_SCAN_CONCURRENCY);
+      expect(mockGetFileHandles).toHaveBeenCalledTimes(12); // all still scanned
+      // C-01: each event carries the agent name matching its pid — no cross-wiring.
+      expect(events.filter((e) => e.pid === 105).every((e) => e.agent === 'Agent5')).toBe(true);
+    });
+
+    it('one agent throwing on an unguarded path does not abort the rest of the batch', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/x.js']);
+      state.isOtherPanelExpanded = () => true;
+      // recordFileAccess (file-watcher.js:332) is NOT inside scanFileHandles' try/catch,
+      // so a throw here propagates — the worker pool's try/catch must contain it.
+      state.recordFileAccess = vi.fn((instanceId, agentName) => {
+        if (agentName === 'B') throw new Error('downstream blew up');
+      });
+      const agents = [
+        { pid: 100, agent: 'A', category: 'ai' },
+        { pid: 101, agent: 'B', category: 'ai' }, // throws mid-scan
+        { pid: 102, agent: 'C', category: 'ai' },
+      ];
+      const events = await fileWatcher.scanAllFileHandles(agents);
+      const pids = events.map((e) => e.pid);
+      expect(pids).toContain(100); // A survived
+      expect(pids).toContain(102); // C survived
+      expect(pids).not.toContain(101); // B's events dropped, batch intact
+    });
+  });
+});
+
+// Restart Manager (RM) path — the win32 read-detect replacement for handle.exe.
+// RM inverts the model: register sensitive DIRECTORY groups, one RmGetList per
+// group returns the holder PIDs. file-watcher maps each holder PID → owning agent
+// and emits an `action:'holding'` event (point-in-time handle hold, NOT a read).
+// The whole RM mechanism is injected via _setDepsForTest({ getSensitiveHolders })
+// so these tests never spawn PowerShell. _resetForTest() clears the RM dep so the
+// getFileHandles-pool tests above stay on their own (non-RM) path.
+describe('file-watcher Restart Manager (RM) holder path', () => {
+  let state;
+  let mockGetSensitiveHolders;
+
+  beforeEach(() => {
+    mockGetSensitiveHolders = vi.fn();
+    state = makeState();
+    fileWatcher.init(state);
+    fileWatcher._resetForTest();
+    fileWatcher._setDepsForTest({
+      getSensitiveHolders: async () => withRmBirth(await mockGetSensitiveHolders()),
+    });
+  });
+
+  // #1 (core proof, RED before the RM branch exists): a holder PID resolves to the
+  // OWNING agent by PID — never cross-wired (C-01) — and emits one holding event.
+  it('maps an RM holder PID to the owning agent and emits a holding event (C-01)', async () => {
+    mockGetSensitiveHolders.mockResolvedValue([
+      { pid: 105, group: '/home/user/.ssh', reason: 'SSH keys/config' },
+    ]);
+    const agents = [
+      { pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:u' },
+      { pid: 105, agent: 'Agent5', category: 'ai', instanceId: '105:u' },
+    ];
+    const events = await scanRm(state, agents);
+    expect(events).toHaveLength(1);
+    expect(events[0].agent).toBe('Agent5'); // resolved from holder PID 105, not aiAgents[0]
+    expect(events[0].pid).toBe(105);
+    expect(events[0].action).toBe('holding'); // NOT 'accessed' / 'read' — it's a hold
+    expect(events[0].eventId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+    expect(events[0].file).toBe('/home/user/.ssh'); // the DIRECTORY group, not a fabricated file
+    expect(events[0].sensitive).toBe(true);
+    expect(events[0].reason).toBe('SSH keys/config');
+  });
+
+  // #3 self-access exemption: an agent holding its OWN config dir is expected, not a
+  // threat — selfAccess true, sensitive false (must not regress under the RM path).
+  it('marks an agent holding its OWN config dir as self-access (not a threat)', async () => {
+    mockGetSensitiveHolders.mockResolvedValue([
+      { pid: 100, group: '/home/user/.claude', reason: 'AI agent config — Claude Code' },
+    ]);
+    const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:u' }];
+    const events = await scanRm(state, agents);
+    expect(events).toHaveLength(1);
+    expect(events[0].selfAccess).toBe(true);
+    expect(events[0].sensitive).toBe(false);
+  });
+
+  // #4 own-PID guard: AEGIS's own process holding a watched file must NEVER be
+  // attributed to an agent ("AEGIS is holding your SSH keys" would be a false alarm).
+  it('drops a holder whose PID is AEGIS itself (own-PID guard)', async () => {
+    mockGetSensitiveHolders.mockResolvedValue([
+      { pid: process.pid, group: '/home/user/.ssh', reason: 'SSH keys/config' },
+    ]);
+    const agents = [
+      { pid: process.pid, agent: 'Self', category: 'ai', instanceId: `${process.pid}:u` },
+    ];
+    const events = await scanRm(state, agents);
+    expect(events).toEqual([]);
+  });
+
+  it('drops RM holders whose PID is not a tracked agent', async () => {
+    mockGetSensitiveHolders.mockResolvedValue([
+      { pid: 9999, group: '/home/user/.aws', reason: 'AWS credentials' },
+    ]);
+    const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:u' }];
+    const events = await scanRm(state, agents);
+    expect(events).toEqual([]);
+  });
+
+  // #5 scope honesty: RM catches a handle HELD across the scan tick, never a
+  // transient open→read→close. The same dir held two consecutive scans dedups to
+  // one event — proving we report a sustained hold, not a per-read stream.
+  it('detects a held handle at the scan tick (dedups a sustained hold, not reads)', async () => {
+    mockGetSensitiveHolders.mockResolvedValue([
+      { pid: 105, group: '/home/user/.ssh', reason: 'SSH keys/config' },
+    ]);
+    const agents = [{ pid: 105, agent: 'Agent5', category: 'ai', instanceId: '105:u' }];
+    const first = await scanRm(state, agents);
+    const second = await scanRm(state, agents); // still holding
+    expect(first).toHaveLength(1);
+    expect(second).toHaveLength(0); // sustained hold → one event, not one-per-scan
+  });
+
+  it('bounds 501 held groups without a repeated wave and recovers on the next full scan', async () => {
+    const groups = Array.from({ length: 501 }, (_, i) => `/home/user/.env.${i}`);
+    const agent = {
+      pid: 105,
+      agent: 'Agent5',
+      category: 'ai',
+      instanceId: '105:u',
+    };
+    const holders = groups.map((group) => ({ pid: 105, group, reason: 'Environment variables' }));
+    mockGetSensitiveHolders.mockResolvedValue(holders);
+
+    const first = await scanRm(state, [agent]);
+    expect(fileWatcher.getFileSensorHealth()['fs-rm'].lossCount).toBe(1);
+    const second = await scanRm(state, [agent]);
+    expect(first).toHaveLength(500);
+    expect(second).toEqual([]);
+    expect(state.activityLog).toHaveLength(500);
+    expect(state.recordFileAccess).toHaveBeenCalledTimes(500);
+    expect(state.knownHandles.get(`105:u|${RM_TEST_BIRTH}`).size).toBe(500);
+    expect(fileWatcher.getFileSensorHealth()['fs-rm']).toMatchObject({
+      state: 'DEGRADED',
+      detail: 'rm-holder-cap-exceeded',
+      lossCount: 2,
+    });
+
+    mockGetSensitiveHolders.mockResolvedValue(holders.slice(0, 500));
+    expect(await scanRm(state, [agent])).toEqual([]); // omitted group closed unseen
+    expect(fileWatcher.getFileSensorHealth()['fs-rm']).toMatchObject({
+      state: 'DEGRADED',
+      detail: 'residual-loss',
+      lossCount: 2,
+    });
+
+    mockGetSensitiveHolders.mockResolvedValue(holders.slice(1));
+    const recovered = await scanRm(state, [agent]);
+    expect(recovered.map((event) => event.file)).toEqual([groups[500]]);
+    expect(fileWatcher.getFileSensorHealth()['fs-rm']).toMatchObject({
+      state: 'DEGRADED',
+      detail: 'residual-loss',
+      lastError: null,
+      lossCount: 2,
+    });
+    expect(fileWatcher.getFileSensorHealth()['fs-rm'].lastSuccessAt).toBeTypeOf('number');
+  });
+
+  // PID reuse under the RM path: a recycled pid holding the same group is a NEW
+  // instance — its hold must fire again, not be swallowed by the dead process's
+  // holding-dedup key.
+  it('a reused pid does not inherit the dead instance holding-dedup', async () => {
+    mockGetSensitiveHolders
+      .mockResolvedValueOnce([{ pid: 105, group: '/home/user/.ssh', reason: 'SSH keys/config' }])
+      .mockResolvedValueOnce([
+        {
+          pid: 105,
+          createTime100ns: '133000000000000001',
+          group: '/home/user/.ssh',
+          reason: 'SSH keys/config',
+        },
+      ]);
+    const gen1 = [
+      { pid: 105, agent: 'Agent5', category: 'ai', startTime: 111, instanceId: '105:111' },
+    ];
+    const gen2 = [
+      {
+        pid: 105,
+        agent: 'Agent5',
+        category: 'ai',
+        startTime: 222,
+        instanceId: '105:222',
+        createTime100ns: '133000000000000001',
+      },
+    ];
+    const first = await scanRm(state, gen1);
+    const second = await scanRm(state, gen2);
+    expect(first).toHaveLength(1);
+    expect(second).toHaveLength(1); // new instance on the recycled pid → real event
+  });
+
+  it('does not dedup two verified births that share a PID and birth millisecond', async () => {
+    const firstBirth = RM_TEST_BIRTH;
+    const secondBirth = '133000000000000001';
+    const group = '/home/user/.ssh';
+    mockGetSensitiveHolders
+      .mockResolvedValueOnce([{ pid: 105, createTime100ns: firstBirth, group, reason: 'SSH' }])
+      .mockResolvedValueOnce([{ pid: 105, createTime100ns: secondBirth, group, reason: 'SSH' }]);
+    const firstAgent = {
+      pid: 105,
+      agent: 'First Agent',
+      category: 'ai',
+      instanceId: '105:1717000000000',
+      createTime100ns: firstBirth,
+    };
+    const secondAgent = { ...firstAgent, agent: 'Second Agent', createTime100ns: secondBirth };
+
+    const first = await scanRm(state, [firstAgent]);
+    const second = await scanRm(state, [secondAgent]);
+    expect(first).toHaveLength(1);
+    expect(second).toHaveLength(1);
+    expect(second[0].agent).toBe('Second Agent');
+    expect(state.knownHandles.size).toBe(2);
+    fileWatcher.pruneKnownHandles([secondAgent]);
+    expect([...state.knownHandles.keys()]).toEqual([`${secondAgent.instanceId}|${secondBirth}`]);
+  });
+
+  it('does not attribute a delayed RM holder to a new generation in the same birth millisecond', async () => {
+    const oldBirth = '133000000000000000';
+    const newBirth = '133000000000000001';
+    const oldAgent = {
+      pid: 105,
+      agent: 'Old Agent',
+      category: 'ai',
+      instanceId: '105:1717000000000',
+      createTime100ns: oldBirth,
+    };
+    const newAgent = { ...oldAgent, agent: 'New Agent', createTime100ns: newBirth };
+    let current = [oldAgent];
+    state.getLatestAgents = () => current;
+    let finishFetch;
+    mockGetSensitiveHolders
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishFetch = resolve;
+          }),
+      )
+      .mockResolvedValueOnce([
+        { pid: 105, createTime100ns: newBirth, group: '/home/user/.ssh', reason: 'SSH' },
+      ]);
+
+    const delayed = fileWatcher.scanAllFileHandles([oldAgent]);
+    expect(finishFetch).toBeTypeOf('function');
+    current = [newAgent];
+    finishFetch([{ pid: 105, createTime100ns: oldBirth, group: '/home/user/.ssh', reason: 'SSH' }]);
+    expect(await delayed).toEqual([]);
+    expect(state.knownHandles.size).toBe(0);
+    expect(state.activityLog).toEqual([]);
+    expect(fileWatcher.getFileSensorHealth()['fs-rm'].state).toBe('DEGRADED');
+
+    const fresh = await fileWatcher.scanAllFileHandles([newAgent]);
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0].agent).toBe('New Agent');
+    expect(state.activityLog).toEqual(fresh);
+  });
+
+  it('does not turn a population outage during RM collection into a confirmed hold or healthy scan', async () => {
+    const birth = '133000000000000001';
+    const agent = {
+      pid: 105,
+      agent: 'Agent5',
+      category: 'ai',
+      instanceId: '105:1717000000000',
+      createTime100ns: birth,
+    };
+    state.getLatestAgents = () => [agent];
+    let reliable = true;
+    fileWatcher._setDepsForTest({
+      getProcessCapabilities: () => ({ populationReliable: reliable }),
+    });
+    let finishFetch;
+    mockGetSensitiveHolders.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishFetch = resolve;
+        }),
+    );
+
+    const pending = fileWatcher.scanAllFileHandles([agent]);
+    reliable = false;
+    finishFetch([{ pid: 105, createTime100ns: birth, group: '/home/user/.ssh', reason: 'SSH' }]);
+    expect(await pending).toEqual([]);
+    expect(state.activityLog).toEqual([]);
+    expect(state.knownHandles.size).toBe(0);
+    expect(fileWatcher.getFileSensorHealth()['fs-rm'].detail).toBe(
+      'process-observation-unavailable',
+    );
+  });
+
+  it('marks a holder unverifiable while the process snapshot has only a millisecond birth', async () => {
+    mockGetSensitiveHolders.mockResolvedValue([
+      { pid: 105, group: '/home/user/.ssh', reason: 'SSH' },
+    ]);
+    const withoutExactBirth = {
+      pid: 105,
+      agent: 'Agent5',
+      category: 'ai',
+      instanceId: '105:1717000000000',
+    };
+    state.getLatestAgents = () => [withoutExactBirth];
+    expect(await fileWatcher.scanAllFileHandles([withoutExactBirth])).toEqual([]);
+    expect(state.knownHandles.size).toBe(0);
+    expect(fileWatcher.getFileSensorHealth()['fs-rm'].detail).toBe('rm-holder-identity-unverified');
+
+    const recovered = withRmBirth([withoutExactBirth]);
+    state.getLatestAgents = () => recovered;
+    const events = await fileWatcher.scanAllFileHandles(recovered);
+    expect(events).toHaveLength(1);
+    expect(fileWatcher.getFileSensorHealth()['fs-rm'].state).toBe('HEALTHY');
+  });
+
+  it('marks a failed RM transport as failed rather than a healthy empty scan', async () => {
+    mockGetSensitiveHolders.mockRejectedValue(new Error('private path failure canary'));
+    const agents = withRmBirth([
+      { pid: 105, agent: 'Agent5', category: 'ai', instanceId: '105:1717000000000' },
+    ]);
+    state.getLatestAgents = () => agents;
+
+    expect(await fileWatcher.scanAllFileHandles(agents)).toEqual([]);
+    const health = fileWatcher.getFileSensorHealth()['fs-rm'];
+    expect(health.state).toBe('FAILED');
+    expect(health.lastError).toBe('rm-fetch-failed');
+    expect(JSON.stringify(health)).not.toContain('private path failure canary');
+  });
+});
+
+// Hot read-detect cycle (~10s) — the fast RM poll over HOT_DIRS. Its whole point
+// is shared dedup: a hold caught by EITHER the hot cycle or the full (30s) scan
+// must fire ONCE, because both cycles write the same key into the shared
+// knownHandles. These RED before scanHotFileHolders exists, and stay RED for the
+// wrong implementation (a hot cycle that keeps its OWN dedup state → 2 events).
+describe('file-watcher hot read-detect cycle (cross-cycle dedup)', () => {
+  let state;
+  let mockFull;
+  let mockHot;
+  const HOLDER = withRmBirth([{ pid: 105, group: '/home/user/.ssh', reason: 'SSH keys/config' }]);
+  const AGENTS = withRmBirth([{ pid: 105, agent: 'Agent5', category: 'ai', instanceId: '105:u' }]);
+
+  beforeEach(() => {
+    mockFull = vi.fn().mockResolvedValue(HOLDER);
+    mockHot = vi.fn().mockResolvedValue(HOLDER);
+    state = makeState();
+    state.getLatestAgents = () => AGENTS;
+    fileWatcher.init(state);
+    fileWatcher._resetForTest();
+    fileWatcher._setDepsForTest({
+      getSensitiveHolders: mockFull,
+      getHotSensitiveHolders: mockHot,
+    });
+  });
+
+  // Core proof + C-01: the hot scan resolves the holder PID to its OWNING agent
+  // and emits a `holding` (never read/accessed) event.
+  it('hot scan emits a holding event attributed by PID (C-01)', async () => {
+    const events = await fileWatcher.scanHotFileHolders(AGENTS);
+    expect(events).toHaveLength(1);
+    expect(events[0].agent).toBe('Agent5');
+    expect(events[0].pid).toBe(105);
+    expect(events[0].action).toBe('holding');
+    expect(events[0].file).toBe('/home/user/.ssh');
+  });
+
+  // Hot then full: full must see the shared dedup key and emit nothing.
+  it('hot scan then full scan of the same holder → ONE event total', async () => {
+    const hot = await fileWatcher.scanHotFileHolders(AGENTS);
+    const full = await fileWatcher.scanAllFileHandles(AGENTS);
+    expect(hot).toHaveLength(1);
+    expect(full).toHaveLength(0);
+  });
+
+  // Reverse order (full first, e.g. agent already held at process start): the hot
+  // cycle must then dedup against the full scan.
+  it('full scan then hot scan of the same holder → ONE event total (reverse order)', async () => {
+    const full = await fileWatcher.scanAllFileHandles(AGENTS);
+    const hot = await fileWatcher.scanHotFileHolders(AGENTS);
+    expect(full).toHaveLength(1);
+    expect(hot).toHaveLength(0);
+  });
+
+  // A sustained hold sampled repeatedly by the FAST cycle still fires once.
+  it('repeated hot scans of a sustained hold → one event, not one-per-tick', async () => {
+    const first = await fileWatcher.scanHotFileHolders(AGENTS);
+    const second = await fileWatcher.scanHotFileHolders(AGENTS);
+    expect(first).toHaveLength(1);
+    expect(second).toHaveLength(0);
+  });
+
+  it('a narrow hot scan cannot clear full-scan holder-cap coverage loss', async () => {
+    const fullHolders = withRmBirth(
+      Array.from({ length: 501 }, (_, i) => ({
+        pid: 105,
+        group: `/home/user/.env.${i}`,
+        reason: 'Environment variables',
+      })),
+    );
+    mockFull.mockResolvedValue(fullHolders);
+    mockHot.mockResolvedValue(fullHolders.slice(0, 1));
+
+    await fileWatcher.scanAllFileHandles(AGENTS);
+    expect(fileWatcher.getFileSensorHealth()['fs-rm']).toMatchObject({
+      detail: 'rm-holder-cap-exceeded',
+      lossCount: 1,
+    });
+    await fileWatcher.scanHotFileHolders(AGENTS);
+    expect(fileWatcher.getFileSensorHealth()['fs-rm']).toMatchObject({
+      state: 'DEGRADED',
+      detail: 'rm-holder-cap-exceeded',
+      lossCount: 1,
+    });
+
+    mockFull.mockResolvedValue(fullHolders.slice(1));
+    await fileWatcher.scanAllFileHandles(AGENTS);
+    expect(fileWatcher.getFileSensorHealth()['fs-rm']).toMatchObject({
+      state: 'DEGRADED',
+      detail: 'residual-loss',
+      lossCount: 1,
+    });
+  });
+
+  // Capability gate: with no hot holder source wired (darwin/linux), the hot scan
+  // is a cheap no-op — never throws, returns [].
+  it('returns [] when no hot holder source is available (darwin/linux)', async () => {
+    fileWatcher._resetForTest(); // clears the injected hot dep
+    const events = await fileWatcher.scanHotFileHolders(AGENTS);
+    expect(events).toEqual([]);
+    expect(fileWatcher.isHotReadScanActive()).toBe(false);
+  });
+});
+
+// A FileEvent must carry the process-INSTANCE key of the agent it was attributed
+// to, taken from that tick's agent OBJECT — the renderer has nothing to correlate
+// events by otherwise, and a bare pid is not an identity on a system that recycles
+// pids. Three emit sites, one rule: the resolved owner's own `instanceId`, or
+// `null`. Every assertion below goes red if the stamp is dropped from its site.
+describe('file-watcher instanceId on FileEvent', () => {
+  describe('handleWatcherEvent() — the path with no PID of its own', () => {
+    let state;
+
+    beforeEach(() => {
+      state = makeState();
+      fileWatcher.init(state);
+      fileWatcher._resetForTest();
+    });
+
+    // `inferred` still means a real owner from this tick. Gating the stamp on
+    // `status === 'confirmed'` would silently drop the key on every cwd-matched
+    // event — chokidar's ENTIRE output, since it hands us a path and never a pid.
+    it('stamps the cwd-owner exact key on an inferred event', () => {
+      const owner = {
+        pid: 100,
+        agent: 'Claude Code',
+        category: 'ai',
+        cwd: '/home/user/project',
+        instanceId: '100:1700000000111',
+      };
+      state.getLatestAgents = () => [owner];
+      state.getLatestAiAgents = () => [owner];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/project/index.js');
+      const event = state.activityLog[0];
+      expect(event.attribution.status).toBe('inferred');
+      expect(event.instanceId).toBe('100:1700000000111');
+    });
+
+    // The forbidden fallback, made reachable: two AI agents ARE online and one is
+    // sitting at index 0 — the event still belongs to neither. `null`, not
+    // `aiAgents[0].instanceId`, not a name match against 'Claude Code'.
+    it('leaves instanceId null on an unattributed event even with agents online', () => {
+      const agents = [
+        {
+          pid: 100,
+          agent: 'Claude Code',
+          category: 'ai',
+          cwd: '/home/user/project',
+          instanceId: '100:1700000000111',
+        },
+        {
+          pid: 200,
+          agent: 'opencode',
+          category: 'ai',
+          cwd: '/home/user/other',
+          instanceId: '200:1700000000222',
+        },
+      ];
+      state.getLatestAgents = () => agents;
+      state.getLatestAiAgents = () => agents;
+      fileWatcher.handleWatcherEvent('modified', '/home/user/unowned/data.txt');
+      const event = state.activityLog[0];
+      expect(event.attribution).toEqual({ status: 'unattributed', evidence: ['no-owner-match'] });
+      expect(event.agent).toBe('');
+      expect(event.pid).toBeNull();
+      expect(event.instanceId).toBeNull();
+      // and specifically NOT either agent's key
+      expect(event.instanceId).not.toBe('100:1700000000111');
+      expect(event.instanceId).not.toBe('200:1700000000222');
+    });
+
+    it('leaves instanceId null when no AI agent is online at all', () => {
+      state.getLatestAgents = () => [{ pid: 100, agent: 'chrome', category: 'other' }];
+      state.getLatestAiAgents = () => [];
+      fileWatcher.handleWatcherEvent('modified', '/home/user/.ssh/id_rsa');
+      const event = state.activityLog[0];
+      expect(event.attribution).toEqual({
+        status: 'unattributed',
+        evidence: ['no-ai-agents-online'],
+      });
+      expect(event.instanceId).toBeNull();
+    });
+
+    // The self-config owner is found by scanning ALL ai agents, so the winner can be
+    // any index. The key must follow the winner, not the scan order.
+    it('stamps the self-config owner key, not the first agent key', () => {
+      const agents = [
+        { pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:1700000000111' },
+        { pid: 200, agent: 'Cursor', category: 'ai', instanceId: '200:1700000000222' },
+      ];
+      state.getLatestAgents = () => agents;
+      state.getLatestAiAgents = () => agents;
+      fileWatcher.handleWatcherEvent('modified', '/home/user/.cursor/settings.json');
+      const event = state.activityLog[0];
+      expect(event.agent).toBe('Cursor');
+      expect(event.instanceId).toBe('200:1700000000222');
+    });
+  });
+
+  describe('scanFileHandles() — handle-scan-pid', () => {
+    let state;
+    let mockGetFileHandles;
+
+    beforeEach(() => {
+      mockGetFileHandles = vi.fn();
+      state = makeState();
+      fileWatcher.init(state);
+      fileWatcher._resetForTest();
+      fileWatcher._setDepsForTest({ getFileHandles: mockGetFileHandles });
+    });
+
+    it('stamps the scanned agent exact key on a confirmed event', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/.ssh/id_rsa']);
+      const agents = [
+        {
+          pid: 100,
+          agent: 'Claude Code',
+          category: 'ai',
+          startTime: 1700000000111,
+          instanceId: '100:1700000000111',
+        },
+      ];
+      const events = await fileWatcher.scanAllFileHandles(agents);
+      expect(events).toHaveLength(1);
+      expect(events[0].attribution.status).toBe('confirmed');
+      expect(events[0].instanceId).toBe('100:1700000000111');
+    });
+
+    // Read the key, never re-derive it. This agent has a pid AND a startTime, so
+    // buildInstanceId() would happily return '100:1700000000111' — a key the
+    // renderer never saw in scan-batch for this agent, joining to nothing. `null`
+    // is the honest answer, and this test fails for any implementation that
+    // derives instead of reads.
+    it('leaves instanceId null for an owner that carries no key of its own', async () => {
+      mockGetFileHandles.mockResolvedValue(['/home/user/.ssh/id_rsa']);
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai', startTime: 1700000000111 }];
+      const events = await fileWatcher.scanAllFileHandles(agents);
+      expect(events).toHaveLength(1);
+      expect(events[0].instanceId).toBeNull();
+    });
+  });
+
+  describe('_scanRmHolders() — rm-holder-pid', () => {
+    let state;
+    let mockGetSensitiveHolders;
+
+    beforeEach(() => {
+      mockGetSensitiveHolders = vi.fn();
+      state = makeState();
+      fileWatcher.init(state);
+      fileWatcher._resetForTest();
+      fileWatcher._setDepsForTest({
+        getSensitiveHolders: async () => withRmBirth(await mockGetSensitiveHolders()),
+      });
+    });
+
+    it('stamps the holder agent key, not the first agent key (C-01)', async () => {
+      mockGetSensitiveHolders.mockResolvedValue([
+        { pid: 105, group: '/home/user/.ssh', reason: 'SSH keys/config' },
+      ]);
+      const agents = [
+        { pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:1700000000111' },
+        { pid: 105, agent: 'Agent5', category: 'ai', instanceId: '105:1700000000555' },
+      ];
+      const events = await scanRm(state, agents);
+      expect(events).toHaveLength(1);
+      expect(events[0].agent).toBe('Agent5');
+      expect(events[0].instanceId).toBe('105:1700000000555');
+    });
+
+    // The collision the whole migration exists to break: two live instances of ONE
+    // agent name. Same display name, same sensitive group, different keys — so the
+    // two events must not share one. A name-derived or first-match stamp collapses
+    // them and this fails.
+    it('gives two same-name instances two different keys', async () => {
+      mockGetSensitiveHolders.mockResolvedValue([
+        { pid: 100, group: '/home/user/.ssh', reason: 'SSH keys/config' },
+        { pid: 200, group: '/home/user/.ssh', reason: 'SSH keys/config' },
+      ]);
+      const agents = [
+        {
+          pid: 100,
+          agent: 'Claude Code',
+          category: 'ai',
+          cwd: '/home/user/projA',
+          instanceId: '100:1700000000111',
+        },
+        {
+          pid: 200,
+          agent: 'Claude Code',
+          category: 'ai',
+          cwd: '/home/user/projB',
+          instanceId: '200:1700000000222',
+        },
+      ];
+      const events = await scanRm(state, agents);
+      expect(events).toHaveLength(2);
+      expect(events.map((e) => e.agent)).toEqual(['Claude Code', 'Claude Code']);
+      expect(events[0].instanceId).toBe('100:1700000000111');
+      expect(events[1].instanceId).toBe('200:1700000000222');
+      expect(new Set(events.map((e) => e.instanceId)).size).toBe(2);
+    });
+  });
+});
+
+// ── Hot-reload watchers (docs/roadmap/sequence-rules.md §5 "Hot-reload") ────────
+//
+// Two chokidar watchers, one per rule directory, and the hole the second one closes:
+// an edit to a FLAT rule file must not reach the sequence reload (which resets the
+// engine and drops its open sequences), and an edit under `rules/sequences` must not
+// reload the flat rules. `chokidar.watch` and `./rule-loader` are replaced through
+// `Module._load` on a fresh native require of the module (the
+// file-watcher-subscription.test.js convention), so the handlers run against fakes
+// and no watcher touches the host filesystem.
+describe('file-watcher rules hot-reload watchers', () => {
+  const require_ = createRequire(import.meta.url);
+  const originalLoad = Module._load;
+  const fwPath = require_.resolve('../../src/main/file-watcher.js');
+  const RULES_DIR = path.join(path.dirname(fwPath), '..', '..', 'rules');
+  const SEQUENCES_DIR = path.join(RULES_DIR, 'sequences');
+
+  /** @type {Array<{paths: unknown, opts: Record<string, any>, emit: Function}>} */
+  let watchers;
+  /** @type {import('vitest').Mock} */
+  let reloadRules;
+  /** @type {Map<string, object>} */
+  let flatRules;
+  /** @type {typeof import('../../src/main/file-watcher.js')} */
+  let fw;
+
+  beforeEach(() => {
+    watchers = [];
+    flatRules = new Map([
+      ['FA001', {}],
+      ['FA002', {}],
+      ['SC003', {}],
+    ]);
+    // The flat reload changes the set it reloads, so `count` read AFTER it is distinguishable
+    // from one read before.
+    reloadRules = vi.fn(() => {
+      flatRules.set('SC004', {});
+    });
+    Module._load = function (request, parent) {
+      if (request === 'chokidar') {
+        return {
+          watch: (paths, opts) => {
+            const handlers = new Map();
+            const w = {
+              paths,
+              opts,
+              on(event, cb) {
+                handlers.set(event, cb);
+                return w;
+              },
+              emit(event, ...args) {
+                const cb = handlers.get(event);
+                if (cb) cb(...args);
+              },
+              close: () => {},
+            };
+            watchers.push(w);
+            return w;
+          },
+        };
+      }
+      if (request === './rule-loader' && parent && parent.filename === fwPath) {
+        return { getAllRules: () => flatRules, reloadRules };
+      }
+      return originalLoad.apply(this, arguments);
+    };
+    delete require_.cache[fwPath];
+    fw = require_('../../src/main/file-watcher.js');
+  });
+
+  afterEach(() => {
+    Module._load = originalLoad;
+    delete require_.cache[fwPath];
+  });
+
+  /**
+   * Both watchers installed on one `sendFn`, the way `startWatchers` installs them.
+   * @param {{sequenceCount?: () => number, reload?: () => number}} [deps]
+   * @returns {{sendFn: import('vitest').Mock, reload: import('vitest').Mock, flat: any, seq: any}}
+   */
+  function installBoth({ sequenceCount = () => 1, reload = () => 1 } = {}) {
+    const sendFn = vi.fn();
+    const reloadSpy = vi.fn(reload);
+    fw.setupRulesWatcher(sendFn, { sequenceCount });
+    fw.setupSequenceRulesWatcher(sendFn, { reload: reloadSpy });
+    return { sendFn, reload: reloadSpy, flat: watchers[0], seq: watchers[1] };
+  }
+
+  it('watches rules/ and rules/sequences with the same options — depth 0, function-form ignored', () => {
+    installBoth();
+
+    expect(watchers.map((w) => w.paths)).toEqual([RULES_DIR, SEQUENCES_DIR]);
+    for (const w of watchers) {
+      expect(w.opts).toMatchObject({
+        persistent: false,
+        ignoreInitial: true,
+        followSymlinks: false,
+        depth: 0,
+      });
+      expect(typeof w.opts.ignored).toBe('function');
+    }
+  });
+
+  it('an _-prefixed file is ignored by both watchers, a rule file is not', () => {
+    const { flat, seq } = installBoth();
+
+    expect(flat.opts.ignored(path.join(RULES_DIR, '_schema.json'))).toBe(true);
+    expect(flat.opts.ignored(path.join(RULES_DIR, 'file-access.yaml'))).toBe(false);
+    expect(seq.opts.ignored(path.join(SEQUENCES_DIR, '_draft.yaml'))).toBe(true);
+    expect(seq.opts.ignored(path.join(SEQUENCES_DIR, 'sequences.yaml'))).toBe(false);
+  });
+
+  it('a change under rules/sequences calls reload, leaves the flat rules alone and pushes sequenceCount', () => {
+    const { sendFn, reload, seq } = installBoth({ reload: () => 2 });
+
+    seq.emit('change', path.join(SEQUENCES_DIR, 'sequences.yaml'));
+
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(reloadRules).not.toHaveBeenCalled();
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    expect(sendFn).toHaveBeenCalledWith('rules:reloaded', {
+      count: 3,
+      sequenceCount: 2,
+    });
+  });
+
+  it('a change to a flat rule file reloads the flat rules and never calls the sequence reload', () => {
+    const { sendFn, reload, flat } = installBoth({ sequenceCount: () => 1 });
+
+    flat.emit('change', path.join(RULES_DIR, 'PRIVATE_RULE_NAME_CANARY.yaml'));
+
+    expect(reloadRules).toHaveBeenCalledTimes(1);
+    expect(reload).not.toHaveBeenCalled();
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    // `count` is the size AFTER the reload (4, not the 3 the map held before it).
+    expect(sendFn).toHaveBeenCalledWith('rules:reloaded', {
+      count: 4,
+      sequenceCount: 1,
+    });
+    expect(JSON.stringify(sendFn.mock.calls)).not.toContain('PRIVATE_RULE_NAME_CANARY');
+  });
+
+  it.each(['add', 'unlink'])(
+    'a flat YAML %s refreshes counts without resetting sequences',
+    (event) => {
+      const { sendFn, reload, flat } = installBoth({ sequenceCount: () => 2 });
+      reloadRules.mockImplementation(() => {
+        if (event === 'add') flatRules.set('ADDED', {});
+        else flatRules.delete('FA001');
+      });
+
+      flat.emit(event, path.join(RULES_DIR, 'file-access.yml'));
+
+      expect(reloadRules).toHaveBeenCalledTimes(1);
+      expect(reload).not.toHaveBeenCalled();
+      expect(sendFn).toHaveBeenCalledExactlyOnceWith('rules:reloaded', {
+        count: event === 'add' ? 4 : 2,
+        sequenceCount: 2,
+      });
+    },
+  );
+
+  it.each(['add', 'unlink'])('a sequence YAML %s installs the current detection rules', (event) => {
+    const engine = require_('../../src/main/sequence-engine.js');
+    const onDetection = vi.fn();
+    const rule = {
+      id: 'RELOAD_TEST',
+      title: 'Reload test',
+      level: 'high',
+      timespanMs: 60000,
+      steps: [
+        {
+          name: 'enter',
+          category: 'process',
+          matcher: (doc) => doc.event.action === 'agent-enter',
+        },
+        { name: 'exit', category: 'process', matcher: (doc) => doc.event.action === 'agent-exit' },
+      ],
+    };
+    const start = (rules) => engine.init({ rules, now: () => 1000, onDetection });
+    const detect = (instanceId) => {
+      const carrier = {
+        instanceId,
+        pid: 4242,
+        agent: 'Claude Code',
+        process: 'node.exe',
+        firstSeen: 1,
+      };
+      engine.ingest(carrier);
+      engine.ingest({ ...carrier, lastSeen: 2 });
+    };
+    try {
+      start([rule]);
+      detect('4242:1');
+      expect(onDetection).toHaveBeenCalledTimes(1);
+      onDetection.mockClear();
+      start(event === 'add' ? [] : [rule]);
+      const { seq, reload, sendFn } = installBoth({
+        reload: () => {
+          const rules = event === 'add' ? [rule] : [];
+          engine.reset();
+          start(rules);
+          return rules.length;
+        },
+      });
+
+      seq.emit(event, path.join(SEQUENCES_DIR, 'reload-test.yaml'));
+      detect('4242:2');
+
+      expect(onDetection).toHaveBeenCalledTimes(event === 'add' ? 1 : 0);
+      expect(reload).toHaveBeenCalledTimes(1);
+      expect(reloadRules).not.toHaveBeenCalled();
+      expect(sendFn).toHaveBeenCalledExactlyOnceWith('rules:reloaded', {
+        count: 3,
+        sequenceCount: event === 'add' ? 1 : 0,
+      });
+    } finally {
+      engine.reset();
+      engine.init({ rules: [] });
+    }
+  });
+
+  it.each(['add', 'change', 'unlink'])(
+    'non-YAML %s events never reload either ruleset',
+    (event) => {
+      const { flat, seq, reload, sendFn } = installBoth();
+      for (const watcher of [flat, seq]) {
+        watcher.emit(event, path.join(watcher.paths, 'notes.txt'));
+        watcher.emit(event, path.join(watcher.paths, 'rule.yaml.bak'));
+      }
+      expect(reloadRules).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
+      expect(sendFn).not.toHaveBeenCalled();
+    },
+  );
+
+  it('an atomic-save unlink/add burst leaves both rulesets at their final counts', () => {
+    let sequenceFiles = 1;
+    const { flat, seq, reload, sendFn } = installBoth({ reload: () => sequenceFiles });
+    reloadRules
+      .mockImplementationOnce(() => flatRules.delete('FA001'))
+      .mockImplementationOnce(() => flatRules.set('FA001', {}));
+    flat.emit('unlink', path.join(RULES_DIR, 'file-access.yaml'));
+    flat.emit('add', path.join(RULES_DIR, 'file-access.yaml'));
+    sequenceFiles = 0;
+    seq.emit('unlink', path.join(SEQUENCES_DIR, 'sequences.yaml'));
+    sequenceFiles = 1;
+    seq.emit('add', path.join(SEQUENCES_DIR, 'sequences.yaml'));
+
+    expect(reloadRules).toHaveBeenCalledTimes(2);
+    expect(reload).toHaveBeenCalledTimes(2);
+    expect(sendFn).toHaveBeenLastCalledWith('rules:reloaded', { count: 3, sequenceCount: 1 });
+  });
+
+  it('the flat push reads the sequence figure at the time of the change, not at setup', () => {
+    let loaded = 1;
+    const { sendFn, flat } = installBoth({ sequenceCount: () => loaded });
+
+    loaded = 3;
+    flat.emit('change', path.join(RULES_DIR, 'file-access.yml'));
+
+    expect(sendFn).toHaveBeenCalledWith('rules:reloaded', {
+      count: 4,
+      sequenceCount: 3,
+    });
+  });
+
+  it('a .yml file under rules/sequences is a rule file too', () => {
+    const { sendFn, reload, seq } = installBoth({ reload: () => 1 });
+
+    seq.emit('change', path.join(SEQUENCES_DIR, 'more.yml'));
+
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(sendFn).toHaveBeenCalledWith('rules:reloaded', {
+      count: 3,
+      sequenceCount: 1,
+    });
+  });
+
+  it('a non-yaml file under either directory is ignored: no reload, no push', () => {
+    const { sendFn, reload, flat, seq } = installBoth();
+
+    flat.emit('change', path.join(RULES_DIR, 'README.md'));
+    seq.emit('change', path.join(SEQUENCES_DIR, 'notes.txt'));
+    seq.emit('change', path.join(SEQUENCES_DIR, 'sequences.yaml.bak'));
+
+    expect(reloadRules).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+    expect(sendFn).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,209 @@
+/* Requested workspace consolidation: related destinations and reachable controls. */
+.sidebar .machine {
+  padding-block: 8px;
+  margin-block: 8px 4px;
+}
+.sidebar nav {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  gap: 2px;
+}
+.sidebar .nav-group {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 4px;
+}
+.sidebar .nav-group-label {
+  margin: 6px 10px 3px;
+  color: var(--faint);
+  font: 500 calc(10px * var(--ui-scale))/1.4 var(--sans);
+}
+.sidebar .nav-group .nav {
+  min-height: 30px;
+  padding-block: 5px;
+}
+.sidebar .sidebar-bottom {
+  padding-top: 8px;
+  flex-shrink: 0;
+}
+.sidebar .sensor-mini {
+  padding: 9px;
+}
+.sidebar .sidebar-foot {
+  margin-top: 6px;
+}
+.workspace-tabs .workspace-tab {
+  min-width: 0;
+}
+#workspace-content {
+  min-width: 0;
+}
+.page-title .workspace-caption {
+  color: var(--muted);
+  font-size: calc(12px * var(--ui-scale));
+}
+.monitoring-view-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  width: fit-content;
+  max-width: 100%;
+  margin-bottom: var(--space-3);
+  padding: var(--space-1);
+  border: 1px solid var(--strong-border);
+  border-radius: var(--surface-radius);
+  background: var(--panel);
+}
+.observatory-app .monitoring-view-switch .button {
+  flex: 1 1 auto;
+  white-space: normal;
+  border-color: transparent;
+  background: transparent;
+  font-weight: 600;
+}
+.observatory-app .monitoring-view-switch .button[aria-pressed='true'] {
+  border-color: var(--strong-border);
+  background: var(--selection);
+  color: var(--ink);
+}
+.page-head .live-badge {
+  flex-shrink: 0;
+}
+.observatory-app footer > span:nth-child(2) {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+@media (min-width: 800px) {
+  .observatory-app footer {
+    margin-right: calc(var(--observatory-alert-trigger-width, 60px) + 32px);
+    min-height: calc(var(--observatory-alert-trigger-height, 30px) + 12px);
+  }
+}
+@media (max-height: 700px) {
+  .radar-panel > .panel-head {
+    flex-wrap: nowrap;
+    gap: var(--space-2);
+  }
+  .radar-panel > .panel-head > div:first-child {
+    flex: 1;
+    min-width: 0;
+  }
+  .radar-panel > .panel-head p {
+    display: none;
+  }
+  .sidebar .machine {
+    display: none;
+  }
+  .sidebar .brand {
+    padding-block: 6px;
+  }
+  .sidebar .nav-group {
+    margin-bottom: 4px;
+  }
+  .sidebar .sensor-mini small,
+  .sidebar .sidebar-foot {
+    display: none;
+  }
+}
+@media (max-width: 1000px) {
+  .sidebar .nav-group .nav {
+    gap: 7px;
+    padding-inline: 8px;
+  }
+  .workspace-tab > button:first-child {
+    padding-inline: 8px;
+  }
+  .page-head .workspace-caption {
+    display: none;
+  }
+}
+
+#main.analysis-view > #workspace-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.monitoring-summary > button {
+  text-align: left;
+}
+.monitoring-summary > button:hover {
+  background: var(--raised);
+}
+
+/* Usability: one navigation row and stable live surfaces. */
+.topbar > .breadcrumb {
+  margin-right: auto;
+}
+.topbar {
+  gap: 12px;
+}
+.radar-clarity .radar-stage,
+.radar-clarity .radar-stage:not([data-layer='radar']) {
+  min-height: calc(400px + 90px * var(--ui-scale));
+}
+.radar-resource-toolbar {
+  height: calc(56px * var(--ui-scale));
+  flex: none;
+  overflow-y: auto;
+  align-content: center;
+  scrollbar-gutter: stable;
+}
+.radar-clarity .inspector {
+  height: calc(640px + (var(--ui-scale) - 1) * 180px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.radar-clarity .inspector-title {
+  flex: none;
+}
+.radar-clarity .inspector-content {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  overflow-anchor: none;
+}
+.radar-clarity .roster-items {
+  min-height: 0;
+  align-content: start;
+}
+.monitoring-summary .summary-stat p {
+  min-height: 2.8em;
+}
+.page-title .live-badge {
+  min-width: 110px;
+}
+.monitoring-summary strong,
+.live-state {
+  font-variant-numeric: tabular-nums;
+}
+@media (min-width: 800px) {
+  .radar-clarity .radar-workspace {
+    grid-template-columns: minmax(0, 1fr) minmax(200px, 0.82fr);
+  }
+  .radar-clarity .radar-roster {
+    border-top: 0;
+    border-left: 1px solid var(--border);
+  }
+}
+
+/* Grid children must shrink before navigation text wraps at enlarged scale. */
+.sidebar .nav-group,
+.sidebar .nav-group .nav,
+.sidebar .nav-group .nav > span {
+  min-width: 0;
+}
+.sidebar .nav-group .nav > span {
+  overflow-wrap: anywhere;
+}
+
+@media (min-width: 800px) and (max-width: 1100px) {
+  .app {
+    grid-template-columns: calc(164px + (var(--ui-scale) - 1) * 96px) minmax(0, 1fr);
+  }
+}

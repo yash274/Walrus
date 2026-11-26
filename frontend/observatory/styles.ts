@@ -1,0 +1,20 @@
+import './styles/workbench.css';
+import './styles/radar.css';
+import './styles/window.css';
+import './styles/interactions.css';
+import './styles/navigation.css';
+import './styles/transitions.css';
+import './styles/entities.css';
+import './styles/radar-info.css';
+import './styles/identity.css';
+import './styles/analysis.css';
+import './styles/polish.css';
+import './styles/dialogs.css';
+import './styles/radar-clarity.css';
+import './styles/feedback.css';
+import './styles/desktop.css';
+import './styles/coherence.css';
+import './styles/detail-layout.css';
+
+import './styles/comfort.css';
+import './styles/workspace-hierarchy.css';

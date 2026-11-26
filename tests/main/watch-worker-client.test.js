@@ -1,0 +1,155 @@
+import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { watch } from '../../src/main/watch-worker-client.js';
+
+class FakeWorker extends EventEmitter {
+  static instances = [];
+  constructor() {
+    super();
+    FakeWorker.instances.push(this);
+    this.postMessage = vi.fn();
+    this.terminate = vi.fn(() => Promise.resolve(0));
+  }
+}
+function create() {
+  const proxy = watch('/fixture', {}, { WorkerClass: FakeWorker });
+  return { proxy, worker: FakeWorker.instances.at(-1) };
+}
+const batch = (seq, extra = {}) => ({
+  seq,
+  events: [],
+  dropped: 0,
+  ready: false,
+  error: null,
+  ...extra,
+});
+
+describe('worker watcher lifetime', () => {
+  it('forwards only increasing safe startup progress before readiness or failure', async () => {
+    for (const terminal of ['ready', 'error', 'close']) {
+      const { proxy, worker } = create();
+      const seen = [];
+      proxy.on('progress', (n) => seen.push(n));
+      proxy.on('error', () => {});
+      let seq = 0;
+      for (const progress of [2, 2, 1, NaN, Infinity, '3', 2.5, -1, 4]) {
+        worker.emit('message', batch(++seq, { progress }));
+      }
+      expect(seen).toEqual([2, 4]);
+      if (terminal === 'close') await proxy.close();
+      else
+        worker.emit(
+          'message',
+          batch(++seq, {
+            [terminal]: terminal === 'ready' ? true : 'watch-worker-provider-error',
+            progress: 8,
+          }),
+        );
+      worker.emit('message', batch(seq + 1, { progress: 9 }));
+      expect(seen).toEqual([2, 4]);
+      await proxy.close();
+    }
+  });
+
+  it('delivers ordered events, ready once and loss deltas before acknowledging', () => {
+    const { proxy, worker } = create();
+    const observed = [];
+    proxy.on('ready', () => observed.push('ready'));
+    proxy.on('loss', (n) => observed.push(`loss:${n}`));
+    proxy.on('change', (p) => {
+      expect(worker.postMessage).not.toHaveBeenCalled();
+      observed.push(p);
+    });
+    worker.emit(
+      'message',
+      batch(1, { ready: true, dropped: 5, events: [{ type: 'change', path: 'one' }] }),
+    );
+    worker.emit('message', batch(2, { ready: true, dropped: 7 }));
+    worker.emit('message', batch(2, { dropped: 7 }));
+    expect(observed).toEqual(['loss:5', 'ready', 'one', 'loss:2']);
+    expect(worker.postMessage.mock.calls).toEqual([
+      [{ type: 'ack', seq: 1 }],
+      [{ type: 'ack', seq: 2 }],
+    ]);
+  });
+
+  it.each(['error', 'exit'])(
+    'reports unexpected worker %s once and never forwards error contents',
+    (event) => {
+      const { proxy, worker } = create();
+      const errors = [];
+      proxy.on('error', (e) => errors.push(e));
+      worker.emit(event, new Error('synthetic-private-path-or-content'));
+      worker.emit('exit', 1);
+      expect(errors).toHaveLength(1);
+      expect(errors[0].message).toMatch(/^watch-worker-(crashed|exited)$/);
+      expect(errors[0].code).toBe('AEGIS_WATCH_WORKER_TERMINATED');
+      expect(JSON.stringify(errors)).not.toContain('synthetic-private-path-or-content');
+    },
+  );
+
+  it('reports terminal exit after an earlier watcher error', () => {
+    const { proxy, worker } = create();
+    const errors = [];
+    proxy.on('error', (error) => errors.push(error));
+    worker.emit('message', { seq: 1, dropped: 0, error: 'watch-root-error', events: [] });
+    worker.emit('exit', 1);
+
+    expect(errors).toHaveLength(2);
+    expect(errors[0].code).toBeUndefined();
+    expect(errors[1].code).toBe('AEGIS_WATCH_WORKER_TERMINATED');
+  });
+
+  it('invalidates late messages and errors before termination, including close-before-ready', async () => {
+    const { proxy, worker } = create();
+    const seen = vi.fn();
+    for (const event of ['ready', 'error', 'loss', 'add']) proxy.on(event, seen);
+    await proxy.close();
+    worker.emit(
+      'message',
+      batch(1, { ready: true, dropped: 2, events: [{ type: 'add', path: 'late' }] }),
+    );
+    worker.emit('error', new Error('late'));
+    worker.emit('exit', 0);
+    await proxy.close();
+    expect(seen).not.toHaveBeenCalled();
+    expect(worker.terminate).toHaveBeenCalledTimes(1);
+    expect(worker.postMessage).not.toHaveBeenCalled();
+  });
+
+  it('stops a batch when a consumer closes its watcher', () => {
+    const { proxy, worker } = create();
+    const seen = [];
+    proxy.on('add', (p) => {
+      seen.push(p);
+      proxy.close();
+    });
+    worker.emit(
+      'message',
+      batch(1, {
+        events: [
+          { type: 'add', path: 'one' },
+          { type: 'add', path: 'two' },
+        ],
+      }),
+    );
+    expect(seen).toEqual(['one']);
+    expect(worker.postMessage).not.toHaveBeenCalled();
+  });
+
+  it('propagates synchronous construction failure to the root registrar', () => {
+    expect(() =>
+      watch(
+        '/fixture',
+        {},
+        {
+          WorkerClass: class {
+            constructor() {
+              throw new Error('no-worker');
+            }
+          },
+        },
+      ),
+    ).toThrow('no-worker');
+  });
+});

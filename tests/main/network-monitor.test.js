@@ -1,0 +1,1096 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import networkMonitor from '../../src/main/network-monitor.js';
+
+describe('network-monitor', () => {
+  describe('isKnownDomain()', () => {
+    it('recognizes the published Claude Code endpoints', () => {
+      expect(networkMonitor.isKnownDomain('api.anthropic.com')).toBe(true);
+      expect(networkMonitor.isKnownDomain('code.claude.com')).toBe(true);
+      expect(networkMonitor.isKnownDomain('mcp-proxy.anthropic.com')).toBe(true);
+      expect(networkMonitor.isKnownDomain('registry.npmjs.org')).toBe(true);
+    });
+
+    it('recognizes github.com', () => {
+      expect(networkMonitor.isKnownDomain('github.com')).toBe(true);
+    });
+
+    it('recognizes cursor.sh', () => {
+      expect(networkMonitor.isKnownDomain('cursor.sh')).toBe(true);
+    });
+
+    it('recognizes subdomains', () => {
+      expect(networkMonitor.isKnownDomain('api.github.com')).toBe(true);
+      expect(networkMonitor.isKnownDomain('cdn.anthropic.com')).toBe(true);
+    });
+
+    it('accepts a trailing dot and mixed case (PTR names carry both)', () => {
+      expect(networkMonitor.isKnownDomain('API.Anthropic.COM.')).toBe(true);
+    });
+
+    it('rejects unknown domains', () => {
+      expect(networkMonitor.isKnownDomain('evil-hacker.xyz')).toBe(false);
+      expect(networkMonitor.isKnownDomain('malware.ru')).toBe(false);
+    });
+
+    it('matches on a label boundary, not a bare suffix', () => {
+      // `evilclaude.ai` ends with the allowlisted string `claude.ai` but is a different
+      // domain, registered by someone else. The old suffix regex accepted it.
+      expect(networkMonitor.isKnownDomain('evilclaude.ai')).toBe(false);
+      expect(networkMonitor.isKnownDomain('notapi.anthropic.com')).toBe(false);
+      expect(networkMonitor.isKnownDomain('claude.ai')).toBe(true);
+    });
+
+    it('includes agent-database.json domains', () => {
+      expect(networkMonitor.isKnownDomain('claude.ai')).toBe(true);
+    });
+
+    it('does not allowlist generic cloud tenancy suffixes', () => {
+      // Every one of these is a name any renter of the platform can obtain. Matching one
+      // proves who owns the hardware, not who owns the endpoint.
+      expect(networkMonitor.isKnownDomain('10.104.79.160.bc.googleusercontent.com')).toBe(false);
+      expect(networkMonitor.isKnownDomain('ec2-52-1-2-3.compute-1.amazonaws.com')).toBe(false);
+      expect(networkMonitor.isKnownDomain('s3.amazonaws.com')).toBe(false);
+      expect(networkMonitor.isKnownDomain('blob.core.windows.net')).toBe(false);
+      expect(networkMonitor.isKnownDomain('d123.cloudfront.net')).toBe(false);
+      expect(networkMonitor.isKnownDomain('cdn.fastly.net')).toBe(false);
+      expect(networkMonitor.isKnownDomain('any-host.1e100.net')).toBe(false);
+      expect(networkMonitor.isKnownDomain('tenant.repl.co')).toBe(false);
+    });
+
+    it('keeps the named service while its generic parent is rejected', () => {
+      expect(networkMonitor.isKnownDomain('storage.googleapis.com')).toBe(true);
+      expect(networkMonitor.isKnownDomain('anything-else.googleapis.com')).toBe(false);
+      expect(networkMonitor.isKnownDomain('raw.githubusercontent.com')).toBe(true);
+      expect(networkMonitor.isKnownDomain('copilot-telemetry.githubusercontent.com')).toBe(true);
+      expect(networkMonitor.isKnownDomain('pages.githubusercontent.com')).toBe(false);
+    });
+
+    it('recognizes new AI-agent vendor domains (Kilo, opencode, grok/xAI)', () => {
+      expect(networkMonitor.isKnownDomain('kilo.ai')).toBe(true);
+      expect(networkMonitor.isKnownDomain('kilocode.ai')).toBe(true);
+      expect(networkMonitor.isKnownDomain('api.kilocode.ai')).toBe(true);
+      expect(networkMonitor.isKnownDomain('opencode.ai')).toBe(true);
+      // The database lists `api.x.ai`, not a bare `x.ai` — so only the listed host matches.
+      expect(networkMonitor.isKnownDomain('api.x.ai')).toBe(true);
+      expect(networkMonitor.isKnownDomain('x.ai')).toBe(false);
+    });
+
+    it('does not let the short x.ai pattern match unrelated .ai domains', () => {
+      expect(networkMonitor.isKnownDomain('netflix.ai')).toBe(false);
+      expect(networkMonitor.isKnownDomain('phoenix.ai')).toBe(false);
+    });
+
+    it('rejects an empty domain', () => {
+      expect(networkMonitor.isKnownDomain('')).toBe(false);
+    });
+  });
+
+  describe('isAllowlistedIp()', () => {
+    it('matches the published inbound range 160.79.104.0/23', () => {
+      expect(networkMonitor.isAllowlistedIp('160.79.104.10')).toBe(true);
+      expect(networkMonitor.isAllowlistedIp('160.79.104.0')).toBe(true);
+      expect(networkMonitor.isAllowlistedIp('160.79.105.255')).toBe(true);
+    });
+
+    it('does not extend to the outbound /21 around it', () => {
+      // 160.79.106.1 and 160.79.111.255 sit inside Anthropic's OUTBOUND /21 but outside the
+      // inbound /23 an agent actually dials. The allowlist covers what is dialled, no more.
+      expect(networkMonitor.isAllowlistedIp('160.79.106.1')).toBe(false);
+      expect(networkMonitor.isAllowlistedIp('160.79.111.255')).toBe(false);
+    });
+
+    it('matches numerically, not by string prefix', () => {
+      // Shares the textual prefix `160.79.1` with the range address but sits outside it.
+      expect(networkMonitor.isAllowlistedIp('160.79.112.0')).toBe(false);
+      expect(networkMonitor.isAllowlistedIp('160.79.103.255')).toBe(false);
+      expect(networkMonitor.isAllowlistedIp('160.79.1.1')).toBe(false);
+    });
+
+    it('unwraps an IPv4-mapped IPv6 address', () => {
+      expect(networkMonitor.isAllowlistedIp('::ffff:160.79.104.10')).toBe(true);
+    });
+
+    it.each([
+      '::ffff:a04f:680a',
+      '0:0:0:0:0:ffff:160.79.104.10',
+      '0:0:0:0:0:FFFF:A04F:680A',
+      '0000::0000:ffff:a04f:680a%eth0',
+    ])('allowlists the equivalent mapped address %s', (ip) => {
+      expect(networkMonitor.isAllowlistedIp(ip)).toBe(true);
+      expect(networkMonitor.classifyConnection(ip)).toMatchObject({
+        verdict: 'allowlisted',
+        reason: 'ip-allowlist',
+      });
+    });
+
+    it.each([
+      '::ffff:a04f:67ff',
+      '::ffff:160.79.106.0',
+      '0:0:0:0:0:ffff:160.79.106.0',
+      '::a04f:680a',
+      '::160.79.104.10',
+      '64:ff9b::a04f:680a',
+      '::ffff:0:160.79.104.10',
+      '0:0:0:0:1:ffff:a04f:680a',
+      '::ffff::160.79.104.10',
+      '2607:6bc0::1::2',
+      '::ffff:160.079.104.10',
+      '[::ffff:a04f:680a]:443',
+    ])('rejects unmapped, out-of-range or invalid address %s', (ip) => {
+      expect(networkMonitor.isAllowlistedIp(ip)).toBe(false);
+    });
+
+    it('matches the published IPv6 range 2607:6bc0::/48', () => {
+      // The API is reachable over IPv6, and an IPv6-preferring host will use it. Without
+      // this range that connection would fall through to a name check it can never pass.
+      expect(networkMonitor.isAllowlistedIp('2607:6bc0::10')).toBe(true);
+      expect(networkMonitor.isAllowlistedIp('2607:6bc0:0:0:0:0:0:10')).toBe(true);
+      expect(networkMonitor.isAllowlistedIp('2607:6BC0::ABCD')).toBe(true);
+      expect(networkMonitor.isAllowlistedIp('2607:6bc0:0:ffff::1')).toBe(true);
+      // The prefix is 48 bits, so the third group is inside it and must match.
+      expect(networkMonitor.isAllowlistedIp('2607:6bc0:1::1')).toBe(false);
+      expect(networkMonitor.isAllowlistedIp('2607:6bc1::1')).toBe(false);
+      expect(networkMonitor.isAllowlistedIp('2606:4700::1111')).toBe(false);
+    });
+
+    it('never matches an address against the other family prefix', () => {
+      expect(networkMonitor.isAllowlistedIp('160.79.104.10%eth0')).toBe(true);
+      expect(networkMonitor.isAllowlistedIp('::a04f:680a')).toBe(false);
+    });
+
+    it('returns false for malformed input', () => {
+      expect(networkMonitor.isAllowlistedIp('160.79.104')).toBe(false);
+      expect(networkMonitor.isAllowlistedIp('160.79.104.999')).toBe(false);
+      expect(networkMonitor.isAllowlistedIp('not-an-address')).toBe(false);
+      expect(networkMonitor.isAllowlistedIp('2607:6bc0:::1')).toBe(false);
+      expect(networkMonitor.isAllowlistedIp('')).toBe(false);
+    });
+  });
+
+  describe('isPrivateIp()', () => {
+    it('127.x loopback', () => {
+      expect(networkMonitor.isPrivateIp('127.0.0.1')).toBe(true);
+      expect(networkMonitor.isPrivateIp('127.0.1.1')).toBe(true);
+    });
+
+    it('10.x private', () => {
+      expect(networkMonitor.isPrivateIp('10.0.0.1')).toBe(true);
+      expect(networkMonitor.isPrivateIp('10.255.255.255')).toBe(true);
+    });
+
+    it('172.16-31.x private', () => {
+      expect(networkMonitor.isPrivateIp('172.16.0.1')).toBe(true);
+      expect(networkMonitor.isPrivateIp('172.31.255.255')).toBe(true);
+    });
+
+    it('192.168.x private', () => {
+      expect(networkMonitor.isPrivateIp('192.168.0.1')).toBe(true);
+      expect(networkMonitor.isPrivateIp('192.168.1.100')).toBe(true);
+    });
+
+    it('::1 and fe80: IPv6 loopback/link-local', () => {
+      expect(networkMonitor.isPrivateIp('::1')).toBe(true);
+      expect(networkMonitor.isPrivateIp('fe80::1')).toBe(true);
+    });
+
+    it('rejects public IPs', () => {
+      expect(networkMonitor.isPrivateIp('8.8.8.8')).toBe(false);
+      expect(networkMonitor.isPrivateIp('52.1.2.3')).toBe(false);
+      expect(networkMonitor.isPrivateIp('172.32.0.1')).toBe(false);
+    });
+
+    it('0.0.0.0 is private', () => {
+      expect(networkMonitor.isPrivateIp('0.0.0.0')).toBe(true);
+    });
+
+    it(':: is private', () => {
+      expect(networkMonitor.isPrivateIp('::')).toBe(true);
+    });
+
+    it.each([
+      ['169.254.0.0', true],
+      ['169.254.1.2', true],
+      ['169.254.255.255', true],
+      ['::ffff:169.254.0.0', true],
+      ['0:0:0:0:0:ffff:169.254.255.255', true],
+      ['::ffff:a9fe:102', true],
+      ['169.253.255.255', false],
+      ['169.255.0.0', false],
+      ['::ffff:0:169.254.1.2', false],
+      ['::169.254.1.2', false],
+      ['::ffff:127.0.0.1', true],
+      ['::ffff:10.1.2.3', true],
+      ['::ffff:172.16.0.1', true],
+      ['::ffff:192.168.1.1', true],
+      ['::ffff:7f00:1', true],
+      ['0:0:0:0:0:ffff:127.0.0.1', true],
+      ['::ffff:0.0.0.0', true],
+      ['fc00::1', true],
+      ['FD12:3456::1', true],
+      ['fdff:ffff::1', true],
+      ['fd12::1%12', true],
+      ['fe90::1', true],
+      ['fe80::1%12', true],
+      ['::ffff:8.8.8.8', false],
+      ['::ffff:808:808', false],
+      ['0:0:0:0:0:ffff:8.8.8.8', false],
+      ['::ffff:0:127.0.0.1', false],
+      ['::127.0.0.1', false],
+      ['fbff::1', false],
+      ['fe00::1', false],
+      ['127.000.0.1', false],
+      ['8.8.8.8%12', false],
+      ['::ffff:127.000.0.1', false],
+      ['fd12:::1', false],
+    ])('classifies %s as local=%s', (ip, local) => {
+      expect(networkMonitor.isPrivateIp(ip)).toBe(local);
+    });
+  });
+});
+
+describe('network-monitor DI tests', () => {
+  let mockGetRawTcp;
+  let mockDnsReverse;
+  let mockDnsResolve;
+
+  /**
+   * Forward-confirming resolver: every hostname maps back to the address it came from.
+   * @param {Record<string, string[]>} map hostname → addresses
+   */
+  const forwardMap = (map) => (hostname) => Promise.resolve(map[hostname] || []);
+
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  };
+
+  beforeEach(() => {
+    mockGetRawTcp = vi.fn();
+    mockDnsReverse = vi.fn();
+    mockDnsResolve = vi.fn().mockResolvedValue([]);
+    networkMonitor._resetForTest();
+    networkMonitor._setDepsForTest({
+      getRawTcpConnections: mockGetRawTcp,
+      dnsReverse: mockDnsReverse,
+      dnsResolve: mockDnsResolve,
+    });
+  });
+
+  afterEach(() => {
+    networkMonitor._resetForTest();
+  });
+
+  describe('resolveIp()', () => {
+    it('resolves IP via DNS reverse lookup when the name forward-confirms', async () => {
+      mockDnsReverse.mockResolvedValue(['api.anthropic.com']);
+      mockDnsResolve.mockResolvedValue(['1.2.3.4']);
+      const domain = await networkMonitor.resolveIp('1.2.3.4');
+      expect(domain).toBe('api.anthropic.com');
+      expect(mockDnsReverse).toHaveBeenCalledWith('1.2.3.4');
+      expect(mockDnsResolve).toHaveBeenCalledWith('api.anthropic.com');
+    });
+
+    it.each([
+      ['::ffff:808:808', '8.8.8.8'],
+      ['0:0:0:0:0:ffff:8.8.8.8', '::ffff:0808:0808'],
+      ['8.8.8.8', '0:0:0:0:0:ffff:8.8.8.8'],
+    ])('forward-confirms %s against %s and shares its IPv4 cache', async (ip, forwardIp) => {
+      mockDnsReverse.mockResolvedValue(['api.github.com']);
+      mockDnsResolve.mockResolvedValue([forwardIp]);
+      expect(await networkMonitor.resolveIp(ip)).toBe('api.github.com');
+      expect(await networkMonitor.resolveIp('8.8.8.8')).toBe('api.github.com');
+      expect(mockDnsReverse).toHaveBeenCalledExactlyOnceWith('8.8.8.8');
+      expect(mockDnsResolve).toHaveBeenCalledExactlyOnceWith('api.github.com');
+    });
+
+    it('forward-confirms equivalent dotted and hex tails without flattening other IPv6', async () => {
+      mockDnsReverse.mockResolvedValue(['api.github.com']);
+      mockDnsResolve.mockResolvedValue(['64:ff9b::808:808']);
+      expect(await networkMonitor.resolveIp('64:ff9b::8.8.8.8')).toBe('api.github.com');
+      expect(mockDnsReverse).toHaveBeenCalledExactlyOnceWith('64:ff9b:0:0:0:0:808:808');
+    });
+
+    it.each(['::808:808', '64:ff9b::808:808', '::ffff:0:8.8.8.8'])(
+      'does not forward-confirm distinct IPv6 %s as IPv4',
+      async (ip) => {
+        mockDnsReverse.mockResolvedValue(['api.github.com']);
+        mockDnsResolve.mockResolvedValue(['8.8.8.8']);
+        expect(await networkMonitor.resolveIp(ip)).toBeNull();
+        expect(networkMonitor.classifyConnection(ip).reason).toBe('ptr-unconfirmed');
+      },
+    );
+
+    it('discards a PTR name that does not resolve back to the same address', async () => {
+      // The owner of an address writes its own PTR record. Without forward confirmation
+      // that record is attacker-supplied text, not an identity.
+      mockDnsReverse.mockResolvedValue(['api.anthropic.com']);
+      mockDnsResolve.mockResolvedValue(['160.79.104.10']);
+      const domain = await networkMonitor.resolveIp('45.33.32.156');
+      expect(domain).toBeNull();
+    });
+
+    it('discards a PTR name whose forward lookup fails', async () => {
+      mockDnsReverse.mockResolvedValue(['ghost.example.com']);
+      mockDnsResolve.mockRejectedValue(new Error('ENOTFOUND'));
+      expect(await networkMonitor.resolveIp('45.33.32.157')).toBeNull();
+    });
+
+    it('caches within TTL', async () => {
+      mockDnsReverse.mockResolvedValue(['cached.example.com']);
+      mockDnsResolve.mockResolvedValue(['5.5.5.5']);
+      await networkMonitor.resolveIp('5.5.5.5');
+      await networkMonitor.resolveIp('5.5.5.5');
+      expect(mockDnsReverse).toHaveBeenCalledTimes(1);
+      expect(mockDnsResolve).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns null on DNS error', async () => {
+      mockDnsReverse.mockRejectedValue(new Error('ENOTFOUND'));
+      const domain = await networkMonitor.resolveIp('99.99.99.99');
+      expect(domain).toBeNull();
+    });
+
+    it('caches null results from DNS errors', async () => {
+      mockDnsReverse.mockRejectedValue(new Error('ENOTFOUND'));
+      await networkMonitor.resolveIp('99.99.99.99');
+      const result = await networkMonitor.resolveIp('99.99.99.99');
+      expect(result).toBeNull();
+      expect(mockDnsReverse).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns null when reverse returns empty array', async () => {
+      mockDnsReverse.mockResolvedValue([]);
+      const domain = await networkMonitor.resolveIp('4.4.4.4');
+      expect(domain).toBeNull();
+      expect(mockDnsResolve).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('scanNetworkConnections()', () => {
+    it('timestamps the TCP snapshot before DNS enrichment, shared by all rows', async () => {
+      let now = 1700000000000;
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      try {
+        mockGetRawTcp.mockImplementation(async () => {
+          now = 1700000001000;
+          return [
+            { pid: 100, ip: '52.1.2.3', port: 443, state: 'ESTAB' },
+            { pid: 100, ip: '160.79.104.10', port: 443, state: 'ESTAB' },
+          ];
+        });
+        mockDnsReverse.mockImplementation(async () => {
+          now = 1700000002000;
+          return ['api.anthropic.com'];
+        });
+        mockDnsResolve.mockResolvedValue(['52.1.2.3']);
+
+        const rows = await networkMonitor.scanNetworkConnections([
+          { pid: 100, agent: 'Claude Code', instanceId: '100:start' },
+        ]);
+
+        expect(rows).toHaveLength(2);
+        expect(mockDnsReverse).toHaveBeenCalled();
+        expect(rows.map((row) => row.timestamp)).toEqual([1700000001000, 1700000001000]);
+        expect(Date.now()).toBe(1700000002000);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it('allowlists mapped socket spellings without DNS and preserves observed addresses', async () => {
+      const ips = ['::ffff:a04f:680a', '0:0:0:0:0:ffff:160.79.104.10'];
+      mockGetRawTcp.mockResolvedValue(
+        ips.map((ip) => ({ pid: 100, ip, port: 443, state: 'ESTAB' })),
+      );
+      const rows = await networkMonitor.scanNetworkConnections([
+        { pid: 100, agent: 'Claude Code' },
+      ]);
+      expect(rows.map((row) => row.remoteIp)).toEqual(ips);
+      expect(
+        rows.every((row) => row.verdict === 'allowlisted' && row.verdictReason === 'ip-allowlist'),
+      ).toBe(true);
+      expect(mockDnsReverse).not.toHaveBeenCalled();
+      expect(mockDnsResolve).not.toHaveBeenCalled();
+    });
+
+    it('returns empty for no agents', async () => {
+      const results = await networkMonitor.scanNetworkConnections([]);
+      expect(results).toEqual([]);
+      expect(mockGetRawTcp).not.toHaveBeenCalled();
+    });
+
+    it('allowlists the published Anthropic range without any DNS lookup', async () => {
+      // api.anthropic.com resolves to 160.79.104.10, which publishes no PTR record at all.
+      // The old check read that absence as evidence and marked the agent's own API
+      // endpoint FLAGGED. Range membership is published and verifiable; a PTR is not.
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 100, ip: '160.79.104.10', port: 443, state: 'ESTAB' },
+      ]);
+      mockDnsReverse.mockRejectedValue(new Error('ENOTFOUND'));
+
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+
+      expect(results[0]).toMatchObject({
+        remoteIp: '160.79.104.10',
+        verdict: 'allowlisted',
+        verdictReason: networkMonitor.VERDICT_REASONS.IP_ALLOWLIST,
+        flagged: false,
+        domain: '',
+      });
+      expect(mockDnsReverse).not.toHaveBeenCalled();
+    });
+
+    it('allowlists the API endpoint over IPv6 as well', async () => {
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 100, ip: '2607:6bc0::10', port: 443, state: 'ESTAB' },
+      ]);
+      mockDnsReverse.mockRejectedValue(new Error('ENOTFOUND'));
+
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+
+      expect(results[0]).toMatchObject({
+        verdict: 'allowlisted',
+        verdictReason: networkMonitor.VERDICT_REASONS.IP_ALLOWLIST,
+        flagged: false,
+      });
+      expect(mockDnsReverse).not.toHaveBeenCalled();
+    });
+
+    it('does not allowlist a host whose PTR is a generic cloud name', async () => {
+      // A rented GCE instance gets a bc.googleusercontent.com PTR for free. Under the old
+      // hardcoded suffix that made it SAFE.
+      const ip = '34.83.12.7';
+      const ptr = '7.12.83.34.bc.googleusercontent.com';
+      mockGetRawTcp.mockResolvedValue([{ pid: 100, ip, port: 443, state: 'ESTAB' }]);
+      mockDnsReverse.mockResolvedValue([ptr]);
+      mockDnsResolve.mockImplementation(forwardMap({ [ptr]: [ip] }));
+
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+
+      expect(results[0]).toMatchObject({
+        domain: ptr,
+        verdict: 'flagged',
+        verdictReason: networkMonitor.VERDICT_REASONS.DOMAIN_NOT_ALLOWLISTED,
+        flagged: true,
+      });
+    });
+
+    it('discards a PTR that fails forward confirmation and reports unknown', async () => {
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 100, ip: '45.33.32.156', port: 443, state: 'ESTAB' },
+      ]);
+      mockDnsReverse.mockResolvedValue(['api.anthropic.com']);
+      mockDnsResolve.mockResolvedValue(['160.79.104.10']);
+
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+
+      expect(results[0]).toMatchObject({
+        domain: '',
+        verdict: 'unknown',
+        verdictReason: networkMonitor.VERDICT_REASONS.PTR_UNCONFIRMED,
+      });
+      // An unconfirmed name never reaches the record — not as the domain, not anywhere.
+      expect(results[0].domain).not.toContain('anthropic');
+    });
+
+    it('reports an address with no name at all as unknown, not flagged', async () => {
+      mockGetRawTcp.mockResolvedValue([{ pid: 100, ip: '99.99.99.99', port: 443, state: 'ESTAB' }]);
+      mockDnsReverse.mockRejectedValue(new Error('ENOTFOUND'));
+
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+
+      expect(results[0].verdict).toBe('unknown');
+      expect(results[0].verdictReason).toBe(networkMonitor.VERDICT_REASONS.PTR_MISSING);
+      expect(results[0].domain).toBe('');
+      // `flagged` keeps its original meaning — "not confirmed allowlisted" — so the
+      // existing consumers do not start reporting an unidentified endpoint as safe.
+      expect(results[0].flagged).toBe(true);
+    });
+
+    it('every verdict carries a reason code', async () => {
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 100, ip: '160.79.104.10', port: 443, state: 'ESTAB' },
+        { pid: 100, ip: '52.1.2.3', port: 443, state: 'ESTAB' },
+        { pid: 100, ip: '99.99.99.99', port: 443, state: 'ESTAB' },
+      ]);
+      mockDnsReverse.mockImplementation((ip) =>
+        ip === '52.1.2.3' ? Promise.resolve(['api.github.com']) : Promise.reject(new Error('ENO')),
+      );
+      mockDnsResolve.mockImplementation(forwardMap({ 'api.github.com': ['52.1.2.3'] }));
+
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+
+      expect(results).toHaveLength(3);
+      const codes = Object.values(networkMonitor.VERDICT_REASONS);
+      for (const r of results) {
+        expect(['allowlisted', 'unknown', 'flagged']).toContain(r.verdict);
+        expect(codes).toContain(r.verdictReason);
+      }
+      expect(results[1]).toMatchObject({
+        verdict: 'allowlisted',
+        verdictReason: networkMonitor.VERDICT_REASONS.DOMAIN_ALLOWLIST,
+      });
+    });
+
+    it('enriches connections with agent info and domain', async () => {
+      mockGetRawTcp.mockResolvedValue([{ pid: 100, ip: '52.1.2.3', port: 443, state: 'ESTAB' }]);
+      mockDnsReverse.mockResolvedValue(['api.anthropic.com']);
+      mockDnsResolve.mockImplementation(forwardMap({ 'api.anthropic.com': ['52.1.2.3'] }));
+
+      const agents = [
+        { pid: 100, agent: 'Claude Code', parentEditor: 'VS Code', cwd: '/proj', category: 'ai' },
+      ];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({
+        agent: 'Claude Code',
+        pid: 100,
+        parentEditor: 'VS Code',
+        cwd: '/proj',
+        remoteIp: '52.1.2.3',
+        remotePort: 443,
+        domain: 'api.anthropic.com',
+        verdict: 'allowlisted',
+        verdictReason: networkMonitor.VERDICT_REASONS.DOMAIN_ALLOWLIST,
+        flagged: false,
+      });
+    });
+
+    it('flags unknown domains', async () => {
+      mockGetRawTcp.mockResolvedValue([{ pid: 100, ip: '99.99.99.99', port: 443, state: 'ESTAB' }]);
+      mockDnsReverse.mockResolvedValue(['evil-server.xyz']);
+      mockDnsResolve.mockImplementation(forwardMap({ 'evil-server.xyz': ['99.99.99.99'] }));
+
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+      expect(results[0].flagged).toBe(true);
+      expect(results[0].verdict).toBe('flagged');
+    });
+
+    it('deduplicates only identical socket observations and preserves their local endpoints', async () => {
+      const base = {
+        pid: 100,
+        ip: '52.1.2.3',
+        port: 443,
+        state: 'ESTAB',
+        localIp: '10.0.0.1',
+        localPort: 52001,
+      };
+      mockGetRawTcp.mockResolvedValue([
+        base,
+        { ...base },
+        { ...base, localPort: 52002 },
+        { ...base, localIp: '10.0.0.2' },
+        { ...base, state: 'CLOSE_WAIT' },
+      ]);
+      const results = await networkMonitor.scanNetworkConnections([
+        { pid: 100, instanceId: '100:start', agent: 'Claude Code', category: 'ai' },
+      ]);
+      expect(results).toHaveLength(4);
+      expect(
+        results.map(({ localIp, localPort, state }) => ({ localIp, localPort, state })),
+      ).toEqual([
+        { localIp: '10.0.0.1', localPort: 52001, state: 'ESTAB' },
+        { localIp: '10.0.0.1', localPort: 52002, state: 'ESTAB' },
+        { localIp: '10.0.0.2', localPort: 52001, state: 'ESTAB' },
+        { localIp: '10.0.0.1', localPort: 52001, state: 'CLOSE_WAIT' },
+      ]);
+      expect(results.every((row) => row.instanceId === '100:start')).toBe(true);
+    });
+
+    it.each([
+      {},
+      { localIp: '10.0.0.1' },
+      { localPort: 52001 },
+      { localIp: '', localPort: 52001 },
+      { localIp: '10.0.0.1', localPort: null },
+      { localIp: '10.0.0.1', localPort: 0 },
+      { localIp: 'not-ip', localPort: 52001 },
+    ])('does not invent socket equality with incomplete local identity: %j', async (local) => {
+      const row = { pid: 100, ip: '52.1.2.3', port: 443, state: 'ESTAB', ...local };
+      mockGetRawTcp.mockResolvedValue([row, { ...row }]);
+      const results = await networkMonitor.scanNetworkConnections([
+        { pid: 100, agent: 'Claude Code', category: 'ai' },
+      ]);
+      expect(results).toHaveLength(2);
+    });
+
+    it('filters out private IPs from raw connections', async () => {
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 100, ip: '192.168.1.1', port: 3000, state: 'ESTAB' },
+        { pid: 100, ip: '10.0.0.1', port: 8080, state: 'ESTAB' },
+        { pid: 100, ip: '52.1.2.3', port: 443, state: 'ESTAB' },
+      ]);
+      mockDnsReverse.mockResolvedValue(['api.anthropic.com']);
+      mockDnsResolve.mockImplementation(forwardMap({ 'api.anthropic.com': ['52.1.2.3'] }));
+
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+      expect(results).toHaveLength(1);
+      expect(results[0].remoteIp).toBe('52.1.2.3');
+    });
+
+    it('filters mapped private and ULA sockets before DNS while retaining a public mapped socket', async () => {
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 100, ip: '::ffff:127.0.0.1', port: 3000, state: 'ESTAB' },
+        { pid: 100, ip: '0:0:0:0:0:ffff:192.168.1.1', port: 8080, state: 'ESTAB' },
+        { pid: 100, ip: 'fd12:3456::1', port: 443, state: 'ESTAB' },
+        { pid: 100, ip: '::ffff:8.8.8.8', port: 443, state: 'ESTAB' },
+      ]);
+      mockDnsReverse.mockResolvedValue(['dns.google']);
+      mockDnsResolve.mockResolvedValue(['8.8.8.8']);
+
+      const results = await networkMonitor.scanNetworkConnections([
+        { pid: 100, agent: 'Claude Code', instanceId: '100:1', category: 'ai' },
+      ]);
+
+      expect(results.map((row) => row.remoteIp)).toEqual(['::ffff:8.8.8.8']);
+      expect(mockDnsReverse).toHaveBeenCalledExactlyOnceWith('8.8.8.8');
+      expect(mockDnsResolve).toHaveBeenCalledExactlyOnceWith('dns.google');
+    });
+
+    it('handles multiple agents', async () => {
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 100, ip: '1.1.1.1', port: 443, state: 'ESTAB' },
+        { pid: 200, ip: '2.2.2.2', port: 80, state: 'ESTAB' },
+      ]);
+      mockDnsReverse.mockImplementation((ip) => {
+        if (ip === '1.1.1.1') return Promise.resolve(['api.anthropic.com']);
+        return Promise.resolve(['unknown.xyz']);
+      });
+      mockDnsResolve.mockImplementation(
+        forwardMap({ 'api.anthropic.com': ['1.1.1.1'], 'unknown.xyz': ['2.2.2.2'] }),
+      );
+
+      const agents = [
+        { pid: 100, agent: 'Claude Code', category: 'ai' },
+        { pid: 200, agent: 'Copilot', category: 'ai' },
+      ];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+      expect(results).toHaveLength(2);
+      expect(results[0].agent).toBe('Claude Code');
+      expect(results[0].flagged).toBe(false);
+      expect(results[1].agent).toBe('Copilot');
+      expect(results[1].flagged).toBe(true);
+    });
+
+    it('filters IPv4 link-local sockets and their mapped forms before any DNS query', async () => {
+      const ips = [
+        '169.254.0.0',
+        '169.254.1.2',
+        '169.254.255.255',
+        '::ffff:169.254.0.0',
+        '0:0:0:0:0:ffff:169.254.255.255',
+        '::ffff:a9fe:102',
+      ];
+      mockGetRawTcp.mockResolvedValue(
+        ips.map((ip) => ({ pid: 100, ip, port: 443, state: 'ESTAB' })),
+      );
+      mockDnsReverse.mockResolvedValue([]);
+      const result = await networkMonitor.scanNetworkConnections([
+        { pid: 100, agent: 'Claude Code', instanceId: '100:1' },
+      ]);
+      expect(result).toEqual([]);
+      expect(mockDnsReverse).not.toHaveBeenCalled();
+      expect(mockDnsResolve).not.toHaveBeenCalled();
+      expect(networkMonitor.getNetworkSensorHealth().state).toBe('HEALTHY');
+    });
+
+    it('keeps adjacent public IPv4 endpoints in DNS classification', async () => {
+      const ips = ['169.253.255.255', '169.255.0.0'];
+      mockGetRawTcp.mockResolvedValue(
+        ips.map((ip) => ({ pid: 100, ip, port: 443, state: 'ESTAB' })),
+      );
+      mockDnsReverse.mockResolvedValue([]);
+      const result = await networkMonitor.scanNetworkConnections([
+        { pid: 100, agent: 'Claude Code', instanceId: '100:1' },
+      ]);
+      expect(result.map((row) => row.remoteIp)).toEqual(ips);
+      expect(mockDnsReverse.mock.calls.map(([ip]) => ip).sort()).toEqual(ips);
+    });
+
+    it('keeps no agent name when the pid is not in the map (C-01)', async () => {
+      // Previously this synthesized `PID 999`. That name reaches the audit log, where a
+      // fabricated agent is indistinguishable from a real one — and under Event Schema v1
+      // it would sit beside an attribution status, dressing a guess as a resolved owner.
+      mockGetRawTcp.mockResolvedValue([{ pid: 999, ip: '8.8.8.8', port: 53, state: 'ESTAB' }]);
+      mockDnsReverse.mockResolvedValue(['dns.google']);
+      mockDnsResolve.mockImplementation(forwardMap({ 'dns.google': ['8.8.8.8'] }));
+
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai' }];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+      expect(results).toHaveLength(1);
+      expect(results[0].agent).toBe('');
+      // The pid itself is still reported — it is an observation, not a guess.
+      expect(results[0].pid).toBe(999);
+    });
+  });
+
+  describe('scanNetworkConnections() — current population', () => {
+    const agents = [{ pid: 100, agent: 'Claude Code', instanceId: '100:1700000000111' }];
+
+    it('discards a stale empty TCP response without advancing a prior success', async () => {
+      mockGetRawTcp.mockResolvedValueOnce([]);
+      await networkMonitor.scanNetworkConnections(agents);
+      const lastSuccessAt = networkMonitor.getNetworkSensorHealth().lastSuccessAt;
+      const raw = deferred();
+      mockGetRawTcp.mockReturnValueOnce(raw.promise);
+      let current = true;
+      const isScopeCurrent = vi.fn(() => current);
+
+      const scan = networkMonitor.scanNetworkConnections(agents, { isScopeCurrent });
+      current = false;
+      raw.resolve([]);
+
+      expect(await scan).toBeNull();
+      expect(isScopeCurrent).toHaveBeenCalledTimes(1);
+      expect(networkMonitor.getNetworkSensorHealth()).toMatchObject({
+        state: 'DEGRADED',
+        lastSuccessAt,
+        lastError: 'population-changed-during-scan',
+        detail: 'population-changed-during-scan',
+        consecutiveFailures: 0,
+      });
+    });
+
+    it('discards a response when the population changes during DNS resolution', async () => {
+      const dns = deferred();
+      mockGetRawTcp.mockResolvedValue([{ pid: 100, ip: '8.8.4.4', port: 443, state: 'ESTAB' }]);
+      mockDnsReverse.mockReturnValue(dns.promise);
+      mockDnsResolve.mockResolvedValue(['8.8.4.4']);
+      let current = true;
+      const isScopeCurrent = vi.fn(() => current);
+
+      const scan = networkMonitor.scanNetworkConnections(agents, { isScopeCurrent });
+      await vi.waitFor(() => expect(mockDnsReverse).toHaveBeenCalledTimes(1));
+      expect(isScopeCurrent).toHaveBeenCalledTimes(1);
+      current = false;
+      dns.resolve(['dns.google']);
+
+      expect(await scan).toBeNull();
+      expect(isScopeCurrent).toHaveBeenCalledTimes(2);
+      expect(networkMonitor.getNetworkSensorHealth()).toMatchObject({
+        state: 'DEGRADED',
+        lastSuccessAt: null,
+        lastError: 'population-changed-during-scan',
+      });
+    });
+
+    it('treats a throwing scope callback as lost coverage, not a provider failure', async () => {
+      mockGetRawTcp.mockResolvedValue([]);
+
+      await expect(
+        networkMonitor.scanNetworkConnections(agents, {
+          isScopeCurrent: () => {
+            throw new Error('scope-read-failed');
+          },
+        }),
+      ).resolves.toBeNull();
+      expect(networkMonitor.getNetworkSensorHealth()).toMatchObject({
+        state: 'DEGRADED',
+        lastSuccessAt: null,
+        lastError: 'population-changed-during-scan',
+        consecutiveFailures: 0,
+      });
+    });
+
+    it('keeps a TCP provider rejection FAILED even when the scope is stale', async () => {
+      mockGetRawTcp.mockRejectedValue(new Error('tcp-unavailable'));
+      const isScopeCurrent = vi.fn(() => false);
+
+      await expect(
+        networkMonitor.scanNetworkConnections(agents, { isScopeCurrent }),
+      ).rejects.toThrow('tcp-unavailable');
+      expect(isScopeCurrent).not.toHaveBeenCalled();
+      expect(networkMonitor.getNetworkSensorHealth()).toMatchObject({
+        state: 'FAILED',
+        lastSuccessAt: null,
+        lastError: 'network-provider-failed',
+        consecutiveFailures: 1,
+      });
+    });
+
+    it('keeps the explicit scope-loss reason when a completed scan is rejected late', async () => {
+      mockGetRawTcp.mockResolvedValue([]);
+      await networkMonitor.scanNetworkConnections(agents);
+      const lastSuccessAt = networkMonitor.getNetworkSensorHealth().lastSuccessAt;
+
+      networkMonitor.noteNetworkSkip('population-changed-during-scan');
+
+      expect(networkMonitor.getNetworkSensorHealth()).toMatchObject({
+        state: 'DEGRADED',
+        lastSuccessAt,
+        lastError: 'population-changed-during-scan',
+        detail: 'population-changed-during-scan',
+        consecutiveFailures: 0,
+      });
+    });
+  });
+
+  // A NetworkConnection must carry the process-INSTANCE key of the agent whose pid
+  // the OS reported as owning the socket, read off that agent object inside this
+  // same call. Without it the renderer can only correlate connections by pid or by
+  // display name, and neither survives a pid recycle or a second instance.
+  describe('scanNetworkConnections() — instanceId', () => {
+    it('stamps the matched agent exact key', async () => {
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 100, ip: '160.79.104.10', port: 443, state: 'ESTAB' },
+      ]);
+      const agents = [
+        {
+          pid: 100,
+          agent: 'Claude Code',
+          category: 'ai',
+          instanceId: '100:1700000000111',
+        },
+      ];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+      expect(results).toHaveLength(1);
+      expect(results[0].agent).toBe('Claude Code');
+      expect(results[0].instanceId).toBe('100:1700000000111');
+      expect(results[0].attribution).toEqual({
+        status: 'confirmed',
+        evidence: ['os-tcp-owner-pid'],
+      });
+    });
+
+    // Same C-01 rule that keeps `agent` blank: an unowned connection gets no key.
+    // The agent that IS online sits right there in the map and must not be borrowed.
+    it('leaves instanceId null when the pid matches no agent (C-01)', async () => {
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 999, ip: '160.79.104.10', port: 443, state: 'ESTAB' },
+      ]);
+      const agents = [
+        { pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:1700000000111' },
+      ];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+      expect(results).toHaveLength(1);
+      expect(results[0].agent).toBe('');
+      expect(results[0].instanceId).toBeNull();
+      expect(results[0].instanceId).not.toBe('100:1700000000111');
+      expect(results[0].attribution).toEqual({
+        status: 'unattributed',
+        evidence: ['no-owner-match'],
+      });
+    });
+
+    // Read, never re-derive: this agent has a pid and a startTime, so
+    // buildInstanceId() would return a plausible '100:1700000000111' — a key that
+    // appears in no scan-batch and joins to nothing.
+    it('leaves instanceId null for an agent that carries no key of its own', async () => {
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 100, ip: '160.79.104.10', port: 443, state: 'ESTAB' },
+      ]);
+      const agents = [{ pid: 100, agent: 'Claude Code', category: 'ai', startTime: 1700000000111 }];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+      expect(results).toHaveLength(1);
+      expect(results[0].agent).toBe('Claude Code');
+      expect(results[0].instanceId).toBeNull();
+    });
+
+    // Two live instances of ONE agent name, each with its own socket. The display
+    // name is identical, so only the key separates them.
+    it('gives two same-name instances two different keys', async () => {
+      mockGetRawTcp.mockResolvedValue([
+        { pid: 100, ip: '160.79.104.10', port: 443, state: 'ESTAB' },
+        { pid: 200, ip: '160.79.104.11', port: 443, state: 'ESTAB' },
+      ]);
+      const agents = [
+        {
+          pid: 100,
+          agent: 'Claude Code',
+          category: 'ai',
+          cwd: '/home/user/projA',
+          instanceId: '100:1700000000111',
+        },
+        {
+          pid: 200,
+          agent: 'Claude Code',
+          category: 'ai',
+          cwd: '/home/user/projB',
+          instanceId: '200:1700000000222',
+        },
+      ];
+      const results = await networkMonitor.scanNetworkConnections(agents);
+      expect(results).toHaveLength(2);
+      expect(results.map((c) => c.agent)).toEqual(['Claude Code', 'Claude Code']);
+      expect(results[0].instanceId).toBe('100:1700000000111');
+      expect(results[1].instanceId).toBe('200:1700000000222');
+      expect(new Set(results.map((c) => c.instanceId)).size).toBe(2);
+    });
+  });
+
+  describe('isNetworkScanRunning / setNetworkScanRunning', () => {
+    it('tracks scan running state', () => {
+      expect(networkMonitor.isNetworkScanRunning()).toBe(false);
+      networkMonitor.setNetworkScanRunning(true);
+      expect(networkMonitor.isNetworkScanRunning()).toBe(true);
+      networkMonitor.setNetworkScanRunning(false);
+      expect(networkMonitor.isNetworkScanRunning()).toBe(false);
+    });
+  });
+});
+
+describe('whole-scan DNS budget', () => {
+  const agents = [{ pid: 42, agent: 'Claude', instanceId: '42:t' }];
+  const tcp = (ip) => ({ pid: 42, ip, port: 443, state: 'Established' });
+  let reverse;
+  let forward;
+  let raw;
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  };
+  beforeEach(() => {
+    vi.useFakeTimers();
+    networkMonitor._resetForTest();
+    reverse = vi.fn();
+    forward = vi.fn().mockResolvedValue([]);
+    raw = vi.fn();
+    networkMonitor._setDepsForTest({
+      getRawTcpConnections: raw,
+      dnsReverse: reverse,
+      dnsResolve: forward,
+    });
+  });
+  afterEach(() => {
+    networkMonitor._resetForTest();
+    vi.useRealTimers();
+  });
+  it.each(['reverse', 'forward'])(
+    'returns TCP observations after a hung %s within the shared deadline',
+    async (stage) => {
+      const hung = deferred();
+      raw.mockResolvedValue([tcp('8.8.8.8'), tcp('1.1.1.1'), tcp('160.79.104.10')]);
+      reverse.mockImplementation((ip) =>
+        ip === '8.8.8.8' && stage === 'reverse'
+          ? hung.promise
+          : Promise.resolve([ip === '8.8.8.8' ? 'hung.example' : 'api.github.com']),
+      );
+      forward.mockImplementation((name) =>
+        name === 'hung.example' ? hung.promise : Promise.resolve(['1.1.1.1']),
+      );
+      const scan = networkMonitor.scanNetworkConnections(agents);
+      await vi.advanceTimersByTimeAsync(2999);
+      let finished = false;
+      scan.then(() => {
+        finished = true;
+      });
+      await Promise.resolve();
+      expect(finished).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const rows = await scan;
+      expect(rows[0]).toMatchObject({
+        verdict: 'unknown',
+        verdictReason: 'dns-timeout',
+        instanceId: '42:t',
+      });
+      expect(rows[1]).toMatchObject({ verdict: 'allowlisted', domain: 'api.github.com' });
+      expect(rows[2]).toMatchObject({ verdict: 'allowlisted', verdictReason: 'ip-allowlist' });
+      expect(reverse).not.toHaveBeenCalledWith('160.79.104.10');
+      expect(networkMonitor.getNetworkSensorHealth().state).toBe('HEALTHY');
+      hung.resolve(stage === 'reverse' ? ['api.github.com'] : ['8.8.8.8']);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(networkMonitor.classifyConnection('8.8.8.8').reason).toBe('ptr-missing');
+      raw.mockResolvedValue([tcp('8.8.8.8')]);
+      reverse.mockResolvedValue(['api.github.com']);
+      forward.mockResolvedValue(['8.8.8.8']);
+      expect((await networkMonitor.scanNetworkConnections(agents))[0].verdict).toBe('allowlisted');
+    },
+  );
+  it('retains actual resolver slots across repeated scans and releases them only on settlement', async () => {
+    const hung = deferred();
+    const rows = Array.from({ length: 40 }, (_, i) => tcp(`8.8.1.${i + 1}`));
+    raw.mockResolvedValue(rows);
+    reverse.mockReturnValue(hung.promise);
+    const first = networkMonitor.scanNetworkConnections(agents);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect((await first).every((row) => row.verdictReason === 'dns-timeout')).toBe(true);
+    expect(reverse).toHaveBeenCalledTimes(16);
+    for (let i = 0; i < 3; i++) {
+      expect(await networkMonitor.scanNetworkConnections(agents)).toHaveLength(40);
+    }
+    expect(reverse).toHaveBeenCalledTimes(16);
+    hung.resolve([]);
+    await vi.advanceTimersByTimeAsync(0);
+    reverse.mockResolvedValue([]);
+    expect((await networkMonitor.scanNetworkConnections(agents))[0].verdictReason).toBe(
+      'ptr-missing',
+    );
+    expect(reverse).toHaveBeenCalledTimes(56);
+  });
+  it('limits distinct PTR candidates and reports incomplete enrichment', async () => {
+    raw.mockResolvedValue([tcp('8.8.8.8')]);
+    reverse.mockResolvedValue(Array.from({ length: 80 }, (_, i) => `candidate${i}.example`));
+    const rows = await networkMonitor.scanNetworkConnections(agents);
+    expect(forward).toHaveBeenCalledTimes(16);
+    expect(rows[0]).toMatchObject({ verdict: 'unknown', verdictReason: 'dns-timeout' });
+  });
+  it.each(['reverse', 'forward'])(
+    'bounds scan waiters sharing an unbudgeted hung %s lookup',
+    async (stage) => {
+      const hung = deferred();
+      reverse.mockImplementation((ip) =>
+        stage === 'reverse' ? hung.promise : Promise.resolve(['shared.example', `${ip}.example`]),
+      );
+      forward.mockImplementation((name) =>
+        name === 'shared.example' ? hung.promise : Promise.resolve([]),
+      );
+      const owner = networkMonitor.resolveIp('9.9.9.9');
+      await vi.advanceTimersByTimeAsync(0);
+      raw.mockResolvedValue([tcp(stage === 'reverse' ? '9.9.9.9' : '8.8.8.8')]);
+      for (let i = 0; i < 3; i++) {
+        const scan = networkMonitor.scanNetworkConnections(agents);
+        await vi.advanceTimersByTimeAsync(3000);
+        expect((await scan)[0]).toMatchObject({ verdict: 'unknown', verdictReason: 'dns-timeout' });
+      }
+      expect(reverse).toHaveBeenCalledTimes(stage === 'reverse' ? 1 : 4);
+      expect(forward).toHaveBeenCalledTimes(stage === 'reverse' ? 0 : 1);
+      hung.resolve([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await owner).toBeNull();
+      // Only the original unbudgeted owner may continue; expired scan workers have left.
+      expect(forward).toHaveBeenCalledTimes(stage === 'reverse' ? 0 : 2);
+      expect(networkMonitor.classifyConnection('8.8.8.8').reason).toBe('ptr-missing');
+    },
+  );
+  it('uses one deadline across worker waves rather than granting each IP another deadline', async () => {
+    raw.mockResolvedValue(Array.from({ length: 64 }, (_, i) => tcp(`8.8.2.${i + 1}`)));
+    reverse.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve([]), 1100)));
+    const scan = networkMonitor.scanNetworkConnections(agents);
+    await vi.advanceTimersByTimeAsync(3000);
+    const rows = await scan;
+    expect(rows.filter((row) => row.verdictReason === 'ptr-missing')).toHaveLength(32);
+    expect(rows.filter((row) => row.verdictReason === 'dns-timeout')).toHaveLength(32);
+    expect(reverse).toHaveBeenCalledTimes(48);
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(reverse).toHaveBeenCalledTimes(48);
+    expect(networkMonitor.classifyConnection('8.8.2.33').reason).toBe('ptr-missing');
+  });
+  it('still rejects a changed population after the DNS deadline', async () => {
+    raw.mockResolvedValue([tcp('8.8.8.8')]);
+    reverse.mockReturnValue(new Promise(() => {}));
+    let current = true;
+    const scan = networkMonitor.scanNetworkConnections(agents, { isScopeCurrent: () => current });
+    await vi.advanceTimersByTimeAsync(1);
+    current = false;
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(await scan).toBeNull();
+    expect(networkMonitor.getNetworkSensorHealth().lastError).toBe(
+      'population-changed-during-scan',
+    );
+  });
+});

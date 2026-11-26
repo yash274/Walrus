@@ -1,0 +1,254 @@
+name: Windows installer lifecycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Qualification environment and installer interaction
+        type: choice
+        default: server-silent
+        options:
+          - server-silent
+          - windows11-wizard
+          - windows11-x64
+          - windows11-x64-updater
+          - windows11-x64-all-users
+          - windows11-x64-all-users-updater
+      candidate:
+        description: Published installer, this revision, or the frozen PR 1048 candidate
+        type: choice
+        default: published
+        options:
+          - published
+          - build
+          - pr1048
+          - master813
+
+permissions:
+  contents: read
+
+jobs:
+  qualification-master813:
+    if: inputs.candidate == 'master813'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/windows-candidate-021.yml
+    with:
+      profile: master813
+  qualification-pr1048:
+    if: inputs.candidate == 'pr1048'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/windows-candidate-021.yml
+  build-candidate:
+    if: inputs.candidate == 'build' && !startsWith(inputs.target, 'windows11-x64')
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      HUSKY: '0'
+      CI: 'true'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      npm_config_logs_max: '1'
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      RuntimeFrameworkVersion: '10.0.14'
+      TargetLatestRuntimePatch: 'false'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Allocate .NET job paths
+        run: |
+          ('DOTNET_INSTALL_DIR=' + (Join-Path $env:RUNNER_TEMP 'aegis-dotnet-10.0.403')) | Add-Content -LiteralPath $env:GITHUB_ENV
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '10.0.403'
+      - name: Verify selected .NET SDK
+        run: |
+          $sdk = dotnet --version
+          if ($LASTEXITCODE -or $sdk.Trim() -ne '10.0.403') { throw 'Expected .NET SDK 10.0.403' }
+          $hostPath = (Get-Command dotnet).Source
+          if (-not $hostPath.StartsWith([IO.Path]::GetFullPath($env:DOTNET_INSTALL_DIR).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'dotnet escaped the job-local installation' }
+      - name: Allocate build storage
+        run: |
+          $buildRoot = Join-Path $env:RUNNER_TEMP ('aegis-candidate-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $buildRoot) { throw 'Build scratch already exists' }
+          New-Item -ItemType Directory -Path $buildRoot | Out-Null
+          @(
+            ('AEGIS_CANDIDATE_BUILD=' + $buildRoot)
+            ('TEMP=' + $buildRoot)
+            ('TMP=' + $buildRoot)
+            ('npm_config_cache=' + (Join-Path $buildRoot 'npm'))
+            ('ELECTRON_CACHE=' + (Join-Path $buildRoot 'electron'))
+            ('ELECTRON_BUILDER_CACHE=' + (Join-Path $buildRoot 'builder'))
+            ('NUGET_PACKAGES=' + (Join-Path $buildRoot 'nuget'))
+          ) | Add-Content -LiteralPath $env:GITHUB_ENV
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name,Free,Used
+          if ((Get-PSDrive -Name ((Split-Path -Qualifier $buildRoot).TrimEnd(':'))).Free -lt 6GB) { throw 'Insufficient build disk space' }
+      - name: Install locked build dependencies
+        timeout-minutes: 5
+        run: npm ci --no-audit --no-fund --loglevel=error
+      - name: Build candidate without release publication
+        run: npx --no-install electron-builder --win --x64 --publish never
+      - name: Verify published .NET runtime
+        run: |
+          $runtime = Get-Content -LiteralPath dist/win-unpacked/resources/etw-file/EtwFile.runtimeconfig.json -Raw | ConvertFrom-Json
+          $frameworks = @($runtime.runtimeOptions.includedFrameworks)
+          if ($frameworks.Count -ne 1 -or $frameworks[0].name -ne 'Microsoft.NETCore.App' -or $frameworks[0].version -ne '10.0.14') { throw 'Expected self-contained .NET runtime 10.0.14' }
+          $deps = Get-Content -LiteralPath dist/win-unpacked/resources/etw-file/EtwFile.deps.json -Raw | ConvertFrom-Json
+          $packs = @($deps.libraries.PSObject.Properties.Name | Where-Object { $_ -like 'runtimepack.Microsoft.NETCore.App.Runtime.*' })
+          if ($packs.Count -ne 1 -or $packs[0] -ne 'runtimepack.Microsoft.NETCore.App.Runtime.win-x64/10.0.14') { throw 'Unexpected runtime pack in published dependencies' }
+      - name: Record candidate provenance and digest
+        run: |
+          $files = @(Get-ChildItem -LiteralPath dist -Filter '*.exe' -File)
+          if ($files.Count -ne 1 -or $files[0].Length -gt 250MB) { throw 'Expected one bounded installer' }
+          $stage = Join-Path $env:AEGIS_CANDIDATE_BUILD 'artifact'
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item -LiteralPath $files[0].FullName -Destination (Join-Path $stage $files[0].Name)
+          @{
+            schema='aegis-ci-installer/1'; repository=$env:GITHUB_REPOSITORY
+            sourceSha=$env:GITHUB_SHA; runId=$env:GITHUB_RUN_ID; attempt=$env:GITHUB_RUN_ATTEMPT
+            version=(Get-Content package.json -Raw | ConvertFrom-Json).version
+            filename=$files[0].Name; bytes=$files[0].Length
+            sha256=(Get-FileHash -LiteralPath $files[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            releaseSigned=$false; published=$false
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'candidate.json') -Encoding utf8
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name,Free,Used
+          Get-ChildItem -LiteralPath $env:AEGIS_CANDIDATE_BUILD -File -Recurse | Measure-Object Length -Sum
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: installer-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.AEGIS_CANDIDATE_BUILD }}/artifact/
+          if-no-files-found: error
+          retention-days: 7
+  installer:
+    needs: build-candidate
+    if: always() && !cancelled() && inputs.candidate != 'pr1048' && inputs.candidate != 'master813' && !startsWith(inputs.target, 'windows11-x64') && (needs.build-candidate.result == 'success' || (inputs.candidate != 'build' && needs.build-candidate.result == 'skipped'))
+    runs-on: ${{ inputs.target == 'windows11-wizard' && 'windows-11-vs2026-arm' || 'windows-2025' }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [fresh, upgrade]
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      HUSKY: '0'
+      CI: 'true'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      npm_config_logs_max: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Allocate job-local storage
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP ('aegis-installer-' + '${{ matrix.scenario }}' + '-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $scratch) { throw 'Scratch already exists' }
+          $bootstrap = $scratch + '-bootstrap'
+          if (Test-Path -LiteralPath $bootstrap) { throw 'Bootstrap scratch already exists' }
+          New-Item -ItemType Directory -Path $bootstrap | Out-Null
+          @(
+            ('AEGIS_INSTALLER_QA=' + $scratch)
+            ('TEMP=' + $bootstrap)
+            ('TMP=' + $bootstrap)
+            ('npm_config_cache=' + (Join-Path $bootstrap 'npm'))
+            ('NODE_COMPILE_CACHE=' + (Join-Path $bootstrap 'node-cache'))
+          ) | Add-Content -LiteralPath $env:GITHUB_ENV
+      - name: Install locked test driver dependencies
+        if: inputs.target != 'windows11-wizard'
+        timeout-minutes: 5
+        run: npm ci --ignore-scripts --no-audit --no-fund --loglevel=error
+      - name: Fetch candidate from this workflow run
+        if: inputs.candidate == 'build'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: installer-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/aegis-candidate-input
+      - name: Qualify installer in disposable Windows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $options = @{}
+          if ('${{ inputs.candidate }}' -eq 'build') { $options.CandidateDirectory = Join-Path $env:RUNNER_TEMP 'aegis-candidate-input' }
+          ./scripts/qualification/windows-installer-lifecycle.ps1 -Scenario '${{ matrix.scenario }}' -QaRoot $env:AEGIS_INSTALLER_QA -Mode '${{ inputs.target == 'windows11-wizard' && 'wizard' || 'silent' }}' @options
+      - name: Preserve bounded evidence
+        if: always() && env.AEGIS_INSTALLER_QA != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: installer-lifecycle-${{ inputs.target }}-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.AEGIS_INSTALLER_QA }}/evidence/
+          if-no-files-found: warn
+          retention-days: 7
+  installer-x64:
+    if: inputs.candidate != 'pr1048' && inputs.candidate != 'master813' && startsWith(inputs.target, 'windows11-x64')
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(inputs.target == 'windows11-x64-updater' && '["auto-update"]' || inputs.target == 'windows11-x64-all-users-updater' && '["all-users-update"]' || inputs.target == 'windows11-x64-all-users' && '["all-users"]' || '["fresh","upgrade"]') }}
+    defaults:
+      run:
+        shell: powershell
+    env:
+      HUSKY: '0'
+      CI: 'true'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      npm_config_logs_max: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Prepare bounded cloud test storage
+        run: |
+          if ('${{ inputs.candidate }}' -ne 'published') { throw 'Windows 11 x64 lane qualifies the pinned published installer only' }
+          $scratch = Join-Path $env:RUNNER_TEMP ('aegis-x64-driver-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $scratch) { throw 'Driver scratch already exists' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          @(
+            ('TEMP=' + $scratch)
+            ('TMP=' + $scratch)
+            ('npm_config_cache=' + (Join-Path $scratch 'npm'))
+          ) | Add-Content -LiteralPath $env:GITHUB_ENV
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name,Free,Used
+          if ((Get-PSDrive D).Free -lt 34GB) { throw 'Insufficient cloud guest data-drive storage' }
+      - name: Install locked test driver dependencies
+        timeout-minutes: 5
+        run: npm ci --ignore-scripts --no-audit --no-fund --loglevel=error
+      - name: Qualify published installer in native x64 Windows 11 guest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/qualification/windows-installer-x64.ps1 -Scenario '${{ matrix.scenario }}'
+      - name: Check bounded guest evidence
+        if: always() && env.AEGIS_X64_EVIDENCE != ''
+        run: |
+          $files = @(Get-ChildItem -LiteralPath $env:AEGIS_X64_EVIDENCE -Recurse -File)
+          if ($files.Count -gt 110 -or ($files | Measure-Object Length -Sum).Sum -gt 40MB -or @(Get-ChildItem -LiteralPath $env:AEGIS_X64_EVIDENCE -Recurse -Force -Attributes ReparsePoint).Count) { throw 'Evidence budget/layout exceeded' }
+          'AEGIS_X64_EVIDENCE_READY=true' | Add-Content -LiteralPath $env:GITHUB_ENV
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always() && env.AEGIS_X64_EVIDENCE_READY == 'true'
+        with:
+          name: installer-lifecycle-windows11-x64-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.AEGIS_X64_EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 7

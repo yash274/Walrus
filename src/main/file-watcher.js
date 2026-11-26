@@ -1,0 +1,1841 @@
+/**
+ * @file file-watcher.js
+ * @module main/file-watcher
+ * @description Real-time chokidar file watchers, handle-based scanning via
+ *   PowerShell, sensitive-file classification, and system-noise filtering.
+ * @requires fs
+ * @requires path
+ * @requires os
+ * @requires chokidar
+ * @requires child_process
+ * @requires ../shared/constants
+ * @requires ./rule-loader
+ * @requires ./watch-root-registry
+ * @author AEGIS Contributors
+ * @license MIT
+ * @version 0.3.0-alpha
+ */
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { randomUUID } = require('node:crypto');
+const chokidar = require('chokidar');
+const watchWorker = require('./watch-worker-client');
+const DEFAULT_APP_DIR = path.join(__dirname, '..', '..');
+let _appDir = DEFAULT_APP_DIR;
+const {
+  IGNORE_PATTERNS,
+  AGENT_CONFIG_PATHS,
+  SENSITIVE_AGENT_DIRS,
+  AGENT_SELF_CONFIG,
+} = require('../shared/constants');
+const { getAllRules, reloadRules } = require('./rule-loader');
+const { EVIDENCE, makeAttribution } = require('./attribution');
+const { readInstanceId } = require('./process-identity');
+const { validCreateTime100ns } = require('./platform/windows-observer');
+const { skillFromPath } = require('../shared/skill-path');
+const sensorHealth = require('./sensor-health');
+// Watch-root registry (design §1) — the plan, its per-root state transitions, and the
+// W derived from it. Pure state: this module keeps ownership of the `fs-chokidar`
+// health record and is the only place a sensorHealth.mark* call may happen.
+const {
+  WATCH_GROUP,
+  WATCH_ROOT_STATE,
+  resetWatchPlan,
+  buildWatchPlan,
+  hasPlannedRoot,
+  markRootRegistered,
+  markRootRegistrationFailed,
+  markUnreachedRootsNotAttempted,
+  markRootReady,
+  markRootErrored,
+  markRootTerminated,
+  noteRootDelivery,
+  deriveWatchPlaneState,
+  unavailableRootSummary,
+  getWatchPlan,
+} = require('./watch-root-registry');
+const _platform = require('./platform');
+const { IGNORE_FILE_PATTERNS } = _platform;
+
+/** Stable filesystem sensor IDs (B2). Generic string ids — not a frozen registry. */
+const FS_SENSOR = Object.freeze({
+  CHOKIDAR: 'fs-chokidar',
+  HANDLE: 'fs-handle',
+  RM: 'fs-rm',
+});
+
+/** Reason recorded by every surface that refuses to observe an untrusted population. */
+const SCOPE_UNAVAILABLE_REASON = 'process-observation-unavailable';
+const SCOPE_CHANGED_REASON = 'population-changed-during-scan';
+
+/**
+ * Reason recorded when a trusted population leaves the read scope empty: a successful
+ * observation of zero, the same string the network leaf writes (§10 B4) so one
+ * vocabulary reaches the chip and the logs.
+ */
+const CONFIRMED_ZERO_REASON = 'confirmed-zero-agents';
+
+/**
+ * Reader for the ProcessCapabilities contract (design §3), resolved lazily.
+ *
+ * Required directly rather than injected through `_state`: that object is built in
+ * main.js and does not carry the contract, and §3 is explicit that a dependant must
+ * consume the capability struct — never a plane roll-up — to decide whether an
+ * agent-scoped observation may run. process-scanner requires nothing from here, so
+ * there is no cycle.
+ * @type {(() => {populationReliable: boolean}) | null}
+ */
+let _getProcessCapabilities = null;
+
+/**
+ * Whether the agent population may be used as an observation scope right now.
+ * @returns {boolean}
+ */
+function populationReliable() {
+  if (!_getProcessCapabilities) {
+    _getProcessCapabilities = require('./process-scanner').getProcessCapabilities;
+  }
+  return _getProcessCapabilities().populationReliable === true;
+}
+
+/**
+ * Default directories to ignore in file watchers.
+ * @type {string[]}
+ */
+const DEFAULT_IGNORED_DIRS = [
+  '.git',
+  'node_modules',
+  '__pycache__',
+  '.svn',
+  '.hg',
+  'dist',
+  'build',
+  '.next',
+  '.nuxt',
+  '.cache',
+  '.tmp',
+  '.venv',
+  '.vite',
+  '.svelte-kit',
+  '.turbo',
+];
+
+/**
+ * Max concurrent per-PID handle scans in scanAllFileHandles. Each scan spawns
+ * one powershell.exe + handle.exe (~500ms cold) on win32 — an uncapped fan-out
+ * over ~12 agents would saturate CPU and spike resources. Fixed at 5 (the
+ * bottleneck is per-PID I/O, not core count) so the cap stays deterministic.
+ * @type {number}
+ */
+const FILE_SCAN_CONCURRENCY = 5;
+const MAX_KNOWN_HANDLES_PER_INSTANCE = 500;
+const HANDLE_PATH_CAP_REASON = 'handle-path-cap-exceeded';
+const RM_HOLDER_CAP_REASON = 'rm-holder-cap-exceeded';
+
+let _getFileHandles = _platform.getFileHandles;
+// win32 exposes these (Restart Manager); darwin/linux do not → undefined, so the
+// RM branch is skipped and the legacy getFileHandles pool path runs unchanged.
+let _getSensitiveHolders = _platform.getSensitiveHolders;
+// Fast hot-cycle holder source (HOT_DIRS only); win32 only, undefined elsewhere.
+let _getHotSensitiveHolders = _platform.getHotSensitiveHolders;
+const _isRmAvailable = _platform.isRestartManagerAvailable;
+// Cost guard: ensure only ONE RM powershell spawn is in flight at a time across
+// the full (30s) and hot (~10s) cycles. NOT a correctness guard — the shared
+// knownHandles dedup already prevents double-emit (JS is single-threaded); this
+// only avoids a redundant concurrent spawn when both ticks coincide.
+let _rmScanInFlight = false;
+// A hot RM poll cannot prove that overflow in the broader full scope recovered.
+let _rmFullCapExceeded = false;
+/** Optional test override for platform read-detection capability. */
+let _isReadDetectionAvailableOverride = undefined;
+/** Optional test override for Restart Manager availability (the probe's verdict). */
+let _isRmAvailableOverride = undefined;
+
+/**
+ * Why a read leaf is out of the worst-of: the OTHER mechanism observes for this
+ * process. Written into `detail` by {@link resolveReadMechanism}.
+ * @type {Readonly<{RM: string, POOL: string}>}
+ */
+const READ_OWNER_REASON = Object.freeze({
+  RM: 'rm-owns-observation',
+  POOL: 'pool-owns-observation',
+});
+
+/**
+ * The read leaf {@link resolveReadMechanism} marked UNSUPPORTED, or null when it
+ * marked none. Only its own mark is ever undone: `platform-no-rm` is a platform fact
+ * written by {@link createInitialFsHealth} and is never recreated from here.
+ * @type {string|null}
+ */
+let _inactiveReadLeaf = null;
+
+/**
+ * Authoritative filesystem sensor-health records (B2). Lifetime = module process /
+ * until explicit reinit (setupFileWatchers for chokidar; _resetFsHealth for tests).
+ * @type {Record<string, import('./sensor-health').SensorHealth>}
+ */
+let _fsHealth = createInitialFsHealth();
+
+/**
+ * @returns {Record<string, object>}
+ */
+function createInitialFsHealth() {
+  const now = Date.now();
+  // Platform permanently without RM (darwin/linux) → UNSUPPORTED. Test overrides
+  // inject getSensitiveHolders later and re-create STARTING via _setDepsForTest.
+  const platformHasRm = typeof _platform.getSensitiveHolders === 'function';
+  const rm = platformHasRm
+    ? sensorHealth.createSensorHealth(FS_SENSOR.RM)
+    : sensorHealth.createUnsupported(FS_SENSOR.RM, {
+        detail: 'platform-no-rm',
+        now,
+      });
+  return {
+    [FS_SENSOR.CHOKIDAR]: sensorHealth.createSensorHealth(FS_SENSOR.CHOKIDAR),
+    [FS_SENSOR.HANDLE]: sensorHealth.createSensorHealth(FS_SENSOR.HANDLE),
+    [FS_SENSOR.RM]: rm,
+  };
+}
+
+/**
+ * Reset FS health records (tests / intentional reinit). Does not clear residual
+ * production loss mid-lifetime except by creating new records.
+ *
+ * Drops the watch plan with them: the plan is what writes the chokidar record, so a
+ * plan that outlived its record would recompute W from roots the new record never
+ * saw registered.
+ * @returns {void}
+ */
+function _resetFsHealth() {
+  _fsHealth = createInitialFsHealth();
+  _inactiveReadLeaf = null;
+  _rmFullCapExceeded = false;
+  resetWatchPlan();
+}
+
+/**
+ * @returns {boolean}
+ */
+function handleCapabilityOk() {
+  if (typeof _isReadDetectionAvailableOverride === 'boolean') {
+    return _isReadDetectionAvailableOverride;
+  }
+  if (typeof _platform.isReadDetectionAvailable === 'function') {
+    return _platform.isReadDetectionAvailable();
+  }
+  // darwin/linux: lsof//proc always available — no probe.
+  return true;
+}
+
+/**
+ * Plain serializable snapshots for future B6 — callers must not mutate.
+ * @returns {Record<string, object>}
+ * @since 0.11.0
+ */
+function getFileSensorHealth() {
+  /** @type {Record<string, object>} */
+  const out = {};
+  for (const id of Object.values(FS_SENSOR)) {
+    out[id] = sensorHealth.toPlain(_fsHealth[id]);
+  }
+  return out;
+}
+
+/**
+ * Orchestration-only skip: the read mechanisms were NOT run this tick. Two reasons,
+ * two verdicts, and the population gate decides between them BEFORE cardinality does
+ * — in scan-loop's `doFileScan` / `doHotReadScan` and in `scanAllFileHandles` alike:
+ *
+ * - `process-observation-unavailable`: the agent population could not be trusted as
+ *   an observation scope (design §2.4). DEGRADED, never FAILED — no provider failed.
+ *   Never HEALTHY: no read happened, so there is no scoped success to claim, and
+ *   `lastSuccessAt` must not advance.
+ * - `confirmed-zero-agents`: the population WAS read and the read scope is empty —
+ *   no agent at all, or none in the AI subset the pool probes. That is a successful
+ *   observation of zero: HEALTHY with the detail and `lastSuccessAt` advanced, the
+ *   scoped success the network leaf already records (§10 B4). B-S04 stands above
+ *   it — a pool that could not read even if an agent appeared is DEGRADED, not
+ *   vacuously HEALTHY — and a zero never latches: the next real scan writes over
+ *   the detail.
+ *
+ * Either verdict lands on the ACTIVE read mechanism — RM when the RM path owns
+ * observation, the handle pool otherwise — after `resolveReadMechanism` has settled
+ * which one that is, so an empty fleet that never reaches a scan still retires the
+ * idle leaf instead of leaving both STARTING (#328).
+ * @param {'confirmed-zero-agents'|'process-observation-unavailable'|'population-changed-during-scan'|string} reason
+ * @returns {void}
+ * @since 0.12.0
+ */
+function noteFileScanSkip(reason) {
+  const now = Date.now();
+  resolveReadMechanism(now);
+  const id = rmEnabled() ? FS_SENSOR.RM : FS_SENSOR.HANDLE;
+  const rec = _fsHealth[id];
+  // markHealthy and markDegraded both throw from these states, and RM is UNSUPPORTED
+  // on every platform that has no Restart Manager — a skip must not turn that into
+  // an error.
+  if (
+    rec.state === sensorHealth.SENSOR_HEALTH_STATE.UNSUPPORTED ||
+    rec.state === sensorHealth.SENSOR_HEALTH_STATE.DISABLED
+  ) {
+    return;
+  }
+  if (reason === CONFIRMED_ZERO_REASON) {
+    if (id === FS_SENSOR.HANDLE && !handleCapabilityOk()) {
+      markPoolBlind(now);
+      return;
+    }
+    _fsHealth[id] = sensorHealth.markHealthy(rec, now, { detail: CONFIRMED_ZERO_REASON });
+    return;
+  }
+  const scoped = reason === SCOPE_UNAVAILABLE_REASON || reason === SCOPE_CHANGED_REASON;
+  _fsHealth[id] = sensorHealth.markDegraded(rec, now, {
+    error: scoped ? reason : 'file-scan-skip',
+    detail: scoped ? reason : 'file-scan-skip',
+  });
+}
+
+/** @internal Override dependencies (for tests). */
+function _setDepsForTest(overrides) {
+  if (overrides.appDir) _appDir = overrides.appDir;
+  if (overrides.getFileHandles) _getFileHandles = overrides.getFileHandles;
+  if (overrides.getSensitiveHolders) _getSensitiveHolders = overrides.getSensitiveHolders;
+  if (overrides.getHotSensitiveHolders) _getHotSensitiveHolders = overrides.getHotSensitiveHolders;
+  if (overrides.getSensitiveHolders || overrides.getHotSensitiveHolders) {
+    // Tests inject RM on platforms where it is UNSUPPORTED by default — either source
+    // ticks the RM leaf through scanViaRestartManager, so either needs it live.
+    if (
+      _fsHealth[FS_SENSOR.RM] &&
+      _fsHealth[FS_SENSOR.RM].state === sensorHealth.SENSOR_HEALTH_STATE.UNSUPPORTED
+    ) {
+      _fsHealth[FS_SENSOR.RM] = sensorHealth.createSensorHealth(FS_SENSOR.RM);
+    }
+  }
+  if (overrides.getProcessCapabilities) _getProcessCapabilities = overrides.getProcessCapabilities;
+  if (Object.prototype.hasOwnProperty.call(overrides, 'isReadDetectionAvailable')) {
+    _isReadDetectionAvailableOverride = overrides.isReadDetectionAvailable;
+  }
+  if (Object.prototype.hasOwnProperty.call(overrides, 'isRestartManagerAvailable')) {
+    _isRmAvailableOverride = overrides.isRestartManagerAvailable;
+  }
+}
+/** @internal Reset debounce state + opt out of the RM path (for tests). */
+function _resetForTest() {
+  closeFileWatchers().catch(() => {});
+  _appDir = DEFAULT_APP_DIR;
+  watcherDebounce.clear();
+  _getSensitiveHolders = undefined; // tests opt into RM explicitly via _setDepsForTest
+  _getHotSensitiveHolders = undefined;
+  _rmScanInFlight = false;
+  _rmFullCapExceeded = false;
+  _isReadDetectionAvailableOverride = undefined;
+  _isRmAvailableOverride = undefined;
+  // Same contract as the RM dep above: a test opts INTO the population gate via
+  // _setDepsForTest. The real process-scanner sits at STARTING until something drives
+  // a scan, which is honestly "cannot vouch" — but a test asserting attribution logic
+  // is not asserting population health, and making every one of them drive a process
+  // scan first would couple two unrelated sensors. Production never calls this.
+  _getProcessCapabilities = () => ({
+    populationState: 'HEALTHY',
+    populationReliable: true,
+    populationAsOf: null,
+    identityQuality: 'unknown',
+  });
+  _resetFsHealth();
+  _watchCoverageReduced = false;
+}
+
+const watcherDebounce = new Map();
+let _state = null;
+let _watchGeneration = 0;
+let _ownedWatchers = [];
+const _rootRecovery = new Map();
+// One audit pair per continuous confirmed reduction, including watcher re-creation.
+// STARTING during preflight is not evidence that the prior gap has recovered.
+let _watchCoverageReduced = false;
+
+/** Stop delivery immediately, then release this lifetime's workers. @returns {Promise<void>} @since v0.14.0 */
+async function closeFileWatchers() {
+  _watchGeneration++;
+  for (const recovery of _rootRecovery.values()) {
+    clearTimeout(recovery.retryTimer);
+    clearTimeout(recovery.readyTimer);
+  }
+  _rootRecovery.clear();
+  // A retired watch lifetime cannot continue advertising coverage while the next
+  // setup is awaiting preflight or while native handles are being terminated.
+  _fsHealth[FS_SENSOR.CHOKIDAR] = sensorHealth.createSensorHealth(FS_SENSOR.CHOKIDAR);
+  resetWatchPlan();
+  const previous = _ownedWatchers;
+  _ownedWatchers = [];
+  for (const w of previous) {
+    const index = _state?.watchers.indexOf(w) ?? -1;
+    if (index >= 0) _state.watchers.splice(index, 1);
+  }
+  await Promise.all(previous.map((w) => w.close()));
+}
+
+/**
+ * @param {Object} state - shared state refs (getCustomRules, getLatestAgents, getLatestAiAgents, isMonitoringPaused, activityLog, knownHandles, watchers, recordFileAccess, onFileEvent, isOtherPanelExpanded, audit)
+ * @returns {void} @since v0.1.0
+ */
+function init(state) {
+  _state = state;
+}
+
+/**
+ * @param {string} filePath
+ * @returns {string|null} reason or null
+ * @since v0.1.0
+ */
+function classifySensitive(filePath) {
+  for (const rule of getAllRules().values()) {
+    if (rule.enabled !== false && rule.pattern.test(filePath)) return rule.reason;
+  }
+  if (_state) {
+    for (const rule of _state.getCustomRules()) {
+      if (rule.pattern.test(filePath)) return rule.reason;
+    }
+  }
+  return null;
+}
+
+/** @param {string} filePath @returns {boolean} @since v0.1.0 */
+function shouldIgnore(filePath) {
+  return (
+    IGNORE_PATTERNS.some((p) => p.test(filePath)) ||
+    IGNORE_FILE_PATTERNS.some((p) => p.test(filePath))
+  );
+}
+
+/**
+ * Check if a file access is an agent accessing its OWN config directory (expected, not a threat).
+ * @param {string} agentName - Agent display name (e.g. "Claude Code").
+ * @param {string} filePath - File path being accessed.
+ * @returns {boolean} True if this is a self-access.
+ * @since v0.3.0
+ */
+function isSelfAccess(agentName, filePath) {
+  const agentLower = agentName.toLowerCase();
+  for (const [keyword, pattern] of Object.entries(AGENT_SELF_CONFIG)) {
+    if (agentLower.includes(keyword) && pattern.test(filePath)) return true;
+  }
+  return false;
+}
+
+/**
+ * Find the AI agent that owns a file path so the event is attributed to it
+ * (and the self-access exemption is checked against the right agent). An
+ * agent's OWN config dir wins first — a cwd may contain another agent's config
+ * dir, so self-config must outrank cwd containment.
+ *
+ * Returns the owner TOGETHER WITH the evidence code that resolved it, so the
+ * caller never has to re-derive "why" (and never re-runs isSelfAccess against a
+ * different agent). Returns null when nothing matches — the caller must then emit
+ * an UNATTRIBUTED event rather than blame a substitute (C-01).
+ * @param {string} filePath - Resolved file path from the watcher event.
+ * @param {Array<{agent:string,cwd?:string}>} aiAgents - Candidate AI agents.
+ * @returns {{agent: Object|null, evidence: string[]}|null} Unique owner, explicit ambiguity, or no match.
+ * @since v0.10.0
+ */
+function findOwningAgent(filePath, aiAgents) {
+  let configOwner = null;
+  for (const a of aiAgents) {
+    if (isSelfAccess(a.agent, filePath)) {
+      if (configOwner) return { agent: null, evidence: [EVIDENCE.AMBIGUOUS_OWNER_MATCH] };
+      configOwner = a;
+    }
+  }
+  if (configOwner) return { agent: configOwner, evidence: [EVIDENCE.SELF_CONFIG_PATH] };
+  const target = process.platform === 'win32' ? filePath.toLowerCase() : filePath;
+  let cwdOwner = null;
+  for (const a of aiAgents) {
+    if (!a.cwd) continue;
+    let base = path.resolve(a.cwd);
+    if (process.platform === 'win32') base = base.toLowerCase();
+    if (target === base || target.startsWith(base + path.sep)) {
+      if (cwdOwner) return { agent: null, evidence: [EVIDENCE.AMBIGUOUS_OWNER_MATCH] };
+      cwdOwner = a;
+    }
+  }
+  return cwdOwner ? { agent: cwdOwner, evidence: [EVIDENCE.CWD_CONTAINMENT] } : null;
+}
+
+/**
+ * Build an ignore-filter function for chokidar's `ignored` option.
+ * Uses function form (not glob) to avoid chokidar issue #773.
+ * Handles both `/` and `\` separators for Windows compatibility.
+ * @param {Object} [config] - Config object with ignoredDirectories and ignoreCommonBuildDirs
+ * @returns {(filePath: string) => boolean}
+ */
+function getIgnoredDirFilter(config) {
+  const useDefaults = config?.ignoreCommonBuildDirs !== false;
+  const custom = Array.isArray(config?.ignoredDirectories) ? config.ignoredDirectories : [];
+  const dirs = useDefaults ? [...DEFAULT_IGNORED_DIRS, ...custom] : custom;
+  if (dirs.length === 0) return () => false;
+  return (filePath) =>
+    dirs.some(
+      (dir) =>
+        filePath.includes('/' + dir + '/') ||
+        filePath.includes('\\' + dir + '\\') ||
+        filePath.endsWith('/' + dir) ||
+        filePath.endsWith('\\' + dir),
+    );
+}
+
+/**
+ * Bound the audit trail to one pair per confirmed watch-coverage gap. A new plan
+ * starts in STARTING, which cannot prove recovery; only every planned root READY
+ * can close the gap. No root, path or provider error enters the journal.
+ * @param {string} state - derived state of the complete watch plan
+ * @returns {void}
+ * @since v0.16.0-alpha
+ */
+function auditWatchCoverageTransition(state) {
+  if (state === sensorHealth.SENSOR_HEALTH_STATE.STARTING) return;
+  const reduced =
+    state === sensorHealth.SENSOR_HEALTH_STATE.DEGRADED ||
+    state === sensorHealth.SENSOR_HEALTH_STATE.FAILED;
+  if (!reduced && state !== sensorHealth.SENSOR_HEALTH_STATE.HEALTHY) return;
+  if (reduced === _watchCoverageReduced) return;
+  const audit = _state?.audit;
+  if (typeof audit?.log !== 'function') return;
+  audit.log('observation-gap', {
+    agent: '',
+    pid: null,
+    instanceId: null,
+    action: reduced ? 'file-watch-coverage-reduced' : 'file-watch-coverage-restored',
+    path: '',
+    severity: 'normal',
+    attribution: null,
+    extra: { cause: 'file-watch', state: reduced ? 'reduced' : 'restored' },
+  });
+  _watchCoverageReduced = reduced;
+  audit.flush?.();
+}
+
+/**
+ * Write the derived W into the existing `fs-chokidar` record. The record is the
+ * mechanism's health; the plan is where its state now comes from.
+ *
+ * STARTING is not written: `createSensorHealth` already starts the record there,
+ * sensor-health has no markStarting, and a plan only ever leaves STARTING forward —
+ * roots never return to `planned`/`registered`, and every unavailable state is
+ * terminal. Consequence worth naming: `lastSuccessAt` now advances only when EVERY
+ * planned root is ready, where before one `ready` advanced it for all of them.
+ * @param {number} now
+ * @returns {void}
+ */
+function applyWatchPlaneHealth(now) {
+  const state = deriveWatchPlaneState();
+  const rec = _fsHealth[FS_SENSOR.CHOKIDAR];
+  if (state === sensorHealth.SENSOR_HEALTH_STATE.FAILED) {
+    _fsHealth[FS_SENSOR.CHOKIDAR] = sensorHealth.markFailed(rec, now, {
+      error: unavailableRootSummary() || 'no-live-watcher',
+      detail: 'no-live-watcher',
+    });
+  } else if (state === sensorHealth.SENSOR_HEALTH_STATE.DEGRADED) {
+    // Native errors have no lost-event count; worker queue loss is recorded separately.
+    _fsHealth[FS_SENSOR.CHOKIDAR] = sensorHealth.markDegraded(rec, now, {
+      error: unavailableRootSummary(),
+      detail: 'watch-roots-unavailable',
+    });
+  } else if (state === sensorHealth.SENSOR_HEALTH_STATE.HEALTHY) {
+    _fsHealth[FS_SENSOR.CHOKIDAR] = sensorHealth.markHealthy(rec, now);
+  }
+  auditWatchCoverageTransition(state);
+}
+
+/**
+ * @param {object} watcher - the FSWatcher this binding belongs to
+ * @param {string} rootId - the watch group it was registered for
+ * @param {number} generation - watch lifetime that owns these callbacks
+ * @returns {void}
+ */
+function bindWatcherEvents(watcher, rootId, generation) {
+  const current = () =>
+    generation === _watchGeneration && _rootRecovery.get(rootId)?.watcher === watcher;
+  // A selected root gains delivery authority only after this proxy's identity-ready
+  // check. Workers can emit changes while traversing their initial directory tree.
+  let admitted = !_rootRecovery.get(rootId)?.isCurrent;
+  // noteRootDelivery lives HERE, not in handleWatcherEvent: the handler is exported
+  // and called directly with no root context by the attribution/ignore suites.
+  watcher.on('add', (p) => {
+    if (!current() || !admitted) return;
+    noteRootDelivery(rootId);
+    handleWatcherEvent('created', p);
+  });
+  watcher.on('change', (p) => {
+    if (!current() || !admitted) return;
+    noteRootDelivery(rootId);
+    handleWatcherEvent('modified', p);
+  });
+  watcher.on('unlink', (p) => {
+    if (!current() || !admitted) return;
+    noteRootDelivery(rootId);
+    handleWatcherEvent('deleted', p);
+  });
+  // B2: chokidar may keep running after some errors — DEGRADED not FAILED, and the
+  // scope of the degradation is this ROOT, not the mechanism. The registry moves the
+  // root and answers whether anything changed; writing the record is this module's job,
+  // and only on a real transition — W is derived over the plan, so re-deriving it for
+  // an event that named no planned root would read an empty plan and throw.
+  watcher.on('error', (error) => {
+    if (!current()) return;
+    const changed =
+      error?.code === 'AEGIS_WATCH_WORKER_TERMINATED'
+        ? markRootTerminated(rootId, 'watch-worker-terminated')
+        : markRootErrored(rootId, 'watch-root-error');
+    if (changed) applyWatchPlaneHealth(Date.now());
+    if (changed && error?.code === 'AEGIS_WATCH_WORKER_TERMINATED') {
+      retireRootWatcher(rootId, watcher, generation);
+    }
+  });
+  // ready = successful initialization of this FSWatcher instance — that one root. A
+  // `ready` on a root already `errored` moves nothing (§1.4 — terminal), so it writes
+  // no record either.
+  watcher.on('ready', () => {
+    if (!current()) return;
+    const recovery = _rootRecovery.get(rootId);
+    if (recovery.isCurrent && !recovery.isCurrent()) {
+      markRootTerminated(rootId, 'selected-project-unavailable');
+      applyWatchPlaneHealth(Date.now());
+      retireRootWatcher(rootId, watcher, generation);
+      return;
+    }
+    clearTimeout(recovery.readyTimer);
+    recovery.readyTimer = null;
+    if (markRootReady(rootId)) {
+      admitted = true;
+      applyWatchPlaneHealth(Date.now());
+    }
+  });
+  watcher.on('progress', () => {
+    if (!current() || rootId !== 'project-dir' || !_rootRecovery.get(rootId).readyTimer) return;
+    armRootReadyTimeout(rootId, watcher, generation);
+  });
+  watcher.on('loss', (amount) => {
+    if (!current()) return;
+    _fsHealth[FS_SENSOR.CHOKIDAR] = sensorHealth.addLoss(
+      _fsHealth[FS_SENSOR.CHOKIDAR],
+      amount,
+      Date.now(),
+      { detail: 'watch-worker-overflow' },
+    );
+    if (markRootErrored(rootId, 'watch-worker-overflow')) applyWatchPlaneHealth(Date.now());
+  });
+}
+
+/** Retire one dead proxy and bound its local replacement attempts. @returns {void} @since v0.14.0 */
+function retireRootWatcher(rootId, watcher, generation) {
+  const recovery = _rootRecovery.get(rootId);
+  if (!recovery || recovery.watcher !== watcher || generation !== _watchGeneration) return;
+  clearTimeout(recovery.readyTimer);
+  recovery.watcher = null;
+  _ownedWatchers = _ownedWatchers.filter((w) => w !== watcher);
+  const index = _state.watchers.indexOf(watcher);
+  if (index >= 0) _state.watchers.splice(index, 1);
+  Promise.resolve(watcher.close()).catch(() => {});
+  scheduleRootRecovery(rootId, generation);
+}
+
+/** Retry a missing root without closing the surviving plan. @returns {void} @since v0.14.0 */
+function scheduleRootRecovery(rootId, generation) {
+  const recovery = _rootRecovery.get(rootId);
+  if (!recovery || recovery.retryTimer || recovery.attempts >= 3) return;
+  // The existing main-process retry owns complete plan loss.
+  if (getWatchPlan().liveWatcherCount === 0) return;
+  recovery.retryTimer = setTimeout(() => {
+    recovery.retryTimer = null;
+    if (generation !== _watchGeneration || _rootRecovery.get(rootId) !== recovery) return;
+    if (getWatchPlan().liveWatcherCount === 0) return;
+    recovery.attempts++;
+    try {
+      const watcher = recovery.register();
+      recovery.watcher = watcher;
+      markRootRegistered(rootId, watcher);
+      bindWatcherEvents(watcher, rootId, generation);
+      _ownedWatchers.push(watcher);
+      _state.watchers.push(watcher);
+      if (recovery.unknown) markRootErrored(rootId, 'watch-root-preflight-unavailable');
+      armRootReadyTimeout(rootId, watcher, generation);
+    } catch {
+      markRootRegistrationFailed(rootId, 'watch-root-registration-failed');
+      scheduleRootRecovery(rootId, generation);
+    }
+    applyWatchPlaneHealth(Date.now());
+  }, 1000);
+}
+
+/** Bound readiness for initial and replacement workers. @returns {void} @since v0.14.0 */
+function armRootReadyTimeout(rootId, watcher, generation) {
+  const recovery = _rootRecovery.get(rootId);
+  // Large native project scans may still be traversing after ten seconds. Only
+  // scan progress renews that idle allowance; one worker can never exceed a minute.
+  // Readiness and health still require the provider's actual ready notification.
+  if (recovery.startingWatcher !== watcher) {
+    recovery.startingWatcher = watcher;
+    recovery.readyDeadline = Date.now() + (rootId === 'project-dir' ? 60000 : 10000);
+  }
+  clearTimeout(recovery.readyTimer);
+  recovery.readyTimer = setTimeout(
+    () => {
+      if (generation !== _watchGeneration || recovery.watcher !== watcher) return;
+      markRootTerminated(rootId, 'watch-root-ready-timeout');
+      applyWatchPlaneHealth(Date.now());
+      retireRootWatcher(rootId, watcher, generation);
+    },
+    Math.min(10000, Math.max(0, recovery.readyDeadline - Date.now())),
+  );
+}
+
+function handleWatcherEvent(action, filePath) {
+  if (!_state || _state.isMonitoringPaused()) return;
+  filePath = path.resolve(filePath);
+  // F-E02: ignore rules still drop noise; empty latestAgents must NOT drop evidence.
+  // No agents → honest unattributed (NO_AI_AGENTS_ONLINE), not "no event happened".
+  if (shouldIgnore(filePath)) return;
+  const now = Date.now();
+  const reason = classifySensitive(filePath);
+  // G′: chokidar KEEPS OBSERVING under an untrusted population — a path event is
+  // valid evidence regardless of who owns it, and dropping it would lose real
+  // filesystem activity to a process-sensor problem. What is unavailable is the list
+  // of candidate owners, so owner inference is what gets skipped: `latestAiAgents` is
+  // not read, `findOwningAgent` is not run, and the event carries no owner. `W` is
+  // unaffected — no health record is written here.
+  const scopeUsable = populationReliable();
+  const aiAgents = scopeUsable ? _state.getLatestAiAgents() : [];
+  const owner = aiAgents.length > 0 ? findOwningAgent(filePath, aiAgents) : null;
+  // C-01: chokidar hands us a PATH, never a PID — so this path can be `inferred`
+  // at best, and MUST be `unattributed` when no owner matches. Substituting the
+  // first AI agent (or the first agent of any kind) poisoned that agent's
+  // baselines, risk score, tray alert and audit trail. `pid: null`, not 0 — pid 0
+  // is taken by synthetic WSL / local-runtime agents, so 0 would collide with a
+  // real agent card.
+  let evidence;
+  if (owner) {
+    evidence = owner.evidence;
+  } else if (!scopeUsable) {
+    // Says WHY there is no owner, and says it exactly: not "nobody was online"
+    // (which would assert a fact about a population we cannot read) and not "no
+    // owner matched" (which would assert a match was attempted).
+    evidence = [EVIDENCE.POPULATION_UNAVAILABLE];
+  } else {
+    evidence = [aiAgents.length > 0 ? EVIDENCE.NO_OWNER_MATCH : EVIDENCE.NO_AI_AGENTS_ONLINE];
+  }
+  const attribution = makeAttribution(evidence);
+  const agent = owner ? owner.agent : null;
+  // This is the inferred candidate's current snapshot witness, not a kernel
+  // assertion that the candidate issued the write. Never borrow from another row.
+  let createTime100ns = null;
+  if (
+    agent?.instanceIdSource === 'os' &&
+    Number.isSafeInteger(agent.pid) &&
+    agent.pid > 0 &&
+    Number.isSafeInteger(agent.startTime) &&
+    agent.startTime > 0 &&
+    readInstanceId(agent) === `${agent.pid}:${agent.startTime}` &&
+    validCreateTime100ns(agent.createTime100ns) &&
+    agent.generationWitnessSource === 'createTime100ns' &&
+    agent.generationWitness === agent.createTime100ns &&
+    Number((BigInt(agent.createTime100ns) - 116444736000000000n) / 10000n) === agent.startTime
+  )
+    createTime100ns = agent.createTime100ns;
+  // D2: the self-access exemption belongs to the agent that OWNS the path, and is
+  // implied by the evidence — findOwningAgent's first loop already ran
+  // isSelfAccess over every AI agent, so reaching the cwd branch (or no branch at
+  // all) proves no agent self-matched. Re-running it against a substituted agent
+  // is what let a foreign agent's exemption silently clear `sensitive`.
+  const selfAccess = reason !== null && evidence.includes(EVIDENCE.SELF_CONFIG_PATH);
+  const skill = skillFromPath(filePath);
+  const event = {
+    eventId: randomUUID(),
+    agent: agent ? agent.agent : '',
+    pid: agent ? agent.pid : null,
+    // Follows attribution, never leads it: `agent` is exactly the object
+    // findOwningAgent resolved above, so the key comes from the same decision — and
+    // from the same tick. That includes the `inferred` branch (self-config / cwd
+    // containment): its owner is a real agent from this tick, so it gets its real
+    // key. Only a null owner yields a null key — never aiAgents[0], never a
+    // name match.
+    instanceId: readInstanceId(agent),
+    ...(createTime100ns === null ? {} : { createTime100ns }),
+    parentEditor: (agent && agent.parentEditor) || null,
+    cwd: (agent && agent.cwd) || null,
+    file: filePath,
+    ...(skill ? { skill } : {}),
+    sensitive: reason !== null && !selfAccess,
+    selfAccess,
+    reason: reason || '',
+    action,
+    timestamp: now,
+    category: agent ? agent.category || 'other' : 'other',
+    attribution,
+  };
+  // Suppress only consecutive equivalent notifications. A create/delete/recreate
+  // sequence or stronger ownership evidence must reach audit and sequence consumers.
+  const debounceKey = process.platform === 'win32' ? filePath.toLowerCase() : filePath;
+  const signature = JSON.stringify([
+    action,
+    event.instanceId,
+    createTime100ns,
+    event.agent,
+    attribution,
+    event.sensitive,
+    selfAccess,
+    event.reason,
+  ]);
+  const previous = watcherDebounce.get(debounceKey);
+  if (
+    previous &&
+    !event.sensitive &&
+    previous.signature === signature &&
+    now >= previous.at &&
+    now - previous.at < 2000
+  )
+    return;
+  watcherDebounce.set(debounceKey, { at: now, signature });
+  if (watcherDebounce.size > 500) {
+    for (const [key, entry] of watcherDebounce) {
+      if (now - entry.at > 10000) watcherDebounce.delete(key);
+    }
+    if (watcherDebounce.size > 500) watcherDebounce.clear();
+  }
+  _state.activityLog.push(event);
+  if (_state.onActivityPush) _state.onActivityPush(event);
+  if (_state.activityLog.length > 10000) {
+    const evicted = _state.activityLog.shift();
+    if (_state.onActivityEvict) _state.onActivityEvict(evicted);
+  }
+  // An unattributed event enters NO agent's behaviour baseline: recording it under
+  // an empty name would create a phantom agent in sessionData, which
+  // checkDeviations() then iterates and warns about.
+  // The baseline bucket is keyed on the instance, so the key travels with the name —
+  // both taken from the event just built, never re-resolved. An owner that carries no
+  // key is not recorded at all (baselines.js `ensureSessionData`).
+  if (attribution.status !== 'unattributed') {
+    _state.recordFileAccess(event.instanceId, event.agent, filePath, event.sensitive, event.reason);
+  }
+  if (_state.onFileEvent) _state.onFileEvent(event);
+}
+
+/**
+ * Register the production watch roots and record what each one actually did.
+ *
+ * The rejection is deliberately re-thrown after the plan is written: main.js already
+ * reports it (`File watcher setup failed`), and this module owns the plan (§10 step B).
+ * @returns {Promise<void>}
+ * @throws {Error} whatever `chokidar.watch` threw, after the plan records the abort.
+ * @since v0.1.0
+ */
+async function setupFileWatchers() {
+  const closing = closeFileWatchers();
+  const generation = _watchGeneration;
+  await closing;
+  if (generation !== _watchGeneration) return;
+  const homeDir = os.homedir();
+  let projectSelection = { state: 'unselected' };
+  if (typeof _state.getProjectWatchRoot === 'function') {
+    try {
+      projectSelection = await _state.getProjectWatchRoot();
+    } catch {
+      projectSelection = { state: 'unavailable' };
+    }
+  }
+  const projectSelected =
+    projectSelection?.state === 'selected' &&
+    typeof projectSelection.path === 'string' &&
+    path.isAbsolute(projectSelection.path) &&
+    typeof projectSelection.isCurrent === 'function';
+  const projectUnavailable = !projectSelected && projectSelection?.state !== 'unselected';
+  const projectDir = projectSelected ? projectSelection.path : _appDir;
+  const projectCurrent = () => {
+    try {
+      return projectSelection.isCurrent() === true;
+    } catch {
+      return false;
+    }
+  };
+  if (generation !== _watchGeneration) return;
+  // BOTH preflights complete before ANY registration (§1.2). The plan separates
+  // intent from outcome: a group may leave it only because a completed probe proved
+  // there is nothing to watch — never because a registration threw. Under the old
+  // order the second probe ran after the first `chokidar.watch`, so an abort in
+  // between produced a plan that had never heard of the agent-config group, and one
+  // ready root was enough to call the whole mechanism HEALTHY.
+  const sensitiveProbe = await probeWatchDirs(
+    SENSITIVE_AGENT_DIRS.map((d) => path.join(homeDir, d)),
+  );
+  const sensitiveDirs = sensitiveProbe.paths;
+  // AI agent config directories (Hudson Rock threat vector — critical)
+  const sensitiveDirNames = new Set(SENSITIVE_AGENT_DIRS);
+  const agentConfigProbe = await probeWatchDirs(
+    AGENT_CONFIG_PATHS.filter((d) => !sensitiveDirNames.has(d)).map((d) => path.join(homeDir, d)),
+  );
+  const agentConfigDirs = agentConfigProbe.paths;
+  if (generation !== _watchGeneration) return;
+  // Reinit chokidar health lifetime when production recreates the watcher set — and
+  // the plan with it, since the plan is what writes into that record.
+  _fsHealth[FS_SENSOR.CHOKIDAR] = sensorHealth.createSensorHealth(FS_SENSOR.CHOKIDAR);
+  buildWatchPlan([
+    {
+      id: WATCH_GROUP.CREDENTIAL_DIRS,
+      applicable: sensitiveDirs.length > 0 || sensitiveProbe.unknown,
+    },
+    {
+      id: WATCH_GROUP.AGENT_CONFIG_DIRS,
+      applicable: agentConfigDirs.length > 0 || agentConfigProbe.unknown,
+    },
+    // ASAR contents are a virtual, read-only tree. fs.watch cannot observe them;
+    // registering them makes chokidar reject while its root may still report ready.
+    {
+      id: WATCH_GROUP.PROJECT_DIR,
+      applicable: projectSelected || projectUnavailable || path.extname(projectDir) !== '.asar',
+    },
+    // Unconditional, so the plan is never empty even in an archived app.
+    { id: WATCH_GROUP.ENV_FILES, applicable: true },
+  ]);
+  /** @type {string|null} The group whose registration is in flight. */
+  let attempted = null;
+  try {
+    const config = _state.getSettings ? _state.getSettings() : {};
+    const customDirs = Array.isArray(config.ignoredDirectories) ? config.ignoredDirectories : [];
+    const ignoredDirectories =
+      config.ignoreCommonBuildDirs === false
+        ? customDirs
+        : [...DEFAULT_IGNORED_DIRS, ...customDirs];
+    /** Registration order IS plan order — `not-attempted` is read off plan position. */
+    const registrations = [
+      [
+        WATCH_GROUP.CREDENTIAL_DIRS,
+        () =>
+          watchWorker.watch(sensitiveDirs, {
+            persistent: true,
+            ignoreInitial: true,
+            usePolling: false,
+            followSymlinks: false,
+            depth: 1,
+          }),
+        sensitiveProbe,
+      ],
+      [
+        WATCH_GROUP.AGENT_CONFIG_DIRS,
+        () =>
+          watchWorker.watch(agentConfigDirs, {
+            persistent: true,
+            ignoreInitial: true,
+            usePolling: false,
+            followSymlinks: false,
+            depth: 2,
+          }),
+        agentConfigProbe,
+      ],
+      [
+        WATCH_GROUP.PROJECT_DIR,
+        () => {
+          if (projectSelected && !projectCurrent())
+            throw Object.assign(Error('project-unavailable'), {
+              code: 'AEGIS_PROJECT_UNAVAILABLE',
+            });
+          return watchWorker.watch(projectDir, {
+            persistent: true,
+            ignoreInitial: true,
+            ignoredDirectories,
+            ignorePackageLock: true,
+            usePolling: false,
+            followSymlinks: false,
+            depth: 5,
+            startupProgress: true,
+          });
+        },
+        projectUnavailable ? { unknown: true, paths: [] } : undefined,
+      ],
+      [
+        WATCH_GROUP.ENV_FILES,
+        () =>
+          watchWorker.watch(homeDir, {
+            persistent: true,
+            ignoreInitial: true,
+            basenamePrefix: '.env',
+            depth: 0,
+            usePolling: false,
+            followSymlinks: false,
+          }),
+      ],
+    ];
+    for (const [id, register, probe] of registrations) {
+      if (!hasPlannedRoot(id)) continue; // not-applicable — proven absent by preflight
+      // An inaccessible path is not an absent path. Keep the group in the plan,
+      // observe any reachable siblings, and withhold HEALTHY until a new preflight
+      // and watcher lifetime vouch for the whole group.
+      if (probe?.unknown && probe.paths.length === 0) {
+        markRootRegistrationFailed(id, 'watch-root-preflight-unavailable');
+        continue;
+      }
+      attempted = id;
+      let w;
+      try {
+        w = register();
+      } catch (error) {
+        if (error.code !== 'AEGIS_PROJECT_UNAVAILABLE') throw error;
+        markRootRegistrationFailed(id, 'selected-project-unavailable');
+        continue;
+      }
+      _rootRecovery.set(id, {
+        register,
+        watcher: w,
+        attempts: 0,
+        unknown: !!probe?.unknown,
+        isCurrent: id === WATCH_GROUP.PROJECT_DIR && projectSelected ? projectCurrent : null,
+      });
+      markRootRegistered(id, w);
+      bindWatcherEvents(w, id, generation);
+      armRootReadyTimeout(id, w, generation);
+      _ownedWatchers.push(w);
+      _state.watchers.push(w);
+      if (probe?.unknown) markRootErrored(id, 'watch-root-preflight-unavailable');
+    }
+  } catch (err) {
+    // §1.3: the group that threw is `registration-failed`; every planned group the
+    // loop never reached is `not-attempted`, read off plan position. Both are recorded
+    // before the rejection leaves this function.
+    if (attempted) markRootRegistrationFailed(attempted, 'watch-root-registration-failed');
+    markUnreachedRootsNotAttempted();
+    applyWatchPlaneHealth(Date.now());
+    throw err;
+  }
+  applyWatchPlaneHealth(Date.now());
+}
+
+/**
+ * Probe optional watch directories without equating an access failure with absence.
+ * Only ENOENT/ENOTDIR prove the path is not a directory to watch. All other
+ * failures leave group coverage unknown; their text and paths stay out of health.
+ * @param {string[]} dirs
+ * @returns {Promise<{paths: string[], unknown: boolean}>}
+ * @since v0.5.0
+ */
+async function probeWatchDirs(dirs) {
+  const results = await Promise.all(
+    dirs.map((d) =>
+      fs.promises
+        .access(d)
+        .then(() => ({ path: d, unknown: false }))
+        .catch((err) => ({
+          path: null,
+          unknown: err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR',
+        })),
+    ),
+  );
+  return {
+    paths: results.map((result) => result.path).filter(Boolean),
+    unknown: results.some((result) => result.unknown),
+  };
+}
+
+/**
+ * Dedup key for _state.knownHandles: the agent's stamped process instance. Windows recycles PIDs, so a
+ * pid-keyed store lets a new process inherit a dead one's seen-set. Reconstructing
+ * via buildInstanceId from partial fields can disagree with the scan-batch stamp
+ * (ai-mistakes.md #19) — so unstamped agents get no handle-dedup entry this tick.
+ * @param {{instanceId?: string}} agent
+ * @returns {string|null}
+ */
+function handleKey(agent) {
+  return readInstanceId(agent);
+}
+
+/**
+ * RM uses 100 ns birth precision so two Windows processes born in the same
+ * millisecond cannot share a holding seen-set. The legacy handle pool keeps its
+ * existing instanceId key through sidecar-to-CIM precision changes.
+ * @param {{instanceId?: string, createTime100ns?: string|null}} agent
+ * @returns {string|null}
+ */
+function rmHolderKey(agent) {
+  const instanceId = handleKey(agent);
+  return instanceId && typeof agent.createTime100ns === 'string'
+    ? `${instanceId}|${agent.createTime100ns}`
+    : null;
+}
+
+/**
+ * Per-agent handle observation.
+ * @param {Object} agent
+ * @param {Function} [isAgentScopeCurrent] Validates the captured PID owner after the provider await.
+ * @returns {Promise<{ok: boolean, events: Array, error?: string, capExceeded?: boolean}>}
+ * @since v0.1.0
+ */
+async function scanFileHandles(agent, isAgentScopeCurrent) {
+  const scopeCurrent = () => {
+    if (typeof isAgentScopeCurrent !== 'function') return true;
+    try {
+      return isAgentScopeCurrent(agent) === true;
+    } catch {
+      return false;
+    }
+  };
+  if (!scopeCurrent()) return { ok: false, events: [], error: SCOPE_CHANGED_REASON };
+  const pid = agent.pid;
+  let files;
+  try {
+    files = await _getFileHandles(pid);
+  } catch {
+    // B-S03: empty events are compatibility only — ok:false means not a clean empty.
+    return { ok: false, events: [], error: 'handle-scan-failed' };
+  }
+  // Never mutate knownHandles or emit an owner claim from an obsolete PID scope.
+  if (!scopeCurrent()) return { ok: false, events: [], error: SCOPE_CHANGED_REASON };
+  if (!Array.isArray(files)) {
+    return { ok: true, events: [] };
+  }
+
+  const kh = _state.knownHandles;
+  const key = handleKey(agent);
+  // A successful empty observation closes the previous handle snapshot.
+  if (files.length === 0) {
+    if (key) kh.delete(key);
+    return { ok: true, events: [] };
+  }
+  // Keep still-open known paths first, independent of provider order. A path that
+  // closed frees a slot for a newly observed path on this tick. The bounded set
+  // tracks current handles, so a later reopen can produce a new access event.
+  // Unstamped agents still emit without inventing a dedup identity.
+  let known = null;
+  let nextKnown = null;
+  let capExceeded = false;
+  if (key) {
+    known = kh.get(key) || new Set();
+    nextKnown = new Set();
+    for (const f of files) {
+      if (shouldIgnore(f) || !known.has(f) || nextKnown.has(f)) continue;
+      if (nextKnown.size < MAX_KNOWN_HANDLES_PER_INSTANCE) nextKnown.add(f);
+      else capExceeded = true;
+    }
+    kh.set(key, nextKnown);
+  }
+  const newAccess = [];
+  // Event loop is outside getFileHandles try/catch so unexpected throws (e.g.
+  // recordFileAccess) propagate to the worker pool, which drops only this agent.
+  for (const f of files) {
+    if (shouldIgnore(f)) continue;
+    if (known && known.has(f)) continue;
+    if (nextKnown) {
+      if (nextKnown.has(f)) continue;
+      // Beyond the cap we miss new paths, including sensitive ones, until a slot
+      // opens; report incomplete coverage instead of repeated false activity.
+      if (nextKnown.size >= MAX_KNOWN_HANDLES_PER_INSTANCE) {
+        capExceeded = true;
+        continue;
+      }
+      nextKnown.add(f);
+    }
+    const reason = classifySensitive(f);
+    const selfAccess = reason !== null && isSelfAccess(agent.agent, f);
+    // Confirmed: this scan was run FOR agent.pid, so the owner IS the pid.
+    const evidence = [EVIDENCE.HANDLE_SCAN_PID];
+    if (selfAccess) evidence.push(EVIDENCE.SELF_CONFIG_PATH);
+    const skill = skillFromPath(f);
+    const event = {
+      eventId: randomUUID(),
+      agent: agent.agent,
+      pid,
+      // The scan was run FOR this agent object, so the key is that object's own —
+      // no lookup, no tick boundary crossed. Unstamped → null (honest).
+      instanceId: readInstanceId(agent),
+      parentEditor: agent.parentEditor || null,
+      cwd: agent.cwd || null,
+      file: f,
+      ...(skill ? { skill } : {}),
+      sensitive: reason !== null && !selfAccess,
+      selfAccess,
+      reason: reason || '',
+      action: 'accessed',
+      timestamp: Date.now(),
+      category: agent.category || 'other',
+      attribution: makeAttribution(evidence),
+    };
+    newAccess.push(event);
+    _state.activityLog.push(event);
+    if (_state.onActivityPush) _state.onActivityPush(event);
+    if (_state.activityLog.length > 10000) {
+      const evicted = _state.activityLog.shift();
+      if (_state.onActivityEvict) _state.onActivityEvict(evicted);
+    }
+    _state.recordFileAccess(event.instanceId, agent.agent, f, event.sensitive, event.reason);
+  }
+  return { ok: true, events: newAccess, capExceeded };
+}
+
+/**
+ * Whether the Restart Manager read-detect path is usable: the platform exposes
+ * getSensitiveHolders (win32 only) AND, if it reports availability, RM is up. When
+ * RM is unavailable the caller falls back to the legacy getFileHandles pool path,
+ * preserving the PR-A handle.exe fallback.
+ * @returns {boolean}
+ */
+function rmEnabled() {
+  if (typeof _getSensitiveHolders !== 'function') return false;
+  return rmAvailable();
+}
+
+/**
+ * The Restart Manager probe's verdict (`restart-manager._rmAvailable`): optimistic
+ * until the probe fails, so the first ticks may run under RM and a later verdict
+ * switches the read mechanism to the pool — the one switch reachable in production.
+ * @returns {boolean}
+ */
+function rmAvailable() {
+  if (typeof _isRmAvailableOverride === 'boolean') return _isRmAvailableOverride;
+  if (typeof _isRmAvailable === 'function') return _isRmAvailable();
+  return true;
+}
+
+/**
+ * Which read leaf is NOT observing for this process, or null when none is idle.
+ *
+ * `fs-handle` idles whenever the RM path owns the full scan. `fs-rm` idles only when
+ * neither RM entry is usable AND the pool can actually read — a blind win32 (no
+ * handle binary, no RM) has no owner, and B-S04 marks both leaves DEGRADED as before.
+ * In production the two RM entries share one availability flag, so "hot without
+ * full" occurs only in the bench harness, which scripts the hot source beside the
+ * pool; there the RM leaf is live through the hot cycle and no leaf is idle.
+ * @returns {string|null}
+ */
+function inactiveReadLeaf() {
+  if (rmEnabled()) return FS_SENSOR.HANDLE;
+  if (!isHotReadScanActive() && handleCapabilityOk()) return FS_SENSOR.RM;
+  return null;
+}
+
+/**
+ * Settle read-mechanism ownership: the idle leaf is UNSUPPORTED (out of the worst-of,
+ * `detail` naming the owner), decided at the first observation entry and re-decided
+ * only when the mechanism changes — never rewritten tick by tick. A leaf that returns
+ * to service starts a fresh STARTING lifetime (`createSensorHealth`, the only way out
+ * of UNSUPPORTED), exactly as `_setDepsForTest` re-creates the RM leaf.
+ *
+ * Without this a leaf no code path writes on this platform stays STARTING for the
+ * whole process, and `deriveAppHealth` reads SENSORS_STARTING forever.
+ * @param {number} now
+ * @returns {void}
+ * @since 0.14.0
+ */
+function resolveReadMechanism(now) {
+  const next = inactiveReadLeaf();
+  if (next === _inactiveReadLeaf) return;
+  if (_inactiveReadLeaf !== null) {
+    _fsHealth[_inactiveReadLeaf] = sensorHealth.createSensorHealth(_inactiveReadLeaf);
+    _inactiveReadLeaf = null;
+  }
+  if (next !== null && _fsHealth[next].state !== sensorHealth.SENSOR_HEALTH_STATE.UNSUPPORTED) {
+    _fsHealth[next] = sensorHealth.markUnsupported(_fsHealth[next], now, {
+      detail: next === FS_SENSOR.HANDLE ? READ_OWNER_REASON.RM : READ_OWNER_REASON.POOL,
+    });
+    _inactiveReadLeaf = next;
+  }
+}
+
+/**
+ * Restart Manager scan path (win32 primary): ONE powershell spawn returns every
+ * process holding a handle to a registered sensitive directory group. Each holder
+ * PID and creation FILETIME are matched to its current agent (C-01); AEGIS's own
+ * PID and non-agent holders are dropped. Emits an
+ * `action:'holding'` event — a point-in-time handle HOLD at the scan tick, NOT a
+ * read/access. Dedups per-instance by group via knownHandles so a sustained hold
+ * fires once, not once-per-scan.
+ *
+ * Used by BOTH the full (30s) and the hot (~10s) cycles via `fetchHolders`; both
+ * share `_state.knownHandles`, so a hold caught by one cycle is deduped against
+ * the other (cross-cycle dedup). A single-flight guard keeps the two cycles from
+ * spawning two powershells at once (cost only — the shared dedup already prevents
+ * any double-emit since JS is single-threaded).
+ * @param {Array} agents
+ * @param {Function} [fetchHolders] - Holder source (full or hot); defaults to full.
+ * @param {boolean} [fullScope] - Whether the source covers every RM group.
+ * @returns {Promise<Array>}
+ * @since v0.10.0
+ */
+async function scanViaRestartManager(
+  agents,
+  fetchHolders = _getSensitiveHolders,
+  fullScope = true,
+) {
+  // G′ invariant, not a scheduling decision: _scanRmHolders matches the holder's
+  // PID and exact birth to an agent before stamping RM_HOLDER_PID as confirmed.
+  // That stamp must be impossible against a population the process sensor cannot
+  // vouch for, whoever called us. scan-loop refuses earlier and logs the skip; this
+  // guard is what makes the invariant hold rather than the schedule.
+  if (!populationReliable()) {
+    noteFileScanSkip(SCOPE_UNAVAILABLE_REASON);
+    return [];
+  }
+  // B-S09: legitimate single-flight skip — not FAILED, not a success tick.
+  if (_rmScanInFlight) return [];
+  _rmScanInFlight = true;
+  try {
+    const result = await _scanRmHolders(agents, fetchHolders, fullScope);
+    let { degradedReason } = result;
+    if (fullScope) {
+      if (degradedReason?.includes(RM_HOLDER_CAP_REASON)) _rmFullCapExceeded = true;
+      else if (!degradedReason) _rmFullCapExceeded = false;
+    }
+    if (_rmFullCapExceeded && !degradedReason?.includes(RM_HOLDER_CAP_REASON)) {
+      degradedReason = degradedReason
+        ? `${degradedReason};${RM_HOLDER_CAP_REASON}`
+        : RM_HOLDER_CAP_REASON;
+    }
+    const completedAt = Date.now();
+    // One irrecoverable-loss unit per completed poll that actually omitted at
+    // least one holder. This is a lower bound, not a lifetime-unique path count;
+    // the inherited full-scope latch on a narrow hot poll adds no new loss.
+    const rec = result.capExceeded
+      ? sensorHealth.addLoss(_fsHealth[FS_SENSOR.RM], 1, completedAt, {
+          detail: RM_HOLDER_CAP_REASON,
+        })
+      : _fsHealth[FS_SENSOR.RM];
+    _fsHealth[FS_SENSOR.RM] = degradedReason
+      ? sensorHealth.markDegraded(rec, completedAt, {
+          error: degradedReason,
+          detail: degradedReason,
+        })
+      : sensorHealth.markHealthy(rec, completedAt, {
+          detail: rec.lossCount > 0 ? 'residual-loss' : null,
+        });
+    return result.events;
+  } catch {
+    _fsHealth[FS_SENSOR.RM] = sensorHealth.markFailed(_fsHealth[FS_SENSOR.RM], Date.now(), {
+      error: 'rm-fetch-failed',
+      detail: 'rm-fetch-failed',
+    });
+    // Compatibility empty array — health carries FAILED (B-S05 / B-S03 class).
+    return [];
+  } finally {
+    _rmScanInFlight = false;
+  }
+}
+
+/**
+ * Core RM holder→agent mapping + holding-event emission (C-01: current PID and exact
+ * process creation time must both match). Split out so scanViaRestartManager can wrap
+ * it with the single-flight guard.
+ * @param {Array} agents
+ * @param {Function} fetchHolders - Holder source (full or hot).
+ * @param {boolean} fullScope - Whether absent holders prove a previous group closed.
+ * @returns {Promise<{events: Array, degradedReason: string|null, capExceeded?: boolean}>}
+ */
+async function _scanRmHolders(agents, fetchHolders, fullScope) {
+  // Let fetch failures propagate so scanViaRestartManager can mark FAILED.
+  const holders = await fetchHolders();
+  // The process population may have failed or changed while RM was collecting.
+  // Recheck after the await and resolve owners against the current list.
+  if (!populationReliable()) return { events: [], degradedReason: SCOPE_UNAVAILABLE_REASON };
+  if (!Array.isArray(holders)) throw new Error('Invalid RM holder observation');
+  const currentAgents = _state.getLatestAgents();
+  if (!Array.isArray(currentAgents))
+    return { events: [], degradedReason: SCOPE_UNAVAILABLE_REASON };
+  const toScan =
+    _state && _state.isOtherPanelExpanded()
+      ? currentAgents
+      : currentAgents.filter((a) => a.category === 'ai');
+  const pidToAgent = new Map();
+  for (const a of toScan) pidToAgent.set(a.pid, a);
+  const initiallyTrackedPids = new Set(agents.map((a) => a.pid));
+  const kh = _state.knownHandles;
+  const newAccess = [];
+  let identityUnverified = false;
+  const matched = [];
+  for (const h of holders) {
+    if (h.pid === process.pid) continue; // own-PID guard — never blame AEGIS itself
+    const agent = pidToAgent.get(h.pid);
+    if (!agent) {
+      if (initiallyTrackedPids.has(h.pid)) identityUnverified = true;
+      continue; // holder is not a tracked (in-scope) agent — drop
+    }
+    // PID and millisecond instanceId alone cannot prove the RM holder belongs to
+    // this generation. The two fresh FILETIME strings must agree exactly.
+    if (
+      typeof h.createTime100ns !== 'string' ||
+      typeof agent.createTime100ns !== 'string' ||
+      h.createTime100ns !== agent.createTime100ns
+    ) {
+      identityUnverified = true;
+      continue;
+    }
+    matched.push({ h, agent, key: rmHolderKey(agent), dedupKey: 'holding|' + h.group });
+  }
+
+  // A full RM scan covers every registered group; its absent holders may free
+  // slots. The hot scan covers only a subset, so preserve other known groups
+  // until a full scan proves they closed. Both paths reserve still-held known
+  // groups before admitting new ones, avoiding order-dependent false activity.
+  const previousByKey = new Map();
+  const nextByKey = new Map();
+  let capExceeded = false;
+  function prepareKnown(key) {
+    if (!key || nextByKey.has(key)) return;
+    const previous = kh.get(key) || new Set();
+    const next = new Set();
+    previousByKey.set(key, previous);
+    nextByKey.set(key, next);
+    if (!fullScope) {
+      for (const group of previous) {
+        if (next.size < MAX_KNOWN_HANDLES_PER_INSTANCE) next.add(group);
+        else capExceeded = true;
+      }
+    }
+  }
+  if (fullScope) {
+    for (const agent of toScan) {
+      const key = rmHolderKey(agent);
+      if (key && kh.has(key)) prepareKnown(key);
+    }
+  }
+  for (const { key } of matched) prepareKnown(key);
+  if (fullScope) {
+    for (const { key, dedupKey } of matched) {
+      if (!key || !previousByKey.get(key).has(dedupKey)) continue;
+      const next = nextByKey.get(key);
+      if (next.has(dedupKey)) continue;
+      if (next.size < MAX_KNOWN_HANDLES_PER_INSTANCE) next.add(dedupKey);
+      else capExceeded = true;
+    }
+  }
+  for (const [key, next] of nextByKey) kh.set(key, next);
+
+  for (const { h, agent, key, dedupKey } of matched) {
+    if (key) {
+      const previous = previousByKey.get(key);
+      const next = nextByKey.get(key);
+      if (previous.has(dedupKey) || next.has(dedupKey)) continue;
+      // Beyond the cap new holders, including sensitive ones, are missed until
+      // a full scan frees a slot; report this with path-free sensor health.
+      if (next.size >= MAX_KNOWN_HANDLES_PER_INSTANCE) {
+        capExceeded = true;
+        continue;
+      }
+      next.add(dedupKey);
+    }
+    const group = h.group;
+    // Rule/self-config patterns anchor on a separator AFTER the dir name (e.g.
+    // `\.claude[\\/]`), but a group is a bare DIR path with no trailing separator.
+    // Match against a separator-normalized variant so dir groups resolve, while
+    // keeping event.file the clean dir. Single-file (env) groups still match
+    // as-is via the basename-anchored ($) patterns.
+    const groupSep = group.endsWith('/') || group.endsWith('\\') ? group : group + '/';
+    const reason = h.reason || classifySensitive(groupSep) || classifySensitive(group) || '';
+    const selfAccess =
+      reason !== '' && (isSelfAccess(agent.agent, groupSep) || isSelfAccess(agent.agent, group));
+    // Confirmed: the agent and holder share PID and exact process creation time.
+    const evidence = [EVIDENCE.RM_HOLDER_PID];
+    if (selfAccess) evidence.push(EVIDENCE.SELF_CONFIG_PATH);
+    const event = {
+      eventId: randomUUID(),
+      agent: agent.agent,
+      pid: h.pid,
+      // From the current agent that matched this holder's PID and exact birth.
+      instanceId: readInstanceId(agent),
+      createTime100ns: h.createTime100ns,
+      parentEditor: agent.parentEditor || null,
+      cwd: agent.cwd || null,
+      file: group,
+      sensitive: reason !== '' && !selfAccess,
+      selfAccess,
+      reason,
+      action: 'holding',
+      timestamp: Date.now(),
+      category: agent.category || 'other',
+      attribution: makeAttribution(evidence),
+    };
+    newAccess.push(event);
+    _state.activityLog.push(event);
+    if (_state.onActivityPush) _state.onActivityPush(event);
+    if (_state.activityLog.length > 10000) {
+      const evicted = _state.activityLog.shift();
+      if (_state.onActivityEvict) _state.onActivityEvict(evicted);
+    }
+    _state.recordFileAccess(event.instanceId, agent.agent, group, event.sensitive, event.reason);
+  }
+  return {
+    events: newAccess,
+    capExceeded,
+    degradedReason:
+      [identityUnverified && 'rm-holder-identity-unverified', capExceeded && RM_HOLDER_CAP_REASON]
+        .filter(Boolean)
+        .join(';') || null,
+  };
+}
+
+/**
+ * Whether the fast hot read-detect cycle is usable: the platform exposes
+ * getHotSensitiveHolders (win32 only) AND, if it reports availability, RM is up.
+ * scan-loop checks this to avoid creating the hot timer on darwin/linux (no RM).
+ * @returns {boolean}
+ */
+function isHotReadScanActive() {
+  if (typeof _getHotSensitiveHolders !== 'function') return false;
+  return rmAvailable();
+}
+
+/**
+ * Fast hot read-detect scan (win32 only): the same RM holder→agent path as the
+ * full scan but sourced from getHotSensitiveHolders (HOT_DIRS + ~/.env* only),
+ * driven at ~10s to shrink the 30s read-blind window on the crown-jewel secret
+ * dirs. Shares _state.knownHandles with the full scan → cross-cycle dedup (a hold
+ * caught here will NOT re-fire from the 30s scan, and vice versa). Emits
+ * `action:'holding'` — a HOLD at the tick, NEVER a transient open→read→close.
+ * @param {Array} agents
+ * @returns {Promise<Array>}
+ * @since v0.11.0-alpha
+ */
+async function scanHotFileHolders(agents) {
+  if (!isHotReadScanActive()) return [];
+  resolveReadMechanism(Date.now());
+  return scanViaRestartManager(agents, _getHotSensitiveHolders, false);
+}
+
+/**
+ * B-S04: the pool cannot read (no handle binary) and no RM entry stands in for it, so
+ * neither an empty result nor an empty scope is a clean observation. DEGRADED on the
+ * handle leaf, and on the RM leaf too where it is an expected sensor rather than
+ * platform-UNSUPPORTED. Shared by the scan and the confirmed-zero skip, so a blind
+ * machine reads the same whether or not an agent is running.
+ * @param {number} now
+ * @returns {void}
+ */
+function markPoolBlind(now) {
+  _fsHealth[FS_SENSOR.HANDLE] = sensorHealth.markDegraded(_fsHealth[FS_SENSOR.HANDLE], now, {
+    error: 'read-detection-unavailable',
+    detail: 'no-handle-binary-and-no-rm',
+  });
+  // Only degrade RM when it is an expected sensor (not platform-UNSUPPORTED).
+  if (
+    _fsHealth[FS_SENSOR.RM].state !== sensorHealth.SENSOR_HEALTH_STATE.UNSUPPORTED &&
+    !rmEnabled()
+  ) {
+    _fsHealth[FS_SENSOR.RM] = sensorHealth.markDegraded(_fsHealth[FS_SENSOR.RM], now, {
+      error: 'rm-unavailable',
+      detail: 'read-detection-unavailable',
+    });
+  }
+}
+
+/**
+ * @param {Array} agents
+ * @param {{isAgentScopeCurrent?: Function, isScopeCurrent?: Function}} [options]
+ * @returns {Promise<Array>}
+ * @since v0.1.0
+ */
+async function scanAllFileHandles(agents, options = {}) {
+  const now = Date.now();
+  // Ownership first, so the leaf a refusal below marks and the leaf left idle agree.
+  resolveReadMechanism(now);
+  // G′ invariant: the handle pool stamps HANDLE_SCAN_PID — `confirmed`, same strength
+  // as the RM holder pid — so it is gated by the same rule and for the same reason.
+  // Placed ahead of the RM delegation so both mechanisms are covered from one site.
+  if (!populationReliable()) {
+    noteFileScanSkip(SCOPE_UNAVAILABLE_REASON);
+    return [];
+  }
+  // win32 primary: honest read-detect via Restart Manager (no handle.exe needed).
+  // Falls through to the legacy per-PID handle pool on darwin/linux, or on win32
+  // when RM is unavailable (the PR-A getFileHandles→[] fallback still applies).
+  if (rmEnabled()) {
+    // RM path owns observation this tick; the handle leaf is UNSUPPORTED
+    // (rm-owns-observation) by resolveReadMechanism, not sampled and not STARTING.
+    return scanViaRestartManager(agents);
+  }
+
+  // B-S04: capability blind — empty results are not HEALTHY clean observation.
+  if (!handleCapabilityOk()) {
+    markPoolBlind(now);
+    return [];
+  }
+
+  const toScan =
+    _state && _state.isOtherPanelExpanded() ? agents : agents.filter((a) => a.category === 'ai');
+  if (toScan.length === 0) {
+    if (typeof options.isScopeCurrent === 'function') {
+      let current = false;
+      try {
+        current = options.isScopeCurrent() === true;
+      } catch {
+        // A failed population check cannot validate an observed zero.
+      }
+      if (!current) {
+        noteFileScanSkip(SCOPE_CHANGED_REASON);
+        return [];
+      }
+    }
+    // Nothing in the pool's scope to probe: the population gate above vouched for the
+    // list, so this is an observed zero, not a skipped tick (scan-loop's own empty-fleet
+    // return records the same verdict one level up).
+    noteFileScanSkip(CONFIRMED_ZERO_REASON);
+    return [];
+  }
+  // Bounded-concurrency worker pool: at most FILE_SCAN_CONCURRENCY scanFileHandles()
+  // run at once (each spawns one powershell/handle.exe). Results are stored by
+  // original index, so the returned array stays in agent order — per-event agent
+  // attribution (C-01) is stamped inside scanFileHandles and never cross-wired.
+  /** @type {Array<{ok: boolean, events: Array, error?: string, capExceeded?: boolean}>} */
+  const results = new Array(toScan.length);
+  let next = 0;
+  async function worker() {
+    while (next < toScan.length) {
+      const i = next++;
+      try {
+        results[i] = await scanFileHandles(toScan[i], options.isAgentScopeCurrent);
+      } catch {
+        // Unexpected throw outside scanFileHandles control — count as agent failure.
+        results[i] = { ok: false, events: [], error: 'handle-scan-failed' };
+      }
+    }
+  }
+  const poolSize = Math.min(FILE_SCAN_CONCURRENCY, toScan.length);
+  await Promise.all(Array.from({ length: poolSize }, worker));
+  const allNew = [];
+  let failCount = 0;
+  let scopeChanged = false;
+  let capExceeded = false;
+  for (const r of results) {
+    if (!r) continue;
+    if (!r.ok) {
+      failCount += 1;
+      if (r.error === SCOPE_CHANGED_REASON) scopeChanged = true;
+    }
+    if (r.capExceeded) capExceeded = true;
+    allNew.push(...(r.events || []));
+  }
+  const t = Date.now();
+  // Cap loss is counted per completed poll, even when several agents overflow.
+  // Repeated overflow polls are separate omitted observations, while the count
+  // stays a lower bound on unknown distinct accesses.
+  const rec = capExceeded
+    ? sensorHealth.addLoss(_fsHealth[FS_SENSOR.HANDLE], 1, t, {
+        detail: HANDLE_PATH_CAP_REASON,
+      })
+    : _fsHealth[FS_SENSOR.HANDLE];
+  if (scopeChanged) {
+    _fsHealth[FS_SENSOR.HANDLE] = sensorHealth.markDegraded(rec, t, {
+      error: SCOPE_CHANGED_REASON,
+      detail: SCOPE_CHANGED_REASON,
+    });
+  } else if (failCount === toScan.length) {
+    _fsHealth[FS_SENSOR.HANDLE] = sensorHealth.markFailed(rec, t, {
+      error: 'handle-scan-failed',
+      detail: 'all-agents-failed',
+    });
+  } else if (failCount > 0) {
+    // Partial: keep successful events; health is DEGRADED (B2).
+    _fsHealth[FS_SENSOR.HANDLE] = sensorHealth.markDegraded(rec, t, {
+      error: 'partial-handle-scan',
+      detail: `failed-${failCount}-of-${toScan.length}${capExceeded ? `;${HANDLE_PATH_CAP_REASON}` : ''}`,
+    });
+  } else if (capExceeded) {
+    _fsHealth[FS_SENSOR.HANDLE] = sensorHealth.markDegraded(rec, t, {
+      error: HANDLE_PATH_CAP_REASON,
+      detail: HANDLE_PATH_CAP_REASON,
+    });
+  } else {
+    _fsHealth[FS_SENSOR.HANDLE] = sensorHealth.markHealthy(rec, t, {
+      detail: rec.lossCount > 0 ? 'residual-loss' : null,
+    });
+  }
+  return allNew;
+}
+
+/**
+ * Drop knownHandles entries whose process INSTANCE is gone. Keyed by instanceId,
+ * so a recycled pid counts as gone: the dead instance's entry is removed even
+ * while a NEW process occupies the same pid — that new instance starts with a
+ * clean seen-set and its first sensitive access fires.
+ * @param {Array} activeAgents
+ * @param {{preservePids?: Set<number>, previousAgents?: Array}} [options] PIDs missing a birth witness and the preceding published population.
+ * @returns {void} @since v0.1.0
+ */
+function pruneKnownHandles(activeAgents, options = {}) {
+  // The instanceId stores milliseconds. Only two independently stamped, precise
+  // observations can prove a new generation when that key collides. These maps
+  // live for this prune call only; neither a missing witness nor a cached key is
+  // allowed to manufacture a birth observation.
+  const uniqueByKey = (agents) => {
+    const byKey = new Map();
+    for (const agent of Array.isArray(agents) ? agents : []) {
+      const key = handleKey(agent);
+      if (!key) continue;
+      byKey.set(key, byKey.has(key) ? null : agent);
+    }
+    return byKey;
+  };
+  const previousByKey = uniqueByKey(options.previousAgents);
+  const currentByKey = uniqueByKey(activeAgents);
+  for (const [key, current] of currentByKey) {
+    const previous = previousByKey.get(key);
+    if (
+      !previous ||
+      !current ||
+      !Number.isInteger(current.pid) ||
+      current.pid <= 0 ||
+      previous.pid !== current.pid ||
+      options.preservePids?.has(current.pid)
+    )
+      continue;
+    const source = previous.generationWitnessSource;
+    const comparableWitnesses =
+      source === current.generationWitnessSource &&
+      (source === 'sequence' || source === 'createTime100ns') &&
+      typeof previous.generationWitness === 'string' &&
+      previous.generationWitness.length > 0 &&
+      typeof current.generationWitness === 'string' &&
+      current.generationWitness.length > 0;
+    const changedWitness =
+      comparableWitnesses && previous.generationWitness !== current.generationWitness;
+    const changedRawBirth =
+      typeof previous.createTime100ns === 'string' &&
+      typeof current.createTime100ns === 'string' &&
+      /^[1-9]\d{0,19}$/.test(previous.createTime100ns) &&
+      /^[1-9]\d{0,19}$/.test(current.createTime100ns) &&
+      previous.createTime100ns !== current.createTime100ns;
+    if (changedWitness || changedRawBirth) _state.knownHandles.delete(key);
+  }
+  const activeKeys = new Set();
+  const birthPrecisionUnavailable = new Set();
+  for (const a of activeAgents) {
+    const k = handleKey(a);
+    if (!k) continue;
+    activeKeys.add(k);
+    const rmKey = rmHolderKey(a);
+    if (rmKey) activeKeys.add(rmKey);
+    else birthPrecisionUnavailable.add(k);
+  }
+  for (const key of _state.knownHandles.keys()) {
+    if (activeKeys.has(key)) continue;
+    // A CIM fallback can still prove the millisecond instance while losing raw
+    // FILETIME. Keep its exact-key history until a later pass can compare births.
+    const precisionSeparator = key.indexOf('|');
+    if (precisionSeparator > 0 && birthPrecisionUnavailable.has(key.slice(0, precisionSeparator)))
+      continue;
+    // An unknown generation cannot prove the old instance of this PID stopped
+    // holding a file. Preserve only that PID; prune unrelated stale generations.
+    const separator = key.indexOf(':');
+    const pid = separator > 0 ? Number(key.slice(0, separator)) : null;
+    if (options.preservePids?.has(pid)) continue;
+    _state.knownHandles.delete(key);
+  }
+}
+
+/**
+ * One chokidar watcher over ONE rule directory, no recursion, `_`-prefixed entries ignored
+ * (function-form `ignored`, not a glob — chokidar issue #773). Shared by the two rule
+ * watchers below so they cannot drift apart on their options.
+ * @param {string} dir
+ * @returns {import('chokidar').FSWatcher|null} null for rules embedded in ASAR.
+ */
+function _watchRuleDir(dir) {
+  // Embedded rules are loaded normally; hot reload applies to unpacked app trees.
+  if (path.extname(_appDir) === '.asar') return null;
+  return chokidar.watch(dir, {
+    ignored: (filePath) => path.basename(filePath).startsWith('_'),
+    persistent: false,
+    ignoreInitial: true,
+    followSymlinks: false,
+    depth: 0,
+  });
+}
+
+/**
+ * @param {string} basename
+ * @returns {boolean} whether the changed entry is a rule file at all.
+ */
+function _isRuleFile(basename) {
+  return basename.endsWith('.yaml') || basename.endsWith('.yml');
+}
+
+/**
+ * Watch the rules/ directory for YAML additions, changes and removals and hot-reload the FLAT rules. `depth: 0`, so
+ * `rules/sequences/` is not this watcher's — {@link setupSequenceRulesWatcher} owns it — and
+ * an edit here never resets the sequence engine (docs/roadmap/sequence-rules.md §5
+ * "Hot-reload"). The push carries both figures: `count` from the reloaded flat set and
+ * `sequenceCount` read off `deps.sequenceCount` at the time of the change, so the renderer
+ * is never handed a flat count with no sequence figure beside it.
+ * @param {(channel: string, data: object) => void} sendFn - Function to push events to renderer
+ * @param {{sequenceCount: () => number, isActive?: () => boolean}} deps - `sequenceCount` answers how many sequence
+ *   rules the engine currently holds (main.js owns that figure).
+ * @returns {import('chokidar').FSWatcher|null} null for rules embedded in ASAR.
+ * @since v0.6.0
+ */
+function setupRulesWatcher(sendFn, { sequenceCount, isActive = () => true }) {
+  const rulesDir = path.join(_appDir, 'rules');
+  const rw = _watchRuleDir(rulesDir);
+  if (!rw) return null;
+  const onRuleMutation = (filePath) => {
+    if (!isActive()) return;
+    const basename = path.basename(filePath);
+    if (!_isRuleFile(basename)) return;
+    reloadRules();
+    sendFn('rules:reloaded', {
+      count: getAllRules().size,
+      sequenceCount: sequenceCount(),
+    });
+  };
+  for (const event of ['add', 'change', 'unlink']) rw.on(event, onRuleMutation);
+  return rw;
+}
+
+/**
+ * Watch rules/sequences/ for YAML additions, changes and removals and hot-reload the SEQUENCE rules — the second
+ * watcher of docs/roadmap/sequence-rules.md §5 "Hot-reload", same options as
+ * {@link setupRulesWatcher}. Only this one calls `deps.reload`, which main.js supplies as:
+ * load the directory again, reset the engine, re-init it with the new rules. The flat rules
+ * are NOT reloaded from here. The `rules:reloaded` push carries only the two
+ * counts; the renderer does not need the changed rule file name.
+ * @param {(channel: string, data: object) => void} sendFn - Function to push events to renderer
+ * @param {{reload: () => number, isActive?: () => boolean}} deps - `reload` re-reads the sequence rules into the engine
+ *   and returns how many are loaded now.
+ * @returns {import('chokidar').FSWatcher|null} null for rules embedded in ASAR.
+ * @since v0.14.0
+ */
+function setupSequenceRulesWatcher(sendFn, { reload, isActive = () => true }) {
+  const sequencesDir = path.join(_appDir, 'rules', 'sequences');
+  const rw = _watchRuleDir(sequencesDir);
+  if (!rw) return null;
+  const onRuleMutation = (filePath) => {
+    if (!isActive()) return;
+    const basename = path.basename(filePath);
+    if (!_isRuleFile(basename)) return;
+    const sequenceCount = reload();
+    sendFn('rules:reloaded', { count: getAllRules().size, sequenceCount });
+  };
+  for (const event of ['add', 'change', 'unlink']) rw.on(event, onRuleMutation);
+  return rw;
+}
+
+module.exports = {
+  closeFileWatchers,
+  init,
+  setupFileWatchers,
+  setupRulesWatcher,
+  setupSequenceRulesWatcher,
+  scanAllFileHandles,
+  scanHotFileHolders,
+  isHotReadScanActive,
+  pruneKnownHandles,
+  classifySensitive,
+  shouldIgnore,
+  isSelfAccess,
+  handleWatcherEvent,
+  getIgnoredDirFilter,
+  getFileSensorHealth,
+  getWatchPlan,
+  noteFileScanSkip,
+  FS_SENSOR,
+  WATCH_GROUP,
+  WATCH_ROOT_STATE,
+  DEFAULT_IGNORED_DIRS,
+  FILE_SCAN_CONCURRENCY,
+  _setDepsForTest,
+  _resetForTest,
+  _resetFsHealth,
+};

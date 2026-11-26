@@ -1,0 +1,201 @@
+/**
+ * @file audit-hashchain.js
+ * @module main/audit-hashchain
+ * @description Tamper-evident (hash-chained) audit-log helpers. Each daily audit
+ *   file is an INDEPENDENT SHA-256 hash chain: every record's hash binds the
+ *   canonical form of the event to the previous record's hash, starting from a
+ *   fixed GENESIS constant. Verification recomputes the chain in place — there is
+ *   no stored prevHash field; linkage is proven by re-derivation.
+ *
+ *   Scope: the chain lives WITHIN a single daily file. A new day starts a fresh
+ *   chain (seq 0, prevHash = GENESIS), so retention deletion of old day-files
+ *   never invalidates a surviving file.
+ * @requires crypto
+ * @requires fs
+ * @author AEGIS Contributors
+ * @license MIT
+ * @version 0.1.0
+ */
+
+'use strict';
+
+const crypto = require('crypto');
+const fs = require('fs');
+
+/** Fixed seed for the first record of every daily file. */
+const GENESIS = 'AEGIS-AUDIT-GENESIS-v1';
+const TAIL_CHUNK_BYTES = 64 * 1024;
+const MAX_RECORD_BYTES = 1024 * 1024;
+const MAX_TAIL_BYTES = MAX_RECORD_BYTES + TAIL_CHUNK_BYTES;
+
+/** Read only the last nonempty line, with a bounded reverse-read budget.
+ * @param {string} filePath Daily journal path.
+ * @returns {string|null} Last line, or no line for an absent/empty file.
+ * @since 0.18.0
+ */
+function readTailLine(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw Error('audit-tail-unavailable');
+    let position = stat.size;
+    let tail = Buffer.alloc(0);
+    while (position > 0 && tail.length < MAX_TAIL_BYTES) {
+      const length = Math.min(TAIL_CHUNK_BYTES, position, MAX_TAIL_BYTES - tail.length);
+      position -= length;
+      const chunk = Buffer.allocUnsafe(length);
+      if (fs.readSync(fd, chunk, 0, length, position) !== length)
+        throw Error('audit-tail-unavailable');
+      // A complete JSON object without its final delimiter is still a torn
+      // append. Appending another object would join two records on one line.
+      if (tail.length === 0 && chunk[length - 1] !== 0x0a) throw Error('audit-tail-unavailable');
+      tail = Buffer.concat([chunk, tail]);
+      const text = tail.toString('utf8').trimEnd();
+      const boundary = text.lastIndexOf('\n');
+      if (boundary >= 0) return text.slice(boundary + 1).trim();
+      if (position === 0) return text.trim();
+    }
+    if (position === 0) return null;
+    throw Error('audit-tail-unavailable');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Deterministic, insertion-order-independent serialization of a JSON value.
+ * Object keys are sorted recursively so the output depends only on content,
+ * never on key insertion order.
+ * @param {*} value - Any JSON-serializable value.
+ * @returns {string} Canonical string form.
+ * @since v0.1.0
+ */
+function canonical(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
+  const keys = Object.keys(value).sort();
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + canonical(value[k])).join(',') + '}';
+}
+
+/**
+ * Compute a record's chain hash: sha256(prevHash + canonical(event)).
+ *
+ * The event is normalized through a JSON round-trip BEFORE hashing so the hashed
+ * form is byte-identical to what JSON.stringify writes to disk: JSON drops
+ * undefined-valued object keys and maps undefined array elements to null. Without
+ * this, a clean record carrying an undefined-valued detail would hash differently
+ * at write vs verify time and produce a FALSE tamper verdict.
+ * @param {string} prevHash - Previous record's hash, or GENESIS for the first record.
+ * @param {Object} event - The audit event WITHOUT its seq/hash fields.
+ * @returns {string} Hex-encoded SHA-256 hash.
+ * @since v0.1.0
+ */
+function computeHash(prevHash, event) {
+  const normalized = JSON.parse(JSON.stringify(event));
+  return crypto
+    .createHash('sha256')
+    .update(prevHash + canonical(normalized))
+    .digest('hex');
+}
+
+/**
+ * Verify the hash chain of a single daily audit file.
+ *
+ * Detects in-place edits, insertions, and deletions of interior lines; does NOT
+ * detect truncation of trailing lines (valid prefix remains a valid chain).
+ *
+ * The verdict is asymmetric in BOTH directions, and neither direction is about intent:
+ *
+ * A `valid: true` verdict proves no surviving record was ALTERED. It does NOT prove the
+ * file is COMPLETE. An entry evicted from the write buffer under a full disk was never
+ * assigned a seq, so its absence leaves no gap and the remaining records still chain
+ * perfectly. Records of type `buffer-overflow-drop` (see audit-drop-tracker.js) document
+ * the loss windows that are known; loss during a session that never recovered leaves no
+ * record at all.
+ *
+ * A `valid: false` verdict does NOT prove tampering. A write interrupted partway — the
+ * disk filling mid-append, or the process dying during one — leaves a truncated line and,
+ * once the retry re-appends the batch, a repeated seq range. Both produce exactly the
+ * signal an edit would. Treat an invalid verdict as "this file is not trustworthy",
+ * never as "someone changed this file". The exposure scales with batch size, so it is
+ * largest precisely when flushes have been failing and the buffer has filled.
+ * @param {string} filePath - Path to an aegis-audit-YYYY-MM-DD.json file.
+ * @returns {{valid: boolean, brokenAtSeq: number|null, reason: string}}
+ *   On failure, brokenAtSeq is the 0-based line position where the chain breaks.
+ * @since v0.1.0
+ */
+function verifyChain(filePath) {
+  let content;
+  try {
+    content = fs.readFileSync(filePath, 'utf-8');
+  } catch (err) {
+    return { valid: false, brokenAtSeq: null, reason: `read-failed: ${err.message}` };
+  }
+  const lines = content.split('\n').filter((l) => l.trim().length > 0);
+  let prevHash = GENESIS;
+  for (let i = 0; i < lines.length; i++) {
+    let entry;
+    try {
+      entry = JSON.parse(lines[i]);
+    } catch (_) {
+      return { valid: false, brokenAtSeq: i, reason: `malformed JSON at line ${i}` };
+    }
+    if (entry.seq !== i) {
+      return {
+        valid: false,
+        brokenAtSeq: i,
+        reason: `seq discontinuity at line ${i}: got ${entry.seq}`,
+      };
+    }
+    const event = { ...entry };
+    delete event.seq;
+    delete event.hash;
+    if (computeHash(prevHash, event) !== entry.hash) {
+      return { valid: false, brokenAtSeq: i, reason: `hash mismatch at seq ${i}` };
+    }
+    prevHash = entry.hash;
+  }
+  return { valid: true, brokenAtSeq: null, reason: 'ok' };
+}
+
+/**
+ * Read the tail of a daily file to resume its chain after a process restart or a
+ * day rollover. Returns the seed for the NEXT record to append.
+ * @param {string} filePath - Path to today's audit file (may not exist yet).
+ * @returns {{prevHash: string, seq: number}} GENESIS/0 if the file is absent,
+ *   empty, or its last line predates hash-chaining.
+ * @throws {Error} Fixed, path-free code for an unreadable, oversized or invalid tail.
+ * @since v0.1.0
+ */
+function seedFromTail(filePath) {
+  try {
+    const line = readTailLine(filePath);
+    if (!line) return { prevHash: GENESIS, seq: 0 };
+    if (Buffer.byteLength(line, 'utf8') > MAX_RECORD_BYTES) throw Error();
+    const last = JSON.parse(line);
+    if (!last || typeof last !== 'object' || Array.isArray(last)) throw Error();
+    if (!Object.hasOwn(last, 'hash') && !Object.hasOwn(last, 'seq'))
+      return { prevHash: GENESIS, seq: 0 };
+    if (
+      typeof last.hash !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(last.hash) ||
+      !Number.isSafeInteger(last.seq) ||
+      last.seq < 0 ||
+      last.seq >= Number.MAX_SAFE_INTEGER
+    )
+      throw Error();
+    return { prevHash: last.hash, seq: last.seq + 1 };
+  } catch (_) {
+    // Filesystem and JSON parser causes can expose private paths or journal data.
+    // eslint-disable-next-line preserve-caught-error
+    throw Error('audit-tail-unavailable');
+  }
+}
+
+module.exports = { GENESIS, canonical, computeHash, verifyChain, seedFromTail };

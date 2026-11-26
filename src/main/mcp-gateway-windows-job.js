@@ -1,0 +1,282 @@
+'use strict';
+const { spawn, spawnSync } = require('node:child_process');
+const { EventEmitter } = require('node:events');
+const { existsSync } = require('node:fs');
+const path = require('node:path');
+const { PassThrough } = require('node:stream');
+
+const HELPER = 'aegis-mcpjob.exe';
+const STARTUP_MS = 1800;
+const ISOLATION_STARTUP_MS = 10000;
+const MAX_LAUNCH_BYTES = 131072;
+let testDeps = null;
+
+/** Find the shipped helper in the packaged or source checkout.
+ * @param {object} [runtime] Process state, injectable for path tests.
+ * @returns {string} Absolute helper path. @since v0.16.0 */
+function helperPath(runtime = process) {
+  return runtime.resourcesPath && !runtime.defaultApp
+    ? path.join(runtime.resourcesPath, 'sidecar', HELPER)
+    : path.resolve(__dirname, '..', '..', 'build', 'sidecar', HELPER);
+}
+
+function actionStatus(bytes, isolated, imported) {
+  const format = isolated
+    ? new RegExp(
+        `^${imported ? 'I' : 'S'},(C|U),([01]),(-|-?(?:0|[1-9]\\d{0,9})),(\\d{1,5}),(\\d{1,5}),([01]),([01]),([01]),([01]),([01])\\n$`,
+      )
+    : /^A,(C|U),([01]),(-|-?(?:0|[1-9]\d{0,9})),(\d{1,5}),(\d{1,5}),([01]),([01])\n$/;
+  const match = format.exec(bytes.toString('utf8'));
+  if (!match) return null;
+  const exited = match[2] === '1';
+  const exitCode = exited ? Number(match[3]) : null;
+  const stdoutBytes = Number(match[4]);
+  const stderrBytes = Number(match[5]);
+  const outputComplete = match[6] === '1';
+  const outputLimit = match[7] === '1';
+  if (
+    (exited && (!Number.isInteger(exitCode) || exitCode < -2147483648 || exitCode > 2147483647)) ||
+    (!exited && match[3] !== '-') ||
+    stdoutBytes + stderrBytes > 65536 ||
+    (outputLimit && (outputComplete || stdoutBytes + stderrBytes !== 65536))
+  )
+    return null;
+  return {
+    cleanupConfirmed: match[1] === 'C',
+    exited,
+    exitCode,
+    stdoutBytes,
+    stderrBytes,
+    outputComplete,
+    outputLimit,
+    ...(isolated
+      ? {
+          isolationVerified: match[8] === '1',
+          workspaceRetained: match[9] === '1',
+          profileCleanup: match[10] === '1',
+        }
+      : {}),
+  };
+}
+
+function spawnProtected(launch, helper, purpose) {
+  const imported = purpose === 'appcontainer-action-import';
+  const isolated = purpose === 'appcontainer-action' || imported;
+  const action = purpose === 'action' || isolated;
+  if (
+    isolated &&
+    (!launch.executableSnapshot ||
+      launch.executableSnapshot.path !== launch.executable ||
+      !Number.isSafeInteger(launch.executableSnapshot.size) ||
+      launch.executableSnapshot.size < 1 ||
+      launch.executableSnapshot.size > 128 * 1024 * 1024 ||
+      !/^[a-f0-9]{64}$/.test(launch.executableSnapshot.sha256))
+  )
+    throw Error('gateway-protected-launch-unavailable');
+  if (!existsSync(helper)) throw Error('gateway-protected-launch-unavailable');
+  // The .NET Framework reads profiler controls before the helper's Main runs.
+  // Never pass the parent process environment to this privileged launch boundary.
+  const roots = Object.entries(process.env).filter(([name]) => name.toLowerCase() === 'systemroot');
+  if (roots.length !== 1 || !path.win32.isAbsolute(roots[0][1]))
+    throw Error('gateway-protected-launch-unavailable');
+  const frame = JSON.stringify({
+    executable: launch.executable,
+    cwd: launch.cwd,
+    args: launch.args,
+    env: launch.env,
+    ...(action ? { purpose } : {}),
+    ...(isolated ? { executableSnapshot: launch.executableSnapshot } : {}),
+    ...(imported ? { input: launch.input } : {}),
+  });
+  if (Buffer.byteLength(frame) + 1 > MAX_LAUNCH_BYTES)
+    throw Error('gateway-protected-launch-unavailable');
+  const helperProcess = (testDeps?.spawn || spawn)(helper, [], {
+    shell: false,
+    windowsHide: true,
+    cwd: path.dirname(helper),
+    env: { SystemRoot: roots[0][1] },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const peer = new EventEmitter();
+  peer.stdin = helperProcess.stdin;
+  peer.stdout = new PassThrough();
+  peer.stderr = new PassThrough();
+  peer.cleanupConfirmed = false;
+  peer.isolationVerified = false;
+  peer.actionOutcome = null;
+  peer.stop = () => helperProcess.stdin.end();
+  peer.kill = (signal) => helperProcess.kill(signal);
+  peer.unref = () => helperProcess.unref();
+  let ready = false;
+  let statusSeen = false;
+  let helperExitCode = null;
+  let actionStatusBytes = Buffer.alloc(0);
+  let protocolFailed = false;
+  const fail = () => {
+    protocolFailed = true;
+    peer.emit('error', Error('gateway-protected-launch-unavailable'));
+  };
+  const startup = setTimeout(
+    () => {
+      if (ready) return;
+      fail();
+      helperProcess.kill('SIGKILL');
+    },
+    isolated ? ISOLATION_STARTUP_MS : STARTUP_MS,
+  );
+  helperProcess.stdout.on('data', (chunk) => {
+    if (!ready) {
+      if (chunk[0] !== (imported ? 0x49 : isolated ? 0x53 : 0x52)) {
+        clearTimeout(startup);
+        fail();
+        helperProcess.kill('SIGKILL');
+        return;
+      }
+      ready = true;
+      peer.isolationVerified = isolated;
+      clearTimeout(startup);
+      peer.emit('ready');
+      chunk = chunk.subarray(1);
+    }
+    if (chunk.length) {
+      if (action) {
+        fail();
+        helperProcess.kill('SIGKILL');
+      } else peer.stdout.write(chunk);
+    }
+  });
+  helperProcess.stdout.on('end', () => peer.stdout.end());
+  helperProcess.stderr.on('data', (chunk) => {
+    // The selected process's stderr never enters this control channel.
+    if (action) {
+      if (actionStatusBytes.length + chunk.length > 128) {
+        fail();
+        helperProcess.kill('SIGKILL');
+        return;
+      }
+      actionStatusBytes = Buffer.concat([actionStatusBytes, chunk]);
+      return;
+    }
+    if (statusSeen || chunk.length !== 1 || (chunk[0] !== 0x43 && chunk[0] !== 0x55)) {
+      peer.cleanupConfirmed = false;
+      fail();
+      return;
+    }
+    statusSeen = true;
+    peer.cleanupConfirmed = chunk[0] === 0x43;
+  });
+  helperProcess.stderr.on('end', () => peer.stderr.end());
+  helperProcess.on('error', fail);
+  helperProcess.on('exit', (code, signal) => {
+    helperExitCode = code;
+    peer.emit('exit', code, signal);
+  });
+  helperProcess.on('close', (code, signal) => {
+    clearTimeout(startup);
+    if (action) {
+      peer.actionOutcome = actionStatus(actionStatusBytes, isolated, imported);
+      statusSeen = !!peer.actionOutcome;
+      peer.cleanupConfirmed = !!peer.actionOutcome?.cleanupConfirmed;
+      actionStatusBytes.fill(0);
+    }
+    peer.cleanupConfirmed =
+      !protocolFailed && ready && statusSeen && peer.cleanupConfirmed && helperExitCode === 0;
+    peer.emit('close', code, signal);
+  });
+  helperProcess.stdin.write(frame + '\n', (error) => {
+    if (error) fail();
+  });
+  return peer;
+}
+
+/** Start one selected upstream through the Windows Job helper.
+ * @param {object} launch Exact policy-authorized launch.
+ * @param {string} [helper] Explicit path for native smoke tests only.
+ * @returns {object} Child-like stdio and verified cleanup state. @since v0.16.0 */
+function spawnInWindowsJob(launch, helper = helperPath()) {
+  return spawnProtected(launch, helper, 'gateway');
+}
+
+/** Start a selected action with private output accounting and descendant cleanup.
+ * @param {object} launch Exact policy-authorized launch.
+ * @param {string} [helper] Explicit path for native smoke tests only.
+ * @returns {object} Child-like control and verified action outcome. @since v0.16.0 */
+function spawnActionInWindowsJob(launch, helper = helperPath()) {
+  return spawnProtected(launch, helper, 'action');
+}
+
+/** Start an action in a zero-capability AppContainer and a Windows Job.
+ * @param {object} launch Exact authorized launch with a never-created cwd.
+ * @param {string} [helper] Explicit native test helper.
+ * @returns {object} Child-like control and verified isolation receipt. @since v0.16.0 */
+function spawnActionInAppContainer(launch, helper = helperPath()) {
+  return spawnProtected(
+    launch,
+    helper,
+    launch.input ? 'appcontainer-action-import' : 'appcontainer-action',
+  );
+}
+
+/** Read the bounded native workspace inventory for an explicit private CLI request.
+ * @param {string} [helper] Explicit native test helper.
+ * @returns {object} Exact paths and revalidated lifecycle states. @since v0.17.0 */
+function listAppContainerWorkspaces(helper = helperPath()) {
+  const roots = Object.entries(process.env).filter(([name]) => name.toLowerCase() === 'systemroot');
+  if (process.platform !== 'win32' || roots.length !== 1 || !path.win32.isAbsolute(roots[0][1]))
+    throw Error('workspace-inventory-unavailable');
+  const result = (testDeps?.spawnSync || spawnSync)(helper, ['--workspace-list'], {
+    cwd: path.dirname(helper),
+    env: { SystemRoot: roots[0][1] },
+    windowsHide: true,
+    encoding: 'utf8',
+    timeout: 5000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  if (result.status !== 0 || result.error || typeof result.stdout !== 'string')
+    throw Error('workspace-inventory-unavailable');
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    throw Error('workspace-inventory-unavailable');
+  }
+  if (
+    parsed?.schemaVersion !== 1 ||
+    !Number.isInteger(parsed.incompleteIntents) ||
+    parsed.incompleteIntents < 0 ||
+    parsed.incompleteIntents > 256 ||
+    !Array.isArray(parsed.workspaces) ||
+    parsed.workspaces.length > 256 ||
+    !parsed.workspaces.every(
+      (row) =>
+        /^[a-f0-9]{32}$/.test(row?.id) &&
+        typeof row.path === 'string' &&
+        Buffer.byteLength(row.path, 'utf8') <= 4096 &&
+        /^[a-zA-Z]:\\/.test(row.path) &&
+        typeof row.createdUtc === 'string' &&
+        ['intent', 'prepared', 'retained'].includes(row.phase) &&
+        ['unknown', 'present', 'replaced'].includes(row.presence),
+    )
+  )
+    throw Error('workspace-inventory-unavailable');
+  return parsed;
+}
+
+/** @param {object} deps Trusted native transport seam. @returns {void} @since v0.16.0 */
+function _setDepsForTest(deps) {
+  testDeps = deps;
+}
+/** @returns {void} @since v0.16.0 */
+function _resetForTest() {
+  testDeps = null;
+}
+
+module.exports = {
+  helperPath,
+  spawnInWindowsJob,
+  spawnActionInWindowsJob,
+  spawnActionInAppContainer,
+  listAppContainerWorkspaces,
+  _setDepsForTest,
+  _resetForTest,
+};

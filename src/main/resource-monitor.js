@@ -1,0 +1,418 @@
+/**
+ * @file resource-monitor.js
+ * @module main/resource-monitor
+ * @description Per-PID CPU/RAM (and optional NVIDIA GPU memory) sampling for
+ *   detected AI-agent processes. The OS is queried BY PID — that is the only handle
+ *   it offers — but every sample is requested, cached and returned under the caller's
+ *   `instanceId`, so a recycled pid can never inherit the previous holder's numbers.
+ *   Windows transport lives in platform/windows-resources, GPU sampling in
+ *   platform/nvidia-gpu; all queries use the
+ *   injectable execFile runner. Collection and cache provenance stay here.
+ *   CPU is normalized to 0–100 % of total machine per-PID (C-01). GPU memory is
+ *   reported only for complete measurements from an admitted NVIDIA CLI — else gpu:null
+ *   (fail honest: never fabricate a number).
+ * @requires child_process
+ * @requires os
+ * @requires ./logger
+ * @author AEGIS Contributors
+ * @license MIT
+ * @version 0.10.0
+ */
+'use strict';
+
+const { execFile } = require('child_process');
+const os = require('os');
+const logger = require('./logger');
+const { createWindowsResources } = require('./platform/windows-resources');
+const { createNvidiaGpu, parseGpuCsv: _parseGpuCsv } = require('./platform/nvidia-gpu');
+
+/** @typedef {{ pid: number, cpu: number|null, memMb: number|null, gpu: {memMb: number}|null }} Resource */
+/** @typedef {{ cpuRaw: number|null, memMb: number|null }} CpuMem */
+/**
+ * What to sample, and WHO it belongs to. `instanceId` is the caller's stamped
+ * process-instance key for that pid on the tick it built this target — never
+ * re-resolved here, which would be a second lookup able to straddle a pid recycle.
+ * `null` is the honest value for a process the caller could not key.
+ * @typedef {{ pid: number, instanceId: string|null }} ResourceTarget
+ */
+/**
+ * One sampled process, carrying the identity it was requested under.
+ *
+ * `instanceId` is the KEY; `pid` rides alongside for display and diagnostics and must
+ * not be used to key anything downstream — the OS reissues it. A record with
+ * `instanceId: null` is an unattributed sample: it keeps its own pid and stays
+ * individually distinguishable, never merged with other null-key records.
+ * Collection metadata belongs to THIS record and survives cache replay. collectedAt
+ * is the wall-clock completion of the CPU/RAM + optional GPU collection attempt,
+ * not an OS observation timestamp. collectionStartedAt excludes the one-time GPU
+ * availability probe. The counters can describe different provider time windows.
+ * collectionSequence increases with batch request order within this main process;
+ * use it, not wall time, to reject out-of-order replies (the clock can be adjusted).
+ * Missing measurements remain null even when a collection completed successfully.
+ * @typedef {{ instanceId: string|null, pid: number, cpu: number|null, memMb: number|null, gpu: {memMb: number}|null, collectionStartedAt: number, collectedAt: number, collectionSequence: number }} AgentResourceRecord
+ */
+
+/** ms — short on purpose: CPU is volatile, but this keeps spawns off the per-tick path. */
+const RESOURCE_CACHE_TTL = 5000;
+const EXEC_TIMEOUT = 8000;
+const LOGICAL_CORES = Math.max(1, os.cpus().length);
+const BYTES_PER_MB = 1048576;
+
+/**
+ * TTL cache, keyed by `instanceId` — NOT by pid.
+ *
+ * A pid is not an identity: Windows reissues it, so a pid-keyed hit can hand a sample
+ * taken under the previous holder of that pid to the process now wearing it, and the
+ * two would silently disagree about whose CPU that was. `instanceId` binds the pid to
+ * the OS birth time (process-identity.js), so a hit belongs to the instance that asked
+ * for it or to nothing.
+ *
+ * A target with `instanceId: null` is NEITHER read from NOR written to this map: with
+ * no key there is no way to prove the pid still names the same process, so it is
+ * resampled every call. That costs a spawn on a path that is already spawn-bound and
+ * off the critical path — cheaper than inventing distinguishability we do not have.
+ * @type {Map<string, AgentResourceRecord>}
+ */
+const _cache = new Map();
+
+/** Batch sequence is collection provenance, never process identity. */
+let _collectionSequence = 0;
+/** Preserve the newest completed request while other calls are still pending, even
+ * if its cache entry is pruned. A newer pending request must not prevent a finished
+ * reading from filling the cache. Entries are released after all callers finish.
+ * @type {Map<string, {completedSequence: number, pending: number}>}
+ */
+const _pendingCollections = new Map();
+
+/**
+ * Injectable command runner — resolves stdout, rejects on spawn error. Tests
+ * override this via _setExecForTest so no real process is ever spawned.
+ * @type {(cmd: string, argv: string[], opts?: object) => Promise<string>}
+ */
+let _exec = (cmd, argv, opts) =>
+  new Promise((resolve, reject) => {
+    execFile(cmd, argv, { timeout: EXEC_TIMEOUT, windowsHide: true, ...opts }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout || '');
+    });
+  });
+
+/** @internal Override the command runner (tests). */
+function _setExecForTest(fn, options = {}) {
+  _exec = fn;
+  _windows = createWindowsResources({ exec: fn, resolveExe: () => null, ...options });
+  // Injected runners never execute a real driver. Tests can separately exercise
+  // production admission with the platform sampler's resolver seam.
+  _gpu = createGpu(options.resolveGpuExe || (() => ({ file: 'nvidia-smi', cwd: process.cwd() })));
+}
+
+let _windows = createWindowsResources({ exec: (...args) => _exec(...args) });
+
+/** Injectable logger (real by default). Tests inject a spy via DI, not module-mock
+ * — dodges the ESM/CJS interop identity trap. @type {{ warn: Function }} */
+let _log = logger;
+
+function createGpu(resolveExe) {
+  return createNvidiaGpu({
+    exec: (...args) => _exec(...args),
+    resolveExe,
+    warn: (message) => _log.warn('resource-monitor', message),
+  });
+}
+let _gpu = createGpu();
+
+/** @internal Override the logger (tests). */
+function _setLoggerForTest(fn) {
+  _log = fn;
+}
+
+/** @internal Reset all module state (tests). */
+function _resetForTest() {
+  _cache.clear();
+  _pendingCollections.clear();
+  _collectionSequence = 0;
+  _gpu.reset();
+  _log = logger;
+}
+
+/**
+ * Normalize a sum-across-cores percent (0–100×N) to 0–100 % of total machine.
+ * @param {number|null} raw - PercentProcessorTime (win32) / ps %cpu, summed across cores
+ * @param {number} cores - logical core count
+ * @returns {number|null} 0–100, one decimal place; null when unmeasured
+ */
+function _normalizeCpu(raw, cores) {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return null;
+  const pct = raw / Math.max(1, cores);
+  return Math.round(Math.min(100, pct) * 10) / 10;
+}
+
+/**
+ * Read a nonnegative OS measurement without coercing missing data to zero.
+ * Numeric strings are emitted by some OS providers; blanks and booleans are not readings.
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+function measurement(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  if (typeof value === 'string' && !value.trim()) return null;
+  const result = Number(value);
+  return Number.isFinite(result) && result >= 0 ? result : null;
+}
+
+/**
+ * Parse Win32_PerfFormattedData_PerfProc_Process JSON (object or array form).
+ * @param {string} stdout
+ * @returns {Map<number, CpuMem>}
+ */
+function _parsePerfJson(stdout) {
+  const map = new Map();
+  const raw = (stdout || '').trim();
+  if (!raw) return map;
+  let entries;
+  try {
+    entries = JSON.parse(raw);
+  } catch (_) {
+    return map;
+  }
+  if (!Array.isArray(entries)) entries = [entries];
+  for (const e of entries) {
+    const pid = Number(e && e.IDProcess);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const cpuRaw = measurement(e.PercentProcessorTime);
+    const ws = measurement(e.WorkingSet);
+    map.set(pid, {
+      cpuRaw,
+      memMb: ws === null ? null : Math.round(ws / BYTES_PER_MB),
+    });
+  }
+  return map;
+}
+
+/**
+ * Parse posix `ps -o pid=,%cpu=,rss=` output (rss in KB).
+ * @param {string} stdout
+ * @returns {Map<number, CpuMem>}
+ */
+function _parsePsOutput(stdout) {
+  const map = new Map();
+  for (const line of (stdout || '').split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+([\d.]+)\s+(\d+)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const rss = measurement(m[3]);
+    map.set(pid, {
+      cpuRaw: measurement(m[2]),
+      memMb: rss === null ? null : Math.round(rss / 1024),
+    });
+  }
+  return map;
+}
+
+/**
+ * One-time probe for an admitted NVIDIA binary. Records availability and warns once when
+ * absent. Errors/timeouts resolve to unavailable (fail honest); later calls return
+ * the memoized result with no extra spawn.
+ * @returns {Promise<{available: boolean}>}
+ * @since v0.10.0
+ */
+function probeGpu() {
+  return _gpu.probe();
+}
+
+/** @returns {boolean} Whether nvidia-smi GPU detection is currently available. */
+function isGpuAvailable() {
+  return _gpu.isAvailable();
+}
+
+/**
+ * Spawn-and-parse CPU/RAM for the given PIDs in a single batched query.
+ * Win32 uses the formatted-counter helper with PowerShell fallback; posix uses `ps`.
+ * Errors → empty map.
+ * @param {number[]} pids
+ * @returns {Promise<Map<number, CpuMem>>}
+ */
+function _fetchCpuMem(pids) {
+  if (process.platform === 'win32') {
+    return _windows
+      .fetch(pids)
+      .then(_parsePerfJson)
+      .catch(() => new Map());
+  }
+  return _exec('ps', ['-o', 'pid=,%cpu=,rss=', '-p', pids.join(',')])
+    .then(_parsePsOutput)
+    .catch(() => new Map());
+}
+
+/**
+ * Per-PID GPU memory via nvidia-smi. Empty map when GPU detection is degraded.
+ * @returns {Promise<Map<number, number>>}
+ */
+function _fetchGpu() {
+  return _gpu.sample();
+}
+
+/**
+ * Drop cache entries older than the TTL once the map grows large (bounded growth).
+ * @param {number} now
+ */
+function _pruneCache(now) {
+  if (_cache.size <= 500) return;
+  for (const [instanceId, entry] of _cache) {
+    const age = now - entry.collectedAt;
+    if (age < 0 || age > RESOURCE_CACHE_TTL) _cache.delete(instanceId);
+  }
+}
+
+/**
+ * Drop anything that is not a sampleable target, and collapse exact duplicates.
+ *
+ * Dedup is on the (instanceId, pid) PAIR, not on pid alone: two agents sharing a pid
+ * under different keys are two requests and both are answered. An exact repeat of the
+ * same pair is one process named twice, and nothing distinguishes the two — collapsing
+ * it is what the old pid-level `new Set` did and it stays correct.
+ * @param {unknown} targets
+ * @returns {ResourceTarget[]}
+ */
+function _normalizeTargets(targets) {
+  if (!Array.isArray(targets)) return [];
+  const seen = new Set();
+  /** @type {ResourceTarget[]} */
+  const out = [];
+  for (const t of targets) {
+    if (!t || typeof t !== 'object') continue;
+    const pid = Number(/** @type {{pid: unknown}} */ (t).pid);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const raw = /** @type {{instanceId: unknown}} */ (t).instanceId;
+    const instanceId = typeof raw === 'string' && raw !== '' ? raw : null;
+    const dedupKey = `${instanceId ?? ''}\u0000${pid}`;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
+    out.push({ pid, instanceId });
+  }
+  return out;
+}
+
+/**
+ * Resolve CPU/RAM/GPU for a set of {pid, instanceId} targets, batched and TTL-cached
+ * BY INSTANCE. Fresh cache hits are served without spawning; unkeyed targets and stale
+ * or missing instances trigger one batched query for their pids.
+ *
+ * Returns an ARRAY, not a Map, and that is load-bearing: a Map keyed on `instanceId`
+ * would put every unattributed record under one `null` key and lose all but the last,
+ * while a Map keyed on pid would reintroduce the pid-as-identity the cache migration
+ * exists to remove. The array preserves one record per requested target, in request
+ * order.
+ * @param {ResourceTarget[]} targets
+ * @returns {Promise<AgentResourceRecord[]>}
+ * @since v0.10.0
+ */
+async function getResourcesForPids(targets) {
+  const wanted = _normalizeTargets(targets);
+  if (wanted.length === 0) return [];
+
+  const now = Date.now();
+  _pruneCache(now);
+
+  /** @type {Map<ResourceTarget, AgentResourceRecord>} */
+  const resolved = new Map();
+  /** @type {ResourceTarget[]} */
+  const needSample = [];
+  for (const target of wanted) {
+    const cached = target.instanceId ? _cache.get(target.instanceId) : undefined;
+    const age = cached ? now - cached.collectedAt : -1;
+    if (cached && age >= 0 && age <= RESOURCE_CACHE_TTL) resolved.set(target, cached);
+    else needSample.push(target);
+  }
+
+  if (needSample.length > 0) {
+    const collectionSequence = ++_collectionSequence;
+    const keys = new Set(needSample.map((target) => target.instanceId).filter(Boolean));
+    for (const key of keys) {
+      const pending = _pendingCollections.get(key);
+      _pendingCollections.set(key, {
+        completedSequence: Math.max(
+          pending?.completedSequence || 0,
+          _cache.get(key)?.collectionSequence || 0,
+        ),
+        pending: (pending?.pending || 0) + 1,
+      });
+    }
+    try {
+      await probeGpu(); // one-time; memoized no-op after first call
+      const pids = [...new Set(needSample.map((t) => t.pid))];
+      const collectionStartedAt = Date.now();
+      const [cpuMem, gpu] = await Promise.all([_fetchCpuMem(pids), _fetchGpu()]);
+      const collectedAt = Date.now();
+
+      for (const target of needSample) {
+        const cm = cpuMem.get(target.pid);
+        const gpuMb = gpu.get(target.pid);
+        /** @type {AgentResourceRecord} */
+        const record = {
+          instanceId: target.instanceId,
+          pid: target.pid,
+          cpu: cm ? _normalizeCpu(cm.cpuRaw, LOGICAL_CORES) : null,
+          memMb: cm ? cm.memMb : null,
+          gpu: gpuMb !== undefined ? { memMb: gpuMb } : null,
+          collectionStartedAt,
+          collectedAt,
+          collectionSequence,
+        };
+        // Only a newer completed request supersedes this reading. Pending work
+        // must not starve the cache during continuous overlapping collection.
+        const pending = target.instanceId ? _pendingCollections.get(target.instanceId) : undefined;
+        if (
+          target.instanceId &&
+          pending &&
+          pending.completedSequence <= collectionSequence &&
+          (_cache.get(target.instanceId)?.collectionSequence || 0) <= collectionSequence
+        ) {
+          pending.completedSequence = collectionSequence;
+          _cache.set(target.instanceId, record);
+        }
+        resolved.set(target, record);
+      }
+    } finally {
+      for (const key of keys) {
+        const pending = _pendingCollections.get(key);
+        if (pending && --pending.pending === 0) _pendingCollections.delete(key);
+      }
+    }
+  }
+
+  return wanted.map((t) => /** @type {AgentResourceRecord} */ (resolved.get(t)));
+}
+
+/**
+ * Resolve CPU/RAM/GPU for a single PID. Returns an all-null resource when the
+ * PID cannot be sampled (exited, denied, or unparseable).
+ *
+ * Unchanged contract: a bare pid in, a pid-shaped {@link Resource} out. It carries no
+ * instance key, so — like every unkeyed target — it never reads or writes the cache and
+ * samples afresh on each call.
+ * @param {number} pid
+ * @returns {Promise<Resource>}
+ * @since v0.10.0
+ */
+async function getResourcesByPid(pid) {
+  const [record] = await getResourcesForPids([{ pid: Number(pid), instanceId: null }]);
+  if (!record) return { pid: Number(pid), cpu: null, memMb: null, gpu: null };
+  return { pid: record.pid, cpu: record.cpu, memMb: record.memMb, gpu: record.gpu };
+}
+
+module.exports = {
+  getResourcesByPid,
+  getResourcesForPids,
+  probeGpu,
+  isGpuAvailable,
+  RESOURCE_CACHE_TTL,
+  _setExecForTest,
+  _setLoggerForTest,
+  _resetForTest,
+  _parsePerfJson,
+  _parsePsOutput,
+  _parseGpuCsv,
+  _normalizeCpu,
+};

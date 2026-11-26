@@ -1,0 +1,1938 @@
+/**
+ * @file main.js
+ * @description Electron main-process orchestrator. Wires sub-modules, manages
+ *   app lifecycle. Scan intervals delegated to scan-loop.js.
+ * @since v0.1.0
+ */
+'use strict';
+
+// Capture the native owner's locator, session secret and optional profile root.
+// Remove bootstrap-only values before loading modules or starting descendants.
+let ownerConsoleBootstrap;
+if (
+  process.argv[2] === '--action-mcp-delete-review' &&
+  (process.env.AEGIS_OWNER_PIPE !== undefined || process.env.AEGIS_OWNER_SECRET !== undefined)
+) {
+  ownerConsoleBootstrap = {
+    pipe: process.env.AEGIS_OWNER_PIPE,
+    secret: process.env.AEGIS_OWNER_SECRET,
+    profileRoot: process.env.AEGIS_OWNER_PROFILE_ROOT,
+    profileEnvironment: Object.fromEntries(
+      ['APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'HOME', 'TEMP', 'TMP'].map((key) => [
+        key,
+        process.env[key],
+      ]),
+    ),
+  };
+  delete process.env.AEGIS_OWNER_PIPE;
+  delete process.env.AEGIS_OWNER_SECRET;
+  delete process.env.AEGIS_OWNER_PROFILE_ROOT;
+}
+
+// Storage configuration only; reject malformed selectors before CLI or settings.
+const ownedGuiProfile = require('./owned-gui-profile');
+const _hookStartup = require('./hook-startup-args').selectHookStartupArgs(process.argv);
+const _hookInvocation = _hookStartup.isHook;
+const _ownedGuiSelector = ownedGuiProfile.hasOwnedGuiProfileSelector(process.argv.slice(1));
+const _cliArgs = _hookStartup.args;
+if (!_hookInvocation && _ownedGuiSelector)
+  ownedGuiProfile.configureOwnedGuiProfile(process.argv.slice(1), require('electron').app);
+
+// ═══ CLI MODE (before Electron imports) ═══
+const _cliFlags = new Set([
+  '--mcp-gateway-http',
+  '--mcp-gateway-stdio',
+  '--mcp-gateway-stdio-review',
+  '--mcp-gateway-credential-tag',
+  '--mcp-gateway-stdio-route-tag',
+  '--action-mcp-config-json',
+  '--action-catalog-check-json',
+  '--action-route-check-json',
+  '--action-mcp-catalog-stdio',
+  '--action-mcp-catalog-review',
+  '--handoff-import-json',
+  '--action-policy-hook',
+  '--action-policy-after-hook',
+  '--claude-guard-session',
+  '--gemini-beforetool-hook',
+  '--gemini-beforetool-exit-code',
+  '--action-exec-json',
+  '--action-exec-confirm',
+  '--action-exec-windows-job-json',
+  '--action-exec-windows-job-confirm',
+  '--action-exec-appcontainer-confirm',
+  '--action-exec-appcontainer-import-confirm',
+  '--action-appcontainer-workspaces',
+  '--action-delete-file-confirm',
+  '--action-mcp-stdio',
+  '--action-mcp-review',
+  '--action-mcp-delete-review',
+  '--action-mcp-connect',
+  '--handoff-listen-json',
+  '--handoff-send',
+  '--static-import-json',
+  '--static-scan-json',
+  '--scan-json',
+  '--inventory-json',
+  '--inventory-profile-json',
+  '--inventory-snapshot-json',
+  '--inventory-accept-json',
+  '--inventory-diff-json',
+  '--version',
+  '--help',
+]);
+if (_cliArgs.some((a) => _cliFlags.has(a))) {
+  require('./cli')
+    .handleCLI(_cliArgs, { ownerConsoleBootstrap })
+    .then(async (code) => {
+      if (
+        !_cliArgs.includes('--gemini-beforetool-hook') &&
+        !_cliArgs.includes('--action-policy-hook') &&
+        [
+          '--mcp-gateway-http',
+          '--mcp-gateway-stdio',
+          '--mcp-gateway-stdio-review',
+          '--action-mcp-stdio',
+          '--action-mcp-review',
+          '--action-mcp-delete-review',
+          '--action-mcp-connect',
+          '--action-mcp-catalog-stdio',
+          '--action-mcp-catalog-review',
+        ].includes(_cliArgs[0])
+      ) {
+        // The transport already drained bounded output and awaited child cleanup.
+        process.exit(code ?? 2);
+      }
+      if (
+        _cliArgs.includes('--gemini-beforetool-hook') ||
+        _cliArgs.includes('--action-policy-hook') ||
+        [
+          '--action-exec-json',
+          '--action-exec-confirm',
+          '--action-exec-windows-job-json',
+          '--action-exec-windows-job-confirm',
+          '--action-exec-appcontainer-confirm',
+          '--action-exec-appcontainer-import-confirm',
+          '--action-appcontainer-workspaces',
+          '--action-delete-file-confirm',
+          '--action-route-check-json',
+          '--action-catalog-check-json',
+          '--action-mcp-config-json',
+          '--mcp-gateway-credential-tag',
+          '--mcp-gateway-stdio-route-tag',
+        ].includes(_cliArgs[0])
+      ) {
+        // These commands emit small bounded reports; drain before ending even
+        // when a late operation outlives the evaluation or cleanup deadline.
+        await new Promise((resolve) => process.stdout.write('', resolve));
+        process.exit(code ?? 2);
+      }
+      // Finite live commands close their sockets/timers and let stdout drain.
+      if (['--handoff-listen-json', '--handoff-send'].includes(_cliArgs[0]))
+        process.exitCode = code ?? 0;
+      else process.exit(code ?? 0);
+    });
+  return; // CJS module-scope return — stops rest of file from executing
+}
+
+const { app, BrowserWindow, globalShortcut } = require('electron');
+// Public API and updater requests must never select an OS client certificate.
+// Electron 44 also emits this event for net requests with null webContents.
+app.on('select-client-certificate', (event, _contents, _url, _certificates, callback) => {
+  event.preventDefault();
+  callback();
+});
+const { randomUUID } = require('node:crypto');
+const FILE_EVENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const path = require('path');
+const { guardRendererNavigation, resolveRendererDocument } = require('./external-url-boundary');
+const { createFileWatchRetryPolicy } = require('./file-watch-retry');
+const { readBoundedConfigFile } = require('./bounded-config-file');
+
+// ═══ HW ACCELERATION (must run before app.whenReady) ═══
+try {
+  const settingsFile = path.join(app.getPath('userData'), 'settings.json');
+  const raw = JSON.parse(readBoundedConfigFile(settingsFile));
+  if (raw.hardwareAcceleration === false) {
+    app.disableHardwareAcceleration();
+  }
+} catch (_) {
+  // Settings unreadable — keep HW accel enabled (default)
+}
+
+app.name = 'Aegis';
+if (process.platform === 'darwin') {
+  app.setName('Aegis');
+  app.dock.setIcon(path.join(__dirname, '..', '..', 'assets', 'icon.png'));
+}
+// ═══ CRITICAL (needed before ready-to-show) ═══
+const config = require('./config-manager');
+const logger = require('./logger');
+const desktopShell = require('./platform/desktop-shell').createDesktopShell({
+  app,
+  platform: process.platform,
+});
+const tray = require('./tray-icon');
+const ipc = require('./ipc-handlers');
+const { createLiveToolContext } = require('./live-tool-context');
+const { createSensitiveAlertJournal } = require('./sensitive-alert-journal');
+let sensitiveAlertJournal;
+let updates;
+let claudeHookProfile;
+let geminiHookProfile;
+let projectWatchSelection;
+let etwFile;
+let nativeSensor = null;
+const { createBatcher } = require('./ipc-batcher');
+// Pure domain modules — no I/O, no Electron, no timers — so they cost nothing to load
+// on the fast path to a visible window. `file-access-batching` must be here rather than
+// deferred: the file-access batcher is built at module scope below, long before
+// loadDeferredModules runs.
+const appHealth = require('./app-health');
+const { FILE_ACCESS_BATCHER_OPTIONS } = require('./file-access-batching');
+// Pure as well (Block B5): `getStats` reads its snapshot on BOTH branches, and the
+// powerMonitor subscription below `app.whenReady` must exist before any sensor does —
+// a laptop can sleep during boot. `session-tracker` is here for one read, the active
+// session count the resume record carries; it is the module scan-loop reconciles with.
+const observationGap = require('./observation-gap');
+const sessionTracker = require('./session-tracker');
+
+// ═══ DEFERRED (loaded after ready-to-show via loadDeferredModules) ═══
+// `network` is here rather than local to initDeferredSubsystems because getAppHealth()
+// reads its sensor leaf: a module the composer must ask cannot be a local const. The
+// three secondary detectors are here for the same one reason and no other — scan-loop
+// still requires them itself, and this file never calls their detection functions.
+let baselines,
+  anomaly,
+  scanner,
+  procUtil,
+  watcher,
+  exporter,
+  audit,
+  scanLoop,
+  sequenceEngine,
+  network,
+  platform,
+  ideDetector,
+  wslDetector,
+  llmDetector,
+  dockerDiscovery,
+  podmanDiscovery,
+  wslInventory;
+
+// How many sequence rules the engine holds — written by loadSequenceRules, read by the
+// `rules:reloaded` push of BOTH rule watchers (file-watcher.js) as `sequenceCount`.
+let sequenceRuleCount = 0;
+
+let mainWindow = null;
+let latestAgents = [],
+  latestAiAgents = [],
+  latestOtherAgents = [];
+let liveLifecycleGeneration = 0n;
+let livePopulationGeneration = 0n;
+let livePopulationReady = false;
+let livePopulationScanStartedAt = null;
+let livePopulationObservedAt = null;
+
+function invalidateLivePopulation() {
+  livePopulationReady = false;
+  livePopulationObservedAt = null;
+  livePopulationGeneration++;
+}
+function noteLiveLifecycleChange() {
+  liveLifecycleGeneration++;
+  invalidateLivePopulation();
+}
+function beginLivePopulationScan() {
+  invalidateLivePopulation();
+  livePopulationScanStartedAt = performance.now();
+  return liveLifecycleGeneration;
+}
+function commitLivePopulationScan(pass) {
+  try {
+    if (
+      !pass ||
+      pass.lifecycleGeneration !== liveLifecycleGeneration ||
+      pass.agents !== latestAgents ||
+      pass.reliable !== true ||
+      pass.observationComplete !== true ||
+      pass.snapshotCurrent !== true ||
+      monitoringPaused ||
+      observationGap.snapshot().state !== 'NONE' ||
+      scanner?.getProcessCapabilities?.().populationReliable !== true
+    )
+      return;
+    if (livePopulationScanStartedAt === null || !Number.isFinite(livePopulationScanStartedAt))
+      return;
+    livePopulationObservedAt = livePopulationScanStartedAt;
+    livePopulationReady = true;
+  } catch {
+    livePopulationReady = false;
+  }
+}
+function livePopulationWitness() {
+  try {
+    if (
+      !livePopulationReady ||
+      monitoringPaused ||
+      observationGap.snapshot().state !== 'NONE' ||
+      scanner?.getProcessCapabilities?.().populationReliable !== true
+    )
+      return null;
+    return `${liveLifecycleGeneration}:${livePopulationGeneration}`;
+  } catch {
+    return null;
+  }
+}
+function livePopulationAgeMs() {
+  if (livePopulationWitness() === null || livePopulationObservedAt === null) return null;
+  const age = performance.now() - livePopulationObservedAt;
+  return Number.isFinite(age) && age >= 0 ? age : null;
+}
+function onLiveProcessScanCommitted(pass) {
+  commitLivePopulationScan(pass);
+  nativeSensor?.onProcessScanCommitted(pass);
+  return livePopulationWitness() !== null;
+}
+function onLiveProcessObservationUnavailable() {
+  invalidateLivePopulation();
+  nativeSensor?.onProcessObservationUnavailable();
+}
+function attachLivePopulationPowerMonitor(powerMonitor) {
+  powerMonitor.on('suspend', noteLiveLifecycleChange);
+  powerMonitor.on('resume', noteLiveLifecycleChange);
+  return () => {
+    powerMonitor.removeListener('suspend', noteLiveLifecycleChange);
+    powerMonitor.removeListener('resume', noteLiveLifecycleChange);
+  };
+}
+/**
+ * Publish the current process batch to every main-process reader. Identity stamps
+ * enrich these same objects after the population is published.
+ * @param {Array<Object>} agents
+ * @returns {void}
+ * @since v0.17.0
+ */
+function setLatestAgents(agents) {
+  invalidateLivePopulation();
+  latestAgents = agents;
+  latestAiAgents = agents.filter((a) => a.category === 'ai');
+  latestOtherAgents = agents.filter((a) => a.category === 'other');
+}
+let isQuitting = false,
+  monitoringPaused = false;
+
+/**
+ * Apply the operator pause to optional background sensors.
+ * @param {boolean} paused Whether monitoring is paused.
+ * @returns {void}
+ * @since v0.19.2-beta
+ */
+function setMonitoringPaused(paused) {
+  if (monitoringPaused !== paused) noteLiveLifecycleChange();
+  monitoringPaused = paused;
+  etwFile?.setPaused(paused);
+  nativeSensor?.setPaused(paused);
+  if (paused) {
+    wslInventory?.cancelRefresh();
+    dockerDiscovery?.cancelRefresh();
+    podmanDiscovery?.cancelRefresh();
+  }
+}
+let oomIntervalId = null;
+let latestNetConnections = [],
+  otherPanelExpanded = false;
+const fileWatchers = [];
+
+// ═══ RUNNING COUNTERS for getStats() — O(1) instead of O(n) ═══
+let totalSensitive = 0;
+let aiSensitive = 0;
+// ── Attribution counters (blindness metric) ──
+// How many events in the CURRENT activity log we could attach to an agent by PID
+// (confirmed), only by path heuristic (inferred), or not at all (unattributed).
+// attrUnattributedSensitive is the honest blindness number: sensitive accesses we
+// observed but could not blame on anyone.
+let attrConfirmed = 0;
+let attrInferred = 0;
+let attrUnattributed = 0;
+let attrUnattributedSensitive = 0;
+
+/**
+ * Move the attribution counters by `delta` for one event. Called with +1 on push
+ * and -1 on eviction so the counters always describe the current activity log.
+ * Events without an `attribution` field (pre-v0.11.0 entries) move nothing.
+ * @param {Object} ev - Activity log event.
+ * @param {number} delta - +1 when added, -1 when evicted.
+ */
+function bumpAttribution(ev, delta) {
+  const status = ev && ev.attribution && ev.attribution.status;
+  if (status === 'confirmed') {
+    attrConfirmed += delta;
+  } else if (status === 'inferred') {
+    attrInferred += delta;
+  } else if (status === 'unattributed') {
+    attrUnattributed += delta;
+    if (ev.sensitive) attrUnattributedSensitive += delta;
+  }
+}
+
+/** @param {Object} ev - Activity log event being added */
+function onActivityPush(ev) {
+  if (ev.sensitive) {
+    totalSensitive++;
+    if (ev.category === 'ai') aiSensitive++;
+  }
+  bumpAttribution(ev, 1);
+}
+
+/** @param {Object} ev - Activity log event being evicted */
+function onActivityEvict(ev) {
+  if (ev.sensitive) {
+    totalSensitive--;
+    if (ev.category === 'ai') aiSensitive--;
+  }
+  bumpAttribution(ev, -1);
+}
+
+/** Loads modules not needed until first scan cycle. Called after ready-to-show. */
+function loadDeferredModules() {
+  baselines = require('./baselines');
+  anomaly = require('./anomaly-detector');
+  scanner = require('./process-scanner');
+  procUtil = require('./process-utils');
+  watcher = require('./file-watcher');
+  exporter = require('./exports');
+  audit = require('./audit-logger');
+  scanLoop = require('./scan-loop');
+  sequenceEngine = require('./sequence-engine');
+  network = require('./network-monitor');
+  platform = require('./platform');
+  ideDetector = require('./ide-extension-detector');
+  wslDetector = require('./wsl-detector');
+  llmDetector = require('./llm-runtime-detector');
+  if (!dockerDiscovery) {
+    const { createDockerDiscovery } = require('./container-scanner');
+    dockerDiscovery = createDockerDiscovery({
+      onUpdate: () => {
+        if (!monitoringPaused && !isQuitting) statsUpdateBatcher.pushLazy(getStats);
+      },
+    });
+  }
+  if (!podmanDiscovery) {
+    const { createPodmanDiscovery } = require('./podman-scanner');
+    podmanDiscovery = createPodmanDiscovery({
+      onUpdate: () => {
+        if (!monitoringPaused && !isQuitting) statsUpdateBatcher.pushLazy(getStats);
+      },
+    });
+  }
+  if (!wslInventory) {
+    const { createWslInventory } = require('./wsl-inventory');
+    wslInventory = createWslInventory({
+      onUpdate: () => {
+        if (!monitoringPaused && !isQuitting) statsUpdateBatcher.pushLazy(getStats);
+      },
+    });
+  }
+}
+
+/** Project only the configured project watcher's readiness, never its path.
+ * @param {object} plan Existing in-memory root plan. @returns {string} Closed project state. */
+function projectWatchState(plan) {
+  if (!Array.isArray(plan?.groups) || !Array.isArray(plan?.absentGroups)) return 'unknown';
+  const roots = plan.groups.filter((root) => root?.id === 'project-dir');
+  const absent = plan.absentGroups.includes('project-dir');
+  if (!roots.length) return absent ? 'not-observed' : 'unknown';
+  if (roots.length !== 1 || absent) return 'unknown';
+  const root = roots[0];
+  if (typeof root.hasLiveWatcher !== 'boolean') return 'unknown';
+  if (['registration-failed', 'not-attempted', 'errored'].includes(root.state))
+    return 'unavailable';
+  if (root.state === 'ready') return root.hasLiveWatcher === true ? 'observed' : 'unavailable';
+  if (root.state === 'planned' || (root.state === 'registered' && root.hasLiveWatcher === true))
+    return 'starting';
+  return 'unknown';
+}
+
+/**
+ * Compose the app-level health from the honest signals the sensor modules already
+ * publish. READ-ONLY: not one `mark*` call happens here. A leaf record is written only
+ * by the code that performed or refused the observation it names, and this is the
+ * display composer, not an observer.
+ *
+ * Total by construction, which matters because `statsUpdateBatcher.pushLazy` resolves
+ * `getStats` on the flush timer, where a throw would have nowhere to go. `bootPhase`
+ * is false until every health dependency in `loadDeferredModules` is bound. A
+ * reentrant stats read may observe that require pass partway through. `deriveAppHealth`
+ * returns before it reads anything else — so the module reads below cannot happen
+ * against an undefined module.
+ *
+ * `monitoringPaused` is deliberately NOT passed: operator control is a separate
+ * dimension, and it travels beside this value in {@link getStats}, never inside it.
+ * @returns {Object} the plain {@link module:main/app-health}.AppHealth payload.
+ * @since v0.12.0
+ */
+function getAppHealth() {
+  if (
+    !scanner ||
+    !watcher ||
+    !network ||
+    !platform ||
+    !ideDetector ||
+    !wslDetector ||
+    !llmDetector
+  ) {
+    const derived = appHealth.deriveAppHealth({ bootPhase: false });
+    return {
+      state: derived.state,
+      reasons: derived.reasons,
+      // Null, not a guessed 'STARTING': no leaf record exists yet, so there is no
+      // population state to report. A reader must be able to tell "not yet observed"
+      // from "observed and starting".
+      populationState: null,
+      populationReliable: false,
+      populationAsOf: null,
+      identityQuality: null,
+      identityDegraded: false,
+      sensors: { byId: {}, raw: null, effective: null, projections: [] },
+      watchPlan: null,
+    };
+  }
+  const capabilities = scanner.getProcessCapabilities();
+  const watchPlan = watcher.getWatchPlan();
+  const identityDegraded = scanner.isIdentityDegraded(latestAgents) === true;
+  const fsHealth = watcher.getFileSensorHealth();
+  const llmHealth = llmDetector.getLlmRuntimeSensorHealth();
+  // Every leaf that owns a record, RAW. Order is stable so the payload does not
+  // reshuffle between ticks for a reader diffing it.
+  const records = [
+    scanner.getProcessSensorHealth(),
+    ...Object.keys(fsHealth)
+      .sort()
+      .map((id) => fsHealth[id]),
+    network.getNetworkSensorHealth(),
+    // Secondary agent discovery (B-S12): whether the SYNTHETIC half of the fleet —
+    // extension-hosted, WSL-inner and local-runtime agents — was actually looked for.
+    // Deliberately NOT folded into the `process` leaf: that leaf's state drives
+    // `populationReliable`, the gate every pid-scoped sensor reads before observing,
+    // and a failed WSL probe says nothing about whether the pid list can be trusted.
+    ideDetector.getIdeExtensionSensorHealth(),
+    wslDetector.getWslSensorHealth(),
+    ...Object.keys(llmHealth)
+      .sort()
+      .map((id) => llmHealth[id]),
+  ];
+  // Windows and Linux publish their process-map observation health. macOS has no
+  // snapshot leaf and retains its explicit providesStartTime: false capability.
+  if (typeof platform.getSnapshotHealth === 'function') {
+    records.push(platform.getSnapshotHealth());
+  }
+  if (etwFile) records.push(etwFile.getHealth());
+  if (nativeSensor) records.push(nativeSensor.getHealth());
+  if (securityEvents) records.push(securityEvents.getStats().health);
+  const derived = appHealth.deriveAppHealth({
+    bootPhase: true,
+    capabilities,
+    identityDegraded,
+    records,
+    watchPlan,
+  });
+  // Field copying, never a second derivation: `state` and `reasons` are taken from the
+  // pure module as they are. Re-deriving either here would be the two-sources-of-truth
+  // this whole split exists to prevent.
+  return {
+    state: derived.state,
+    reasons: derived.reasons,
+    // The FULL capability contract, not just the boolean. `populationReliable` is true
+    // iff `populationState === 'HEALTHY'`, so the boolean alone cannot tell a starting
+    // scanner from a failed one — see app-health.js and ai-mistakes #29. The renderer
+    // gates "population unknown" on `populationState`, never on `state === 'FAILED'`,
+    // which also has the defensive zero-coverage route.
+    populationState: capabilities.populationState,
+    populationReliable: capabilities.populationReliable,
+    populationAsOf: capabilities.populationAsOf,
+    identityQuality: capabilities.identityQuality,
+    identityDegraded,
+    sensors: {
+      // RAW records, untouched: an accepted birth-time fallback still reads DEGRADED
+      // here and in `raw`, and only `effective` reflects the projection.
+      byId: Object.fromEntries(records.map((r) => [r.sensorId, r])),
+      raw: derived.raw,
+      effective: derived.effective,
+      projections: derived.projections,
+    },
+    watchPlan: {
+      state: watchPlan.state,
+      liveWatcherCount: watchPlan.liveWatcherCount,
+      unavailableGroups: watchPlan.unavailableGroups,
+      projectState: projectWatchState(watchPlan),
+    },
+  };
+}
+
+/** @returns {Object} Process memory and CPU usage @since v0.1.0 */
+function getResourceUsage() {
+  const mem = process.memoryUsage(),
+    cpu = process.cpuUsage();
+  return {
+    memMB: Math.round(mem.rss / 1024 / 1024),
+    heapMB: Math.round(mem.heapUsed / 1024 / 1024),
+    cpuUser: cpu.user,
+    cpuSystem: cpu.system,
+  };
+}
+
+/**
+ * Per-channel IPC delivery accounting, for the DISPLAY lane only.
+ *
+ * A SIBLING of `appHealth`, never a field inside it, and the reason is the same
+ * boundary the ipc-batcher module header draws: an eviction or a merge here is a frame
+ * the renderer never painted. It is not a sensor `lossCount` — nothing went unobserved —
+ * and it is not an audit drop — nothing went unrecorded. The activityLog ring and the
+ * audit-logger JSONL account for their own loss on their own lane. Filing these counters
+ * under app health would let a UI-throughput number read as an observation failure.
+ *
+ * Total by construction: the batcher exists from module load, so this answers with real
+ * values on BOTH `getStats` branches — the scanner-absent branch is not a shaped stub.
+ * @returns {{fileAccess: import('./ipc-batcher').BatcherStats}}
+ * @since v0.13.0
+ */
+function getIpcStats() {
+  return {
+    fileAccess: fileAccessBatcher.getStats(),
+    securityEvents: securityEvents?.getStats() ?? null,
+  };
+}
+
+/**
+ * The sequence engine's counters and gauges (docs/roadmap/sequence-rules.md §3), or `null`
+ * before `loadDeferredModules` has required the engine. Null and not a zeroed lookalike:
+ * unlike the batcher behind {@link getIpcStats}, the engine does not exist yet on that
+ * branch, so there is no counter it could have moved, and a shaped zero would claim an
+ * observation that never happened. The same expression serves BOTH `getStats` branches.
+ * @returns {import('./sequence-engine').EngineStats|null}
+ * @since v0.14.0
+ */
+function getSequenceStats() {
+  return sequenceEngine ? sequenceEngine.getStats() : null;
+}
+
+/** @returns {{skippedProcessTicks: number, lastSkippedAt: number|null, maxProcessGapMs: number|null}} @since v0.17.0-alpha */
+function getScanCadenceStats() {
+  return (
+    scanLoop?.getScanCadence?.() ?? {
+      skippedProcessTicks: 0,
+      lastSkippedAt: null,
+      maxProcessGapMs: null,
+    }
+  );
+}
+
+/** @returns {{droppedEntries: number, bufferDepth: number, writeFailed: boolean}|null} @since v0.17.0-alpha */
+function getAuditDelivery() {
+  return audit?.getDeliveryStatus?.() ?? null;
+}
+
+/**
+ * Return discovery metadata without starting a Docker command during stats reads.
+ * @returns {import('../shared/types/process').DockerDiscoverySnapshot} Last observation, or an explicitly unobserved startup snapshot.
+ * @since v0.19.2-beta
+ */
+function getDockerDiscoveryStats() {
+  return dockerDiscovery
+    ? dockerDiscovery.snapshot()
+    : {
+        status: 'pending',
+        reason: null,
+        observedAt: null,
+        attemptedAt: null,
+        stale: true,
+        candidates: [],
+      };
+}
+
+/**
+ * Return discovery metadata without starting a Podman command during stats reads.
+ * @returns {import('../shared/types/process').PodmanDiscoverySnapshot} Last observation, or an explicitly unobserved startup snapshot.
+ * @since v0.19.2-beta
+ */
+function getPodmanDiscoveryStats() {
+  return podmanDiscovery
+    ? podmanDiscovery.snapshot()
+    : {
+        status: 'pending',
+        reason: null,
+        observedAt: null,
+        attemptedAt: null,
+        stale: true,
+        candidates: [],
+      };
+}
+
+/**
+ * Read cached running-distribution names without launching WSL during stats reads.
+ * @returns {import('../shared/types/process').WslInventorySnapshot} Last observation or an unobserved startup snapshot.
+ * @since v0.19.2-beta
+ */
+function getWslInventoryStats() {
+  return wslInventory
+    ? wslInventory.snapshot()
+    : {
+        status: 'pending',
+        reason: null,
+        observedAt: null,
+        attemptedAt: null,
+        stale: true,
+        distributions: [],
+      };
+}
+
+/**
+ * Monitoring statistics.
+ *
+ * `appHealth` and `monitoringPaused` are SIBLINGS and must stay that way: one answers
+ * "what can we still observe", the other "did the operator stop us". Folding the pause
+ * into the health enum would make a deliberate silence indistinguishable from a broken
+ * sensor, which is the false-clean this whole model exists to kill. `ipc` is a third
+ * sibling on the same principle — see {@link getIpcStats} — and `sequences` a fourth
+ * ({@link getSequenceStats}), riding the existing `stats-update` / `scan-batch` pushes
+ * with no channel of its own.
+ * @returns {Object} Monitoring statistics @since v0.1.0
+ */
+function getStats() {
+  const populationAge = livePopulationAgeMs();
+  if (!scanner) {
+    return {
+      totalFiles: 0,
+      totalSensitive: 0,
+      aiSensitive: 0,
+      uptimeMs: 0,
+      monitoringStarted: Date.now(),
+      peakAgents: 0,
+      currentAgents: 0,
+      aiAgentCount: 0,
+      otherAgentCount: 0,
+      uniqueAgents: [],
+      permissionDeniedScans: 0,
+      attribution: { confirmed: 0, inferred: 0, unattributed: 0, unattributedSensitive: 0 },
+      appHealth: getAppHealth(),
+      dockerDiscovery: getDockerDiscoveryStats(),
+      podmanDiscovery: getPodmanDiscoveryStats(),
+      wslInventory: getWslInventoryStats(),
+      // Same expression as the loaded branch, not a zeroed lookalike: the batcher is a
+      // module-scope const, so it has been counting since before this branch was
+      // reachable and its numbers are real here too.
+      ipc: getIpcStats(),
+      sequences: getSequenceStats(),
+      monitoringPaused,
+      monitoringGeneration: String(liveLifecycleGeneration),
+      monitoringPopulationRevision: String(livePopulationGeneration),
+      monitoringPopulationReady: populationAge !== null,
+      monitoringPopulationAgeMs: populationAge,
+      observationGap: observationGap.snapshot(),
+      scanCadence: getScanCadenceStats(),
+      auditDelivery: getAuditDelivery(),
+      fileReadDiagnostics: etwFile?.getReadView?.() ?? null,
+      nativeSensor: nativeSensor?.getStatus() ?? null,
+    };
+  }
+  const log = scanner.activityLog;
+  return {
+    totalFiles: log.length,
+    totalSensitive,
+    aiSensitive,
+    uptimeMs: Date.now() - scanner.monitoringStarted,
+    monitoringStarted: scanner.monitoringStarted,
+    peakAgents: scanner.peakAgents,
+    currentAgents: latestAgents.length,
+    aiAgentCount: new Set(latestAiAgents.map((a) => a.agent)).size,
+    otherAgentCount: new Set(latestOtherAgents.map((a) => a.agent)).size,
+    uniqueAgents: Array.from(scanner.uniqueAgentNames),
+    permissionDeniedScans: scanner.permissionDeniedScans,
+    attribution: {
+      confirmed: attrConfirmed,
+      inferred: attrInferred,
+      unattributed: attrUnattributed,
+      unattributedSensitive: attrUnattributedSensitive,
+    },
+    appHealth: getAppHealth(),
+    dockerDiscovery: getDockerDiscoveryStats(),
+    podmanDiscovery: getPodmanDiscoveryStats(),
+    wslInventory: getWslInventoryStats(),
+    ipc: getIpcStats(),
+    sequences: getSequenceStats(),
+    monitoringPaused,
+    monitoringGeneration: String(liveLifecycleGeneration),
+    monitoringPopulationRevision: String(livePopulationGeneration),
+    monitoringPopulationReady: populationAge !== null,
+    monitoringPopulationAgeMs: populationAge,
+    observationGap: observationGap.snapshot(),
+    scanCadence: getScanCadenceStats(),
+    auditDelivery: getAuditDelivery(),
+    fileReadDiagnostics: etwFile?.getReadView?.() ?? null,
+    nativeSensor: nativeSensor?.getStatus() ?? null,
+  };
+}
+
+function sendToRenderer(channel, data) {
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(channel, data);
+    }
+  } catch {
+    logger.warn('main', 'sendToRenderer failed', { channel, code: 'renderer-send-failed' });
+  }
+}
+
+// Options passed VERBATIM from file-access-batching.js — the flush window, the capacity
+// bound and the coalesce key live there as one frozen object so a test can drive the
+// production configuration itself rather than a re-assembled lookalike.
+const fileAccessBatcher = createBatcher('file-access', sendToRenderer, FILE_ACCESS_BATCHER_OPTIONS);
+const statsUpdateBatcher = createBatcher('stats-update', sendToRenderer, {
+  intervalMs: 1000,
+  mode: 'latest',
+});
+let securityEvents = null;
+function auditSecuritySettled() {
+  try {
+    const state = securityEvents?.getStats();
+    const names = ['file-watch', 'file-handle', 'process', 'network', 'other'];
+    if (
+      !state ||
+      state.replayPending !== false ||
+      state.pendingLoss !== 0 ||
+      state.unknownLoss !== false ||
+      state.markerDurable !== true ||
+      state.spill?.blocked !== false ||
+      state.spill?.files !== 0 ||
+      !state.sensors ||
+      names.some((name) => state.sensors[name]?.buffered !== 0)
+    )
+      return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function captureAuditCustodyProof(rows) {
+  if (!auditSecuritySettled()) return null;
+  try {
+    const before = liveToolContext.auditRevision();
+    if (!before) return null;
+    const proof = await audit?.captureObservationProof?.(rows);
+    const after = liveToolContext.auditRevision();
+    return auditSecuritySettled() &&
+      after &&
+      before.epoch === after.epoch &&
+      before.revision === after.revision
+      ? (proof ?? null)
+      : null;
+  } catch {
+    return null;
+  }
+}
+function auditCustodyRevision() {
+  try {
+    return liveToolContext.auditRevision(
+      auditSecuritySettled() && audit?.observationCustodyClear?.() === true,
+    );
+  } catch {
+    return liveToolContext.auditRevision(false);
+  }
+}
+const liveToolContext = createLiveToolContext({
+  getAgents: () => (livePopulationWitness() === null ? [] : latestAgents),
+  getPopulationGeneration: livePopulationWitness,
+  onAuditRevision: (revision) => sendToRenderer('audit:custody-revision', revision),
+  auditProof: captureAuditCustodyProof,
+});
+
+/** Preserve watcher UUIDs; stamp accepted legacy/test events before display or audit. */
+function recordAcceptedFileEvent(event) {
+  if (typeof event.eventId !== 'string' || !FILE_EVENT_ID.test(event.eventId))
+    event.eventId = randomUUID();
+  if (event.sensitive === true) sensitiveAlertJournal?.record(event);
+  liveToolContext.record(event);
+}
+
+/**
+ * Route audit delivery changes through the existing one-second latest-value stats push.
+ * No audit entry, path, or error object crosses this boundary.
+ * @param {string} userDataPath
+ * @returns {Object} Audit logger initialization options.
+ * @since v0.17.0-alpha
+ */
+function auditInitOptions(userDataPath) {
+  return {
+    userDataPath,
+    onFlushError: () =>
+      logger.error('audit-logger', 'Flush failed', { code: 'audit-flush-failed' }),
+    onDeliveryChange: () => {
+      liveToolContext.invalidateAudit();
+      if (!isQuitting && mainWindow && !mainWindow.isDestroyed())
+        statsUpdateBatcher.pushLazy(getStats);
+    },
+  };
+}
+
+// ═══ WINDOW ═══
+
+/** Create the hardened window and load the selected application document.
+ * @returns {void}
+ * @since v0.1.0
+ */
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    minWidth: 900,
+    minHeight: 600,
+    show: true,
+    title: 'WALRUS',
+    icon: path.join(
+      __dirname,
+      '..',
+      '..',
+      'assets',
+      process.platform === 'win32' ? 'icon.ico' : 'icon.png',
+    ),
+    backgroundColor: '#050507',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      nodeIntegrationInSubFrames: false,
+      plugins: false,
+    },
+  });
+  mainWindow.webContents.session.webRequest.onHeadersReceived((details, cb) => {
+    cb({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [
+          "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+        ],
+      },
+    });
+  });
+  desktopShell.attach(mainWindow);
+  const document = resolveRendererDocument(app.isPackaged, process.env.VITE_DEV_SERVER_URL);
+  guardRendererNavigation(mainWindow.webContents, document.url);
+  if (document.filePath) {
+    mainWindow.loadFile(document.filePath);
+  } else {
+    mainWindow.loadURL(document.url);
+  }
+  mainWindow.setMenuBarVisibility(false);
+  mainWindow.webContents.on('did-finish-load', () => {
+    mainWindow.show();
+    mainWindow.focus();
+  });
+
+  mainWindow.on('close', (e) => {
+    if (!isQuitting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
+}
+
+// ═══ SINGLE INSTANCE ═══
+
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => desktopShell.open());
+}
+
+// ═══ LIFECYCLE ═══
+
+/** One-shot guard for the startup path and its two rule watchers. @type {boolean} */
+let watchersStarted = false;
+const fileWatchRetryPolicy = createFileWatchRetryPolicy();
+let fileWatchRetryTimer = null;
+let fileWatchSetupInFlight = false;
+let fileWatchSetupRejected = false;
+let fileWatchRetryGeneration = 0;
+let fileWatchFilterKey = null;
+let fileWatchFiltersPending = false;
+let fileWatchRefreshQueued = false;
+
+/** Compare effective filter inputs without retaining a mutable settings array.
+ * @param {object} settings Current validated settings. @returns {string} Private comparison key. */
+function watchFilterKey(settings) {
+  return JSON.stringify([
+    settings.ignoreCommonBuildDirs !== false,
+    [
+      ...new Set(Array.isArray(settings.ignoredDirectories) ? settings.ignoredDirectories : []),
+    ].sort(),
+    projectWatchSelection?.getWatchKey() ?? null,
+  ]);
+}
+
+/** Coalesce explicit filter changes behind the existing single setup owner. @returns {void} */
+function queueFileWatchRefresh() {
+  if (isQuitting || !watchersStarted || fileWatchSetupInFlight || fileWatchRefreshQueued) return;
+  if (fileWatchRetryTimer !== null) clearTimeout(fileWatchRetryTimer);
+  fileWatchRetryTimer = null;
+  fileWatchRefreshQueued = true;
+  const generation = fileWatchRetryGeneration;
+  queueMicrotask(() => {
+    if (generation !== fileWatchRetryGeneration) return;
+    fileWatchRefreshQueued = false;
+    if (isQuitting) return;
+    if (fileWatchFiltersPending) void setupFileWatchers(generation, false);
+    else scheduleFileWatchRetry();
+  });
+}
+
+/** Apply current preferences and recreate file roots only for changed watch filters. @returns {void} */
+function onSettingsApplied() {
+  if (isQuitting) return;
+  const settings = config.getSettings();
+  scanLoop.stopScanIntervals();
+  if (!monitoringPaused) scanLoop.startScanIntervals((settings.scanIntervalSec || 10) * 1000);
+  fileWatchFiltersPending = watchFilterKey(settings) !== fileWatchFilterKey;
+  if (fileWatchFiltersPending) queueFileWatchRefresh();
+}
+
+/** Reconfigure only the watch owner after a private native folder operation. @returns {void} */
+function onProjectWatchSelectionChanged() {
+  if (isQuitting || !watchersStarted) return;
+  fileWatchFiltersPending = watchFilterKey(config.getSettings()) !== fileWatchFilterKey;
+  if (fileWatchFiltersPending) queueFileWatchRefresh();
+}
+
+/** Cancel the one pending file-watch retry check, if any. @returns {void} */
+function cancelFileWatchRetry() {
+  if (fileWatchRetryTimer !== null) clearTimeout(fileWatchRetryTimer);
+  fileWatchRetryTimer = null;
+  fileWatchRetryGeneration++;
+  fileWatchFiltersPending = false;
+  fileWatchRefreshQueued = false;
+}
+
+/**
+ * Recheck the plan throughout the app lifetime: a previously ready root can fail
+ * long after startup. Only confirmed zero coverage permits recreating all roots;
+ * setupFileWatchers closes its previous generation, including healthy roots.
+ * @returns {void}
+ */
+function scheduleFileWatchRetry() {
+  if (
+    isQuitting ||
+    fileWatchRetryTimer !== null ||
+    fileWatchSetupInFlight ||
+    typeof watcher?.getWatchPlan !== 'function'
+  )
+    return;
+  const generation = fileWatchRetryGeneration;
+  fileWatchRetryTimer = setTimeout(() => {
+    fileWatchRetryTimer = null;
+    if (isQuitting || generation !== fileWatchRetryGeneration) return;
+    let plan;
+    try {
+      if (projectWatchSelection && watchFilterKey(config.getSettings()) !== fileWatchFilterKey) {
+        fileWatchFiltersPending = true;
+        queueFileWatchRefresh();
+        return;
+      }
+      plan = watcher.getWatchPlan();
+    } catch {
+      scheduleFileWatchRetry();
+      return;
+    }
+    if (plan.state === 'HEALTHY' && plan.liveWatcherCount > 0) fileWatchRetryPolicy.reset();
+    const failedBeforePlan = fileWatchSetupRejected && plan.groups.length === 0;
+    if (
+      fileWatchRetryPolicy.canRetry() &&
+      plan.liveWatcherCount === 0 &&
+      (plan.state === 'FAILED' || failedBeforePlan)
+    ) {
+      fileWatchRetryPolicy.beginRetry();
+      void setupFileWatchers(generation, true);
+    } else {
+      scheduleFileWatchRetry();
+    }
+  }, fileWatchRetryPolicy.pollDelayMs);
+  fileWatchRetryTimer.unref?.();
+}
+
+/**
+ * Register file roots with one in-flight setup and bounded retries. Rule watchers
+ * are outside this path because recreating file roots must not duplicate them.
+ * @param {number} generation - Startup/teardown generation.
+ * @param {boolean} retry - Whether this is an automatic retry.
+ * @returns {Promise<void>}
+ */
+async function setupFileWatchers(generation, retry) {
+  if (isQuitting || generation !== fileWatchRetryGeneration || fileWatchSetupInFlight) return;
+  fileWatchSetupInFlight = true;
+  fileWatchFiltersPending = false;
+  try {
+    fileWatchFilterKey = watchFilterKey(config.getSettings());
+    await watcher.setupFileWatchers();
+    if (isQuitting || generation !== fileWatchRetryGeneration) return;
+    fileWatchSetupRejected = false;
+    if (!retry) logger.info('main', 'File watchers created', { watchRoots: fileWatchers.length });
+  } catch {
+    if (isQuitting || generation !== fileWatchRetryGeneration) return;
+    fileWatchSetupRejected = true;
+    if (!retry) {
+      logger.error('main', 'File watcher setup failed', { error: 'file-watcher-setup-failed' });
+    } else {
+      const notice = fileWatchRetryPolicy.takeExhaustionNotice();
+      if (notice) logger.error('main', 'File watcher fast retries exhausted', notice);
+    }
+  } finally {
+    if (generation === fileWatchRetryGeneration) {
+      fileWatchSetupInFlight = false;
+      fileWatchRetryPolicy.finishSetup();
+      if (fileWatchFiltersPending) queueFileWatchRefresh();
+      else scheduleFileWatchRetry();
+    }
+  }
+}
+
+/** Rule watchers have a separate lifetime from retryable file-root watchers. */
+const ruleWatchers = [];
+
+/**
+ * Fence callbacks before requesting asynchronous closes; shutdown must not wait on them.
+ * @returns {void}
+ * @since v0.19.2-beta
+ */
+function closeRuleWatchers() {
+  for (const handle of ruleWatchers.splice(0)) {
+    try {
+      Promise.resolve(handle.close()).catch(() => {});
+    } catch {
+      // A failing close must not prevent the other rule watcher or journal drain.
+    }
+  }
+}
+
+/**
+ * Create the startup watcher set exactly once: the chokidar file watchers
+ * (credential dirs, agent-config dirs, the app directory, `~/.env*`) plus both
+ * rule hot-reload watchers. File-root retries use a bounded fast burst and slow probes.
+ *
+ * The guard flips before file setup awaits preflight, so a second call landing
+ * mid-setup cannot duplicate either rule watcher or file setup.
+ * @returns {Promise<void>}
+ * @since v0.11.0-alpha
+ */
+async function startWatchers() {
+  if (watchersStarted || isQuitting) return;
+  watchersStarted = true;
+  try {
+    const handle = watcher.setupRulesWatcher(sendToRenderer, {
+      sequenceCount: getSequenceRuleCount,
+      isActive: () => !isQuitting,
+    });
+    if (handle) ruleWatchers.push(handle);
+  } catch {
+    logger.error('main', 'Rule watcher setup failed', { error: 'rule-watcher-setup-failed' });
+  }
+  try {
+    const handle = watcher.setupSequenceRulesWatcher(sendToRenderer, {
+      reload: reloadSequenceRules,
+      isActive: () => !isQuitting,
+    });
+    if (handle) ruleWatchers.push(handle);
+  } catch {
+    logger.error('main', 'Sequence rule watcher setup failed', {
+      error: 'sequence-rule-watcher-setup-failed',
+    });
+  }
+  await setupFileWatchers(fileWatchRetryGeneration, false);
+}
+
+/**
+ * Start the watchers as soon as the renderer has finished loading, WITHOUT
+ * depending on `did-finish-load` still being pending.
+ *
+ * The previous form registered `once('did-finish-load')` from inside the
+ * deferred init, which itself runs off `ready-to-show` → `setImmediate`. For a
+ * local `loadFile` the load completes first, so the listener was attached to an
+ * event that had already fired and never ran — file monitoring was silently dead
+ * from that point on. Reading `isLoading()` turns the race into an explicit
+ * branch; {@link watchersStarted} keeps both branches to one startup call.
+ * @param {Electron.WebContents} webContents - The main window's web contents.
+ * @returns {void}
+ * @since v0.11.0-alpha
+ */
+function startWatchersWhenLoaded(webContents) {
+  if (webContents.isLoading()) {
+    webContents.once('did-finish-load', () => startWatchers());
+  } else {
+    startWatchers();
+  }
+}
+
+/**
+ * The chokidar file-event handler `file-watcher.js` calls once per event that survived
+ * its own filters: dedup, the display batch, the tray, the audit record — and tap 1 of
+ * docs/roadmap/sequence-rules.md §5. Module-level rather than a closure inside
+ * {@link initDeferredSubsystems} so the tap is reachable by a test with the two
+ * collaborators injected (`_setScanLoopForTest`, `_setSequenceEngineForTest`).
+ *
+ * The record handed to the engine is the SAME object `logAuditForFile` received —
+ * deduped, `repeatCount` stamped — and it is not pre-filtered on `instanceId`: the
+ * engine's null policy skips and counts a keyless record itself (roadmap §4). `ingest`
+ * carries its own error boundary (sequence-engine.js), so nothing here wraps it.
+ * @param {Object} ev - the FileEvent as the watcher built it.
+ * @returns {void}
+ * @since v0.14.0
+ */
+function onFileEvent(ev) {
+  const deduped = scanLoop.dedupFileEvent(ev);
+  if (!deduped) return;
+  recordAcceptedFileEvent(deduped);
+  fileAccessBatcher.push(deduped);
+  // An unattributed hit carries category 'other' (no agent to take it from),
+  // so the ai-only gate would silence exactly the crown-jewel case: a secret
+  // touched with no known owner. A vague alert beats no alert.
+  if (
+    deduped.sensitive &&
+    (deduped.category === 'ai' || deduped.attribution?.status === 'unattributed')
+  ) {
+    tray.notifySensitive([deduped]);
+  }
+  // Lazy on purpose: this fires per file event, and the batcher is 'latest' with a
+  // 1000 ms window — every payload but the last is discarded. Passing the producer
+  // builds exactly one, at flush.
+  statsUpdateBatcher.pushLazy(getStats);
+  tray.updateTrayIcon();
+  scanLoop.logAuditForFile(deduped);
+  // Tap 1 (roadmap §5): after the audit record, the same deduped object.
+  sequenceEngine.ingest(deduped);
+}
+
+/**
+ * The `onDetection` consumer the sequence engine is initialised with (roadmap §5
+ * "Emission"): a completed sequence becomes a `sequence-detection` audit record ON THE
+ * EVENT — inside the ingest that completed it, not on the next tick — and one log line.
+ * The record is the engine's payload handed over field for field: `agent` / `pid` /
+ * `instanceId` are the first step's (already in the audit conventions, `''` and `null`
+ * for absent), `action` is the rule id, `severity` the assessed level, `attribution` the
+ * weakest link across the steps, and `extra` carries the rule and every step's own
+ * attribution evidence. Nothing is re-derived here.
+ *
+ * Module-level rather than a closure inside {@link initDeferredSubsystems} so the record
+ * shape can be pinned with the audit sink injected (`_setAuditForTest`). Not wrapped: the
+ * engine documents a throwing consumer as a consumer defect, and `audit.log` does not
+ * throw on a shaped record.
+ * @param {import('./sequence-engine').SequenceDetection} detection
+ * @returns {void}
+ * @since v0.14.0
+ */
+function onSequenceDetection(detection) {
+  audit.log('sequence-detection', {
+    agent: detection.agent,
+    pid: detection.pid,
+    instanceId: detection.instanceId,
+    action: detection.ruleId,
+    severity: detection.level,
+    attribution: detection.attribution,
+    extra: {
+      ruleId: detection.ruleId,
+      title: detection.title,
+      timespan: detection.timespan,
+      steps: detection.steps,
+      ...(detection.assessment ? { assessment: detection.assessment } : {}),
+      ...(detection.relationship ? { relationship: detection.relationship } : {}),
+    },
+  });
+  // Operational diagnostics need only the rule summary. Detailed evidence,
+  // including sensitive file paths, belongs in the forensic audit record above.
+  logger.info('sequence-engine', 'Sequence detected', {
+    ruleId: detection.ruleId,
+    level: detection.level,
+  });
+}
+
+/**
+ * Reads `rules/sequences/` through the loader and remembers the count. The loader has
+ * already written one `sequence-loader` warn line per warning and per load error; this is
+ * the one-line summary a reader of the log finds first, on the warn level only when there
+ * is something to warn about.
+ * @param {string} message - the summary line: `Sequence rules loaded` at startup,
+ *   `Sequence rules reloaded` from the watcher.
+ * @returns {import('./sequence-rule-loader').SequenceLoadResult}
+ * @since v0.14.0
+ */
+function loadSequenceRules(message) {
+  const sequences = require('./sequence-rule-loader').loadDir();
+  const sequenceSummary = {
+    rules: sequences.rules.map((r) => r.id),
+    warnings: sequences.warnings.length,
+    loadErrors: sequences.loadErrors,
+  };
+  if (sequences.warnings.length > 0 || sequences.loadErrors > 0) {
+    logger.warn('sequence-loader', `${message} with notices`, {
+      ...sequenceSummary,
+      reasons: sequences.warnings.map((w) => w.reason),
+    });
+  } else {
+    logger.info('sequence-loader', message, sequenceSummary);
+  }
+  sequenceRuleCount = sequences.rules.length;
+  return sequences;
+}
+
+/**
+ * The `reload` the `rules/sequences` watcher calls (file-watcher.js
+ * `setupSequenceRulesWatcher`, roadmap §5 "Hot-reload"): the directory read again, the open
+ * sequences dropped and counted — `reset('reload')`, since they were opened against rules
+ * that may no longer exist — and the engine re-initialised with the new rules and the SAME
+ * consumer as startup. Before the deferred init has run there is no engine to reset and that
+ * init reads the directory itself, so the call answers the count it knows and does nothing.
+ * @returns {number} how many sequence rules the engine holds now.
+ * @since v0.14.0
+ */
+function reloadSequenceRules() {
+  if (!sequenceEngine) return sequenceRuleCount;
+  const sequences = loadSequenceRules('Sequence rules reloaded');
+  sequenceEngine.reset('reload');
+  sequenceEngine.init({
+    rules: sequences.rules,
+    onDetection: onSequenceDetection,
+  });
+  return sequenceRuleCount;
+}
+
+/**
+ * @returns {number} the sequence rules the engine holds — the `sequenceCount` field the flat
+ *   rule watcher puts on its `rules:reloaded` push.
+ * @since v0.14.0
+ */
+function getSequenceRuleCount() {
+  return sequenceRuleCount;
+}
+
+/** Wires deferred modules and starts scanning. Called after ready-to-show. */
+function initDeferredSubsystems(userData) {
+  loadDeferredModules();
+  // One-time read-detection capability probe (win32 only — darwin/linux don't
+  // define it, so optional chaining no-ops). Fire-and-forget: it sets the
+  // platform's degraded flag before the first staggered file-scan tick.
+  require('./platform').probeReadDetection?.();
+  const network = require('./network-monitor');
+  const analysis = require('./ai-analysis');
+
+  // Sequence rules (docs/roadmap/sequence-rules.md §5): `rules/sequences/` is read here
+  // and the engine takes the compiled rules; the watcher in startWatchers reads it again
+  // on every change (reloadSequenceRules).
+  const sequences = loadSequenceRules('Sequence rules loaded');
+  sequenceEngine.init({
+    rules: sequences.rules,
+    onDetection: onSequenceDetection,
+  });
+
+  // Replay acknowledges historical audit only, never live detection or display.
+  audit.init(auditInitOptions(userData));
+  securityEvents = require('./ipc-batcher').createSecurityBatcher({
+    directory: path.join(userData, 'event-spill'),
+    consume: (records) => audit.persistBatch(records),
+  });
+  scanLoop.init({
+    securityEvents,
+    onAgentsObserved: () => etwFile?.refreshIssuers(),
+    beginLivePopulationScan,
+    onLivePopulationScanSkipped: noteLiveLifecycleChange,
+    onLivePopulationIntervalsStopped: noteLiveLifecycleChange,
+    onProcessScanCommitted: onLiveProcessScanCommitted,
+    onProcessObservationUnavailable: onLiveProcessObservationUnavailable,
+    scanner,
+    procUtil,
+    watcher,
+    network,
+    baselines,
+    anomaly,
+    audit,
+    tray,
+    logger,
+    sequenceEngine,
+    observationGap,
+    sendToRenderer,
+    fileAccessBatcher,
+    prepareFileObservation: (event) => liveToolContext.prepare(event),
+    recordAcceptedFileEvent,
+    statsUpdateBatcher,
+    getStats,
+    isMonitoringPaused: () => monitoringPaused,
+    refreshDockerDiscovery: () => {
+      if (!monitoringPaused && !isQuitting) return dockerDiscovery?.refresh();
+    },
+    refreshPodmanDiscovery: () => {
+      if (!monitoringPaused && !isQuitting) return podmanDiscovery?.refresh();
+    },
+    refreshWslInventory: () => {
+      if (!monitoringPaused && !isQuitting) return wslInventory?.refresh();
+    },
+    cancelWslInventory: () => wslInventory?.cancelRefresh(),
+    cancelDockerDiscovery: () => dockerDiscovery?.cancelRefresh(),
+    cancelPodmanDiscovery: () => podmanDiscovery?.cancelRefresh(),
+    getResourceUsage,
+    getLatestAgents: () => latestAgents,
+    setAgents: setLatestAgents,
+    setLatestNetConnections: (c) => {
+      latestNetConnections = c;
+    },
+  });
+  fileWatchFilterKey = watchFilterKey(config.getSettings());
+  config.init({
+    knownAgentNames: scanner.AI_AGENTS.map((a) => a.name),
+    applyCallback: onSettingsApplied,
+  });
+  scanner.init({ trackSeenAgent: config.trackSeenAgent });
+  watcher.init({
+    getSettings: () => config.getSettings(),
+    getProjectWatchRoot: () =>
+      projectWatchSelection?.resolveRoot() ?? Promise.resolve({ state: 'unselected' }),
+    getCustomRules: config.getCustomSensitiveRules,
+    getLatestAgents: () => latestAgents,
+    getLatestAiAgents: () => latestAiAgents,
+    isMonitoringPaused: () => monitoringPaused,
+    activityLog: scanner.activityLog,
+    knownHandles: scanner.knownHandles,
+    watchers: fileWatchers,
+    recordFileAccess: baselines.recordFileAccess,
+    onActivityPush,
+    onActivityEvict,
+    onFileEvent,
+    isOtherPanelExpanded: () => otherPanelExpanded,
+    audit,
+  });
+  exporter.init({
+    activityLog: scanner.activityLog,
+    getLatestNetConnections: () => latestNetConnections,
+    monitoringStarted: scanner.monitoringStarted,
+    getMainWindow: () => mainWindow,
+    getStats,
+  });
+  analysis.init({
+    getPopulationHealth: getAppHealth,
+    getSettings: config.getSettings,
+    activityLog: scanner.activityLog,
+    getLatestAgents: () => latestAgents,
+    getLatestNetConnections: () => latestNetConnections,
+    getAnomalyScores: () => {
+      const scores = Object.create(null);
+      // Same name-keyed roll-up as the scan batch (scan-loop.js): the score is computed
+      // per instance, and this prompt section is written per agent NAME, so the
+      // highest-risk instance stands for its name. Keyless agents score 0, as before.
+      for (const a of latestAgents) {
+        const score = a.instanceId ? anomaly.calculateAnomalyScore(a.instanceId).score : 0;
+        scores[a.agent] = Math.max(scores[a.agent] || 0, score);
+      }
+      return scores;
+    },
+  });
+  baselines.loadBaselines();
+  startWatchersWhenLoaded(mainWindow.webContents);
+  startNativeSensor();
+  const ms = (config.getSettings().scanIntervalSec || 10) * 1000;
+  scanLoop.staggeredStartup(ms, monitoringPaused);
+
+  // ── OOM protection: trim old data when heap > 512 MB ──
+  oomIntervalId = setInterval(() => {
+    const heap = process.memoryUsage().heapUsed;
+    if (heap > 512 * 1024 * 1024) {
+      logger.warn('main', 'Memory threshold reached, trimming old data', {
+        heapMB: Math.round(heap / 1024 / 1024),
+      });
+      const log = scanner.activityLog;
+      if (log.length > 1000) {
+        const removed = log.splice(0, log.length - 1000);
+        for (const ev of removed) onActivityEvict(ev);
+      }
+    }
+  }, 60_000);
+}
+
+/** Start the platform owner through the same path used by production deferred startup.
+ * @returns {object|null} The current runtime owner.
+ * @since 0.19.2-beta
+ */
+function startNativeSensor() {
+  if (!nativeSensor) {
+    nativeSensor = require('./platform/sensor-runtime').createSensorRuntime({
+      adapter: platform,
+      packaged: app.isPackaged === true,
+      onStatus: () => {
+        if (!isQuitting) statsUpdateBatcher.pushLazy(getStats);
+      },
+    });
+    nativeSensor?.setPaused(monitoringPaused);
+    nativeSensor?.start();
+  }
+  return nativeSensor;
+}
+
+app.whenReady().then(() => {
+  if (!gotLock) return;
+
+  // ── Critical startup: logger, config, window — fast path to visible UI ──
+  const userData = app.getPath('userData');
+  sensitiveAlertJournal = createSensitiveAlertJournal(userData);
+  logger.init({ userDataPath: userData, isDev: !app.isPackaged });
+  logger.info('main', 'App starting', { version: app.getVersion(), platform: process.platform });
+  config.loadSettings();
+  require('./rule-loader').setRuleOverridesProvider(
+    () => config.getSettings().ruleEnabledOverrides,
+  );
+  updates = require('./app-updates').createUpdateManager({
+    supported: app.isPackaged && process.platform === 'win32' && process.arch === 'x64',
+    getSettings: config.getSettings,
+    onChange: (state) => sendToRenderer('updates:status', state),
+    createUpdater: () => {
+      const { NsisUpdater } = require('electron-updater');
+      const { SignedReleaseProvider } = require('./update-provider');
+      return new NsisUpdater({ provider: 'custom', updateProvider: SignedReleaseProvider });
+    },
+    confirmInstall: async (version) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return false;
+      const { response } = await require('electron').dialog.showMessageBox(mainWindow, {
+        type: 'question',
+        title: 'Update AEGIS',
+        message: `Install AEGIS ${version} and restart?`,
+        detail:
+          'Monitoring will pause while the update is installed. Your settings and history will be kept.',
+        buttons: ['Restart and install', 'Later'],
+        defaultId: 1,
+        cancelId: 1,
+      });
+      return response === 0;
+    },
+    prepareQuit: (value = true) => {
+      isQuitting = value;
+    },
+  });
+  updates.schedule();
+  tray.init({
+    tray: null,
+    currentTrayColor: 'green',
+    lastNotificationTime: 0,
+    getSensitiveCount: () => totalSensitive,
+    getSettings: config.getSettings,
+    isMonitoringPaused: () => monitoringPaused,
+    setMonitoringPaused,
+    stopScanIntervals: () => {
+      if (scanLoop) scanLoop.stopScanIntervals();
+    },
+    startScanIntervals: () => {
+      if (scanLoop) {
+        const ms = (config.getSettings().scanIntervalSec || 10) * 1000;
+        scanLoop.startScanIntervals(ms);
+      }
+    },
+    getMainWindow: () => mainWindow,
+    openWindow: (view) => desktopShell.open(view),
+    setIsQuitting: (v) => {
+      isQuitting = v;
+    },
+    appQuit: () => app.quit(),
+    getAgentCount: () => latestAgents.length,
+  });
+  desktopShell.configureIdentity();
+  createWindow();
+  etwFile = require('./platform/etw-file-runtime').createRuntime({
+    app,
+    powerMonitor: require('electron').powerMonitor,
+    getAgents: () => latestAgents,
+    getPopulationHealth: getAppHealth,
+    classifySensitive: (file) => watcher?.classifySensitive(file) ?? null,
+    onHealthChange: () => {
+      if (!isQuitting && mainWindow && !mainWindow.isDestroyed())
+        statsUpdateBatcher.pushLazy(getStats);
+    },
+  });
+  // Block B5 — the OS sleep gap. `powerMonitor` is usable only after `ready`, which is
+  // where this runs; the module is injected the emitter and a clock and owns the rest.
+  // On resume one `observation-gap` audit record explains the hole in the JSONL, ahead
+  // of any `agent-exit` a post-sleep reconcile may go on to write. `audit` is a
+  // deferred module: a resume before it loaded has no log to write to, and no log is
+  // fabricated later.
+  const powerMonitor = require('electron').powerMonitor;
+  attachLivePopulationPowerMonitor(powerMonitor);
+  observationGap.attach(powerMonitor, {
+    onGap: (gap) => {
+      const details = observationGap.buildGapAuditDetails(gap, {
+        monitoringPaused,
+        activeSessions: sessionTracker.activeCount(),
+      });
+      logger.info('power', 'resume', details);
+      if (!audit) return;
+      audit.log('observation-gap', {
+        agent: '',
+        pid: null,
+        instanceId: null,
+        action: 'os-resume',
+        path: '',
+        severity: 'normal',
+        // Null: the ownership question does not apply — the machine slept, no owner.
+        attribution: null,
+        extra: details,
+      });
+    },
+  });
+  const applicationPath = path.resolve(__dirname, '../..');
+  projectWatchSelection = require('./project-watch-selection').createProjectWatchSelection({
+    userData,
+    getWindow: () => mainWindow,
+    dialog: require('electron').dialog,
+    blockedTrees: [app.getPath('appData'), applicationPath, process.resourcesPath].filter(Boolean),
+    onChanged: onProjectWatchSelectionChanged,
+  });
+  claudeHookProfile = require('./claude-hook-app').createClaudeHookApp({
+    userData,
+    assetsRoot: path.join(
+      app.isPackaged ? process.resourcesPath : path.join(applicationPath, 'build'),
+      'hook-review',
+    ),
+    dialog: require('electron').dialog,
+    shell: require('electron').shell,
+    clipboard: require('electron').clipboard,
+    executable: process.execPath,
+    appPath: applicationPath,
+    getWindow: () => mainWindow,
+  });
+  geminiHookProfile = require('./gemini-hook-app').createGeminiHookApp({
+    userData,
+    assetsRoot: path.join(
+      app.isPackaged ? process.resourcesPath : path.join(applicationPath, 'build'),
+      'hook-review',
+    ),
+    dialog: require('electron').dialog,
+    shell: require('electron').shell,
+    executable: process.execPath,
+    appPath: applicationPath,
+    packaged: app.isPackaged,
+    getWindow: () => mainWindow,
+  });
+  ipc.init({
+    projectWatchSelection,
+    claudeHookProfile,
+    geminiHookProfile,
+    sensitiveAlertJournal,
+    explainToolContext: (eventId) => liveToolContext.explain(eventId),
+    auditToolContextLookup: (row, proof) => liveToolContext.auditLookup(row, proof),
+    captureAuditCustodyProof,
+    auditCustodyRevision,
+    controlFileReads: (request) => etwFile.control(request),
+    updates,
+    getWindow: () => mainWindow,
+    getStats,
+    getResourceUsage,
+    getLatestAgents: () => latestAgents,
+    setOtherPanelExpanded: (v) => {
+      otherPanelExpanded = v;
+    },
+  });
+  ipc.register();
+  const { initPlatformServices, registerPlatformIpc } = require('./platform-ipc');
+  const platformServices = initPlatformServices();
+  registerPlatformIpc(platformServices);
+  const settings = config.getSettings();
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show();
+    mainWindow.focus();
+    desktopShell.open();
+    try {
+      tray.createTray();
+    } catch (err) {
+      console.warn('Tray creation skipped/failed:', err?.message);
+    }
+    // Load heavy modules AFTER window is visible
+    setImmediate(() => initDeferredSubsystems(userData));
+    etwFile.start();
+  });
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+      mainWindow.show();
+      mainWindow.focus();
+      desktopShell.open();
+    }
+  }, 1500);
+  globalShortcut.register('CommandOrControl+Shift+T', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('toggle-theme');
+    }
+  });
+});
+
+let alertQuitDrainStarted = false;
+let alertQuitDrainFinished = false;
+app.on('before-quit', (event) => {
+  projectWatchSelection?.close();
+  dockerDiscovery?.stop();
+  podmanDiscovery?.stop();
+  wslInventory?.stop();
+  if (alertQuitDrainStarted && !alertQuitDrainFinished) {
+    event.preventDefault();
+    return;
+  }
+  const etwActive = etwFile?.isActive?.() === true;
+  const nativeActive = nativeSensor?.isActive() === true;
+  const hookReviewActive =
+    claudeHookProfile?.hasPending() === true || geminiHookProfile?.hasPending() === true;
+  if (
+    !alertQuitDrainStarted &&
+    (sensitiveAlertJournal?.hasPending() || etwActive || nativeActive || hookReviewActive)
+  ) {
+    event.preventDefault();
+    alertQuitDrainStarted = true;
+    isQuitting = true;
+    closeRuleWatchers();
+    cancelFileWatchRetry();
+    if (scanLoop) scanLoop.stopScanIntervals();
+    // Give a normal restart a chance to save the final debounce window, with a
+    // finite bound if the filesystem stops answering during shutdown.
+    let timeout;
+    const drain = async () => {
+      try {
+        await watcher?.closeFileWatchers?.();
+      } catch {
+        // Continue draining accepted events even if a watcher refuses to close.
+      }
+      for (let attempt = 0; attempt < 3 && sensitiveAlertJournal?.hasPending(); attempt++) {
+        if (!(await sensitiveAlertJournal.flush())) break;
+      }
+    };
+    Promise.race([
+      Promise.all([
+        drain(),
+        etwFile?.dispose(),
+        nativeSensor?.dispose(),
+        claudeHookProfile?.close(),
+        geminiHookProfile?.close(),
+      ]),
+      new Promise((resolve) => {
+        // An ETW stop must include its terminal counters AND normal broker exit.
+        // Pending UAC or an unresponsive collector still cannot hold quit forever.
+        timeout = setTimeout(
+          resolve,
+          etwActive ? 15000 : hookReviewActive ? 5000 : nativeActive ? 2500 : 2000,
+        );
+      }),
+    ])
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(timeout);
+        alertQuitDrainFinished = true;
+        app.quit();
+      });
+    return;
+  }
+  isQuitting = true;
+  closeRuleWatchers();
+  cancelFileWatchRetry();
+  etwFile?.dispose();
+  nativeSensor?.dispose();
+  updates?.dispose();
+  if (oomIntervalId) {
+    clearInterval(oomIntervalId);
+    oomIntervalId = null;
+  }
+  globalShortcut.unregisterAll();
+  // Invalidate worker delivery before audit shutdown. Electron cannot await the
+  // final process teardown; each proxy also handles its termination promise.
+  if (watcher?.closeFileWatchers) watcher.closeFileWatchers().catch(() => {});
+  logger.info('main', 'App quitting');
+  securityEvents?.destroy();
+  if (audit) audit.shutdown();
+  if (baselines) baselines.finalizeSession();
+  logger.shutdown();
+  if (tray._state && tray._state.tray) {
+    tray._state.tray.destroy();
+    tray._state.tray = null;
+  }
+});
+app.on('window-all-closed', () => {});
+app.on('quit', () => {
+  dockerDiscovery?.stop();
+  podmanDiscovery?.stop();
+  wslInventory?.stop();
+  fileAccessBatcher.destroy();
+  statsUpdateBatcher.destroy();
+  if (scanLoop) scanLoop.stopScanIntervals();
+  fileWatchers.forEach((w) => w.close());
+});
+
+/** @internal Inject the file-watcher module, normally set by loadDeferredModules (for tests). */
+function _setWatcherForTest(mod) {
+  watcher = mod;
+}
+
+/** @internal Inject the optional ETW runtime without launching a collector.
+ * @param {Object|undefined} mod - Health/diagnostic owner.
+ * @returns {void}
+ * @since v0.14.2
+ */
+function _setEtwFileForTest(mod) {
+  etwFile = mod;
+}
+
+/**
+ * @internal Inject the process-scanner module, normally set by loadDeferredModules
+ * (for tests).
+ *
+ * `getStats` branches on `scanner` alone while {@link getAppHealth} branches on
+ * `scanner || watcher`, so injecting a scanner and leaving `watcher` undefined reaches
+ * the LOADED stats branch with app health still on its own booting path. That is what
+ * makes both stats branches executable in a test instead of merely readable: a payload
+ * contract proven by running the code, not by matching the source (ai-mistakes #21).
+ * @param {Object|undefined} mod
+ */
+function _setScannerForTest(mod) {
+  scanner = mod;
+}
+
+/**
+ * @internal Inject the scan-loop module, normally set by loadDeferredModules (for tests).
+ * {@link onFileEvent} reads its dedup and audit entry points off this reference.
+ * @param {Object|undefined} mod
+ */
+function _setScanLoopForTest(mod) {
+  scanLoop = mod;
+}
+
+/**
+ * @internal Inject the sequence engine, normally set by loadDeferredModules (for tests).
+ * A fake with `ingest` is enough to prove tap 1 hands over the deduped record.
+ * @param {Object|undefined} mod
+ */
+function _setSequenceEngineForTest(mod) {
+  sequenceEngine = mod;
+}
+
+/**
+ * @internal Inject the audit logger, normally set by loadDeferredModules (for tests).
+ * A fake with `log` is enough to pin the `sequence-detection` record shape.
+ * @param {Object|undefined} mod
+ */
+function _setAuditForTest(mod) {
+  audit = mod;
+}
+
+/**
+ * Observe the production stats push without starting Electron.
+ * @param {Object|null|undefined} window
+ * @returns {void}
+ * @since v0.17.0-alpha
+ * @internal
+ */
+function _setMainWindowForTest(window) {
+  mainWindow = window;
+}
+
+/** @internal Inject an alert journal and reset the quit drain for lifecycle tests.
+ * @param {object|undefined} journal
+ * @returns {void}
+ */
+function _setSensitiveAlertJournalForTest(journal) {
+  sensitiveAlertJournal = journal;
+  alertQuitDrainStarted = false;
+  alertQuitDrainFinished = false;
+}
+
+/** @internal Clear startup and retry state and the registered watcher list (for tests). */
+function _resetWatchersForTest() {
+  isQuitting = true;
+  closeRuleWatchers();
+  cancelFileWatchRetry();
+  watchersStarted = false;
+  fileWatchRetryPolicy.reset();
+  fileWatchSetupInFlight = false;
+  fileWatchSetupRejected = false;
+  fileWatchFilterKey = null;
+  isQuitting = false;
+  fileWatchers.length = 0;
+}
+
+/** @internal The live array setupFileWatchers appends to — what startWatchers counts (for tests). */
+function _getWatchersForTest() {
+  return fileWatchers;
+}
+
+/**
+ * @internal Run {@link loadDeferredModules} outside the Electron lifecycle (for tests).
+ *
+ * The loaded `getAppHealth` branch reads five deferred bindings the `_set*ForTest`
+ * hooks above never cover — `network`, `platform` and the three secondary detectors —
+ * so a test that wants the REAL composer over REAL leaves has exactly one door: the
+ * same require pass production runs after `ready-to-show`. Every require goes through
+ * Node's cache, so the test shapes each leaf through that module's own `_resetForTest`
+ * / `_setDepsForTest`, and decides what `./platform` resolves to for main.js with a
+ * `Module._load` interception installed before this runs (tests/main/helpers/
+ * health-umbrella-harness.js). Nothing here starts a scan, a watcher or a probe.
+ * @returns {void}
+ */
+function _loadDeferredModulesForTest() {
+  loadDeferredModules();
+}
+
+// Exported for the startup-ordering and stats-shape regression tests only — nothing in
+// the app requires main.js. Electron runs it as the entry point.
+module.exports = {
+  /** @internal Inject the private selection owner for lifecycle tests. @param {object} owner @returns {void} */
+  _setProjectWatchSelectionForTest: (owner) => {
+    projectWatchSelection = owner;
+  },
+  _initDeferredSubsystemsForTest: initDeferredSubsystems,
+  /** Drop the test owner after observing bounded child cleanup.
+   * @returns {Promise<void>} Fixture cleanup. @since 0.19.2-beta */
+  _resetSensorRuntimeForTest: async () => {
+    await nativeSensor?.dispose();
+    nativeSensor = null;
+  },
+  createWindow,
+  startWatchers,
+  startWatchersWhenLoaded,
+  // The watcher's per-event handler, exposed so the sequence-engine tap inside it can
+  // be driven with a real dedup and a fake engine (tests/main/main-file-event-tap.test.js).
+  onFileEvent,
+  // The engine's detection consumer, exposed so the `sequence-detection` record it
+  // writes can be pinned with a fake audit sink (tests/main/main-sequence-emission.test.js).
+  onSequenceDetection,
+  // Read-only. Exposed so a test can assert the payload SHAPE — that `appHealth`,
+  // `ipc`, `sequences` and `monitoringPaused` are siblings, and that the
+  // pre-`loadDeferredModules` branch answers BOOTING instead of throwing.
+  getStats,
+  getAppHealth,
+  /** Read main-only diagnostic metadata; no preload exposure.
+   * @returns {Object|undefined} Bounded diagnostic snapshot. @since v0.19.2 */
+  getEtwFileDiagnostics: () =>
+    require('./platform/etw-file-attribution').attributeDiagnostics(
+      etwFile?.getDiagnostics(),
+      latestAgents,
+      getAppHealth(),
+    ),
+  _setWatcherForTest,
+  _setEtwFileForTest,
+  _setMonitoringPausedForTest: setMonitoringPaused,
+  _livePopulationHooksForTest: {
+    begin: beginLivePopulationScan,
+    commit: commitLivePopulationScan,
+    committed: onLiveProcessScanCommitted,
+    unavailable: onLiveProcessObservationUnavailable,
+    attachPower: attachLivePopulationPowerMonitor,
+    witness: livePopulationWitness,
+    lifecycleChange: noteLiveLifecycleChange,
+  },
+  _setScannerForTest,
+  _setLatestAgentsForTest: setLatestAgents,
+  _setScanLoopForTest,
+  _setSequenceEngineForTest,
+  _setAuditForTest,
+  _setMainWindowForTest,
+  _setSensitiveAlertJournalForTest,
+  _auditInitOptionsForTest: auditInitOptions,
+  _resetWatchersForTest,
+  _getWatchersForTest,
+  _loadDeferredModulesForTest,
+};

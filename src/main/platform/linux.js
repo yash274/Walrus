@@ -1,0 +1,251 @@
+/**
+ * @file platform/linux.js
+ * @description Linux platform implementation with /proc optimizations.
+ * @since v0.3.0
+ */
+'use strict';
+
+const { execFile: _origExecFile } = require('child_process');
+
+let _execFile = _origExecFile;
+/** @internal Override execFile (for tests). */
+function _setExecFileForTest(fn) {
+  _execFile = fn || _origExecFile;
+}
+const fs = require('fs');
+const path = require('path');
+const {
+  isValidPid,
+  parsePsOutput,
+  parseLsofOutput,
+  parseTcpEndpoint,
+  parseLsofFileHandles,
+  parseLsofCwd,
+} = require('./posix-shared');
+const { signalProcess } = require('./linux-process-control');
+
+/** @param {number} pid @param {string} witness @returns {Promise<object>} @since v0.19.2-beta */
+function killProcess(pid, witness) {
+  return signalProcess(pid, witness, 'kill');
+}
+/** @param {number} pid @param {string} witness @returns {Promise<object>} @since v0.19.2-beta */
+function suspendProcess(pid, witness) {
+  return signalProcess(pid, witness, 'suspend');
+}
+/** @param {number} pid @param {string} witness @returns {Promise<object>} @since v0.19.2-beta */
+function resumeProcess(pid, witness) {
+  return signalProcess(pid, witness, 'resume');
+}
+
+/** @type {RegExp[]} Linux-specific file-path patterns to ignore */
+const IGNORE_FILE_PATTERNS = [
+  /^\/proc\//,
+  /^\/sys\//,
+  /^\/dev\//,
+  /^\/run\//,
+  /^\/snap\//,
+  /^\/usr\/lib\//,
+  /^\/usr\/share\//,
+  /\.so(\.\d+)*$/,
+];
+
+/**
+ * List running processes via `ps`.
+ * @returns {Promise<Array<{name: string, pid: number}>>}
+ */
+function listProcesses() {
+  return new Promise((resolve, reject) => {
+    _execFile(
+      'ps',
+      ['-axo', 'comm=,pid='],
+      { timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(parsePsOutput(stdout));
+      },
+    );
+  });
+}
+
+const processMapReader = require('./linux-process-map').createProcessMapReader({
+  fs,
+  execFile: (...args) => _execFile(...args),
+});
+
+/**
+ * Get raw TCP connections for given PIDs.
+ * Tries `ss` first, falls back to `lsof`.
+ * @param {number[]} pids
+ * @returns {Promise<import("../../shared/types/process").RawTcpConnection[]>}
+ */
+function getRawTcpConnections(pids) {
+  return new Promise((resolve, reject) => {
+    if (pids.length === 0) {
+      resolve([]);
+      return;
+    }
+    const pidSet = new Set(pids);
+
+    // Try ss first
+    _execFile('ss', ['-tnp'], { timeout: 10000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+      if (!err) {
+        resolve(parseSsOutput(stdout || '', pidSet));
+        return;
+      }
+      // lsof >= 4.95: -Q makes empty searches succeed; execution errors still reject.
+      _execFile(
+        'lsof',
+        ['-Q', '-i', 'TCP', '-n', '-P', '-F', 'pcnT'],
+        { timeout: 10000, maxBuffer: 4 * 1024 * 1024 },
+        (lsofErr, lsofStdout) => {
+          // B-S05: both providers failed → reject (not silent empty calm).
+          if (lsofErr) {
+            reject(lsofErr);
+            return;
+          }
+          resolve(parseLsofOutput(lsofStdout, pidSet));
+        },
+      );
+    });
+  });
+}
+
+/**
+ * Parse `ss -tnp` output.
+ * @param {string} stdout
+ * @param {Set<number>} pidSet
+ * @returns {import("../../shared/types/process").RawTcpConnection[]}
+ */
+function parseSsOutput(stdout, pidSet) {
+  const results = [];
+  const lines = stdout.trim().split('\n');
+  // Skip header line
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    // State  Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 6) continue;
+    const state = parts[0];
+    const peer = parts[4]; // e.g. "1.2.3.4:443" or "[::1]:443"
+    const process = parts.slice(5).join(' ');
+
+    // Consume complete owner tuples; quoted names may themselves contain pid text.
+    if (!process.startsWith('users:(') || !process.endsWith(')')) continue;
+    const owners = process.slice(7, -1);
+    const ownerPattern = /\("(?:[^"\\]|\\.)*",pid=(\d+),fd=\d+\)/y;
+    const socketPids = new Set();
+    let offset = 0;
+    while (offset < owners.length) {
+      ownerPattern.lastIndex = offset;
+      const owner = ownerPattern.exec(owners);
+      if (!owner) break;
+      const pid = Number(owner[1]);
+      if (isValidPid(pid) && pidSet.has(pid)) socketPids.add(pid);
+      offset = ownerPattern.lastIndex;
+      if (offset === owners.length) break;
+      // Require another tuple after every separator.
+      if (owners[offset] !== ',' || offset + 1 === owners.length) break;
+      offset++;
+    }
+    if (offset !== owners.length || socketPids.size === 0) continue;
+
+    const remote = parseTcpEndpoint(peer);
+    if (!remote) continue;
+    const { ip, port } = remote;
+    if (ip === '127.0.0.1' || ip === '::1' || ip === '0.0.0.0' || ip === '::') continue;
+    const local = parseTcpEndpoint(parts[3]);
+    for (const pid of socketPids) {
+      results.push({
+        pid,
+        ip,
+        port,
+        state,
+        localIp: local?.ip ?? null,
+        localPort: local?.port ?? null,
+      });
+    }
+  }
+  return results;
+}
+
+/**
+ * Get file handles for a process via /proc/PID/fd readlink, fallback to lsof.
+ * @param {number} pid
+ * @returns {Promise<string[]>}
+ */
+function getFileHandles(pid) {
+  pid = Number(pid);
+  if (!isValidPid(pid)) return Promise.resolve([]);
+  // Try /proc first
+  try {
+    const fdDir = path.join('/proc', String(pid), 'fd');
+    const fds = fs.readdirSync(fdDir);
+    const files = [];
+    for (const fd of fds) {
+      try {
+        const target = fs.readlinkSync(path.join(fdDir, fd));
+        if (target.startsWith('/')) files.push(target);
+      } catch (_) {}
+    }
+    if (files.length > 0) return Promise.resolve(files);
+  } catch (_) {}
+
+  // Fallback to lsof
+  return parseLsofFileHandles(pid);
+}
+
+/**
+ * Get the working directory of a process.
+ * Tries /proc/{pid}/cwd symlink first (fast), falls back to lsof.
+ * @param {number} pid
+ * @returns {Promise<string|null>}
+ * @since v0.5.0
+ */
+function getProcessCwd(pid) {
+  pid = Number(pid);
+  if (!isValidPid(pid)) return Promise.resolve(null);
+  try {
+    const target = fs.readlinkSync(path.join('/proc', String(pid), 'cwd'));
+    if (target && target.startsWith('/')) return Promise.resolve(target);
+  } catch (_) {
+    // /proc not available or permission denied, fall back to lsof
+  }
+  return parseLsofCwd(pid);
+}
+
+/**
+ * Batch CWD lookup — calls getProcessCwd for each PID.
+ * On Linux, /proc readlink is instant so no special batching needed.
+ * @param {number[]} pids
+ * @returns {Promise<Map<number, string|null>>}
+ * @since v0.5.0
+ */
+async function getProcessCwds(pids) {
+  const map = new Map();
+  const results = await Promise.all(
+    pids.map((pid) => getProcessCwd(pid).then((cwd) => ({ pid, cwd }))),
+  );
+  for (const { pid, cwd } of results) map.set(pid, cwd);
+  return map;
+}
+
+module.exports = {
+  /** Fresh procfs generations are observed each pass; outages remain explicit. */
+  providesStartTime: true,
+  listProcesses,
+  getParentProcessMap: processMapReader.getParentProcessMap,
+  getSnapshotHealth: processMapReader.getSnapshotHealth,
+  getProcessBirthContext: processMapReader.getBirthContext,
+  getRawTcpConnections,
+  getFileHandles,
+  getProcessCwd,
+  getProcessCwds,
+  killProcess,
+  suspendProcess,
+  resumeProcess,
+  IGNORE_FILE_PATTERNS,
+  _setExecFileForTest,
+};

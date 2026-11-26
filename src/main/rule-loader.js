@@ -1,0 +1,271 @@
+// @ts-check
+'use strict';
+
+/**
+ * @file rule-loader.js
+ * @module main/rule-loader
+ * @description Loads YAML ruleset files from rules/, validates against JSON Schema,
+ *   and compiles pattern strings into RegExp objects. Every loaded rule carries
+ *   at least { pattern: RegExp, reason: string } — full shape in LoadedRule.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const yaml = require('js-yaml');
+const Ajv = require('ajv');
+const logger = require('./logger');
+const { readBoundedConfigFile, readBoundedArchiveFile } = require('./bounded-config-file');
+
+/**
+ * @typedef {import('../shared/types/config').SensitiveRule} SensitiveRule
+ */
+
+/**
+ * @typedef {object} LoadedRule
+ * @property {string}   id       - Unique rule ID (e.g. "AI001")
+ * @property {string}   name     - Human-readable rule name
+ * @property {RegExp}   pattern  - Compiled regex pattern
+ * @property {string}   reason   - Why the file is sensitive
+ * @property {string}   category - Rule category
+ * @property {string}   risk     - Risk level (critical/high/medium/low)
+ * @property {string[]} tags     - Optional tags
+ * @property {boolean}  enabled  - Whether the rule is active
+ * @property {string}   platform - Target platform
+ */
+
+/** @type {string} */
+const DEFAULT_RULES_DIR = path.join(__dirname, '..', '..', 'rules');
+
+/** @param {string} filename @returns {string} */
+function readRuleFile(filename) {
+  return /[/\\]app\.asar[/\\]/.test(__dirname) && path.dirname(filename) === DEFAULT_RULES_DIR
+    ? readBoundedArchiveFile(filename)
+    : readBoundedConfigFile(filename);
+}
+
+/** @type {Map<string, LoadedRule>} */
+let ruleCache = new Map();
+
+/** @type {Map<string, LoadedRule[]>} */
+let categoryIndex = new Map();
+
+/** @type {import('ajv').ValidateFunction | null} */
+let validateFn = null;
+
+/** @type {(() => Record<string, boolean>) | null} */
+let ruleOverridesProvider = null;
+
+/** Read persisted enable states through the main-process settings owner.
+ * @param {(() => Record<string, boolean>) | null} provider
+ * @returns {void} @since v0.16.0-alpha
+ */
+function setRuleOverridesProvider(provider) {
+  ruleOverridesProvider = provider;
+  if (ruleCache.size) reloadRules();
+}
+
+/**
+ * Initializes the Ajv validator from _schema.json.
+ * @param {string} schemaPath - Path to the JSON Schema file
+ * @returns {import('ajv').ValidateFunction}
+ */
+function initValidator(schemaPath) {
+  const schemaText = readRuleFile(schemaPath);
+  const schema = JSON.parse(schemaText);
+  const ajv = new Ajv({ useDefaults: true });
+  return ajv.compile(schema);
+}
+
+/**
+ * Compiles a pattern string into a case-insensitive RegExp.
+ * @param {string} patternStr - Regex pattern as string (no slashes)
+ * @returns {RegExp}
+ * @throws {SyntaxError} If the pattern is invalid regex
+ */
+function compilePattern(patternStr) {
+  return new RegExp(patternStr, 'i');
+}
+
+/**
+ * Loads all YAML ruleset files from a directory, validates them, and
+ * compiles pattern strings into RegExp objects.
+ *
+ * @param {string} [rulesDir] - Directory to scan (defaults to project rules/)
+ * @returns {Map<string, LoadedRule>} Map of rule ID to loaded rule
+ */
+function loadRules(rulesDir = DEFAULT_RULES_DIR) {
+  /** @type {Map<string, LoadedRule>} */
+  const rules = new Map();
+  const overrides = rulesDir === DEFAULT_RULES_DIR ? ruleOverridesProvider?.() : null;
+
+  if (!fs.existsSync(rulesDir)) {
+    return rules;
+  }
+
+  const schemaPath = path.join(rulesDir, '_schema.json');
+  if (!validateFn) {
+    if (!fs.existsSync(schemaPath)) {
+      logger.warn('rule-loader', 'Schema not found', { code: 'rule-schema-missing' });
+      return rules;
+    }
+    try {
+      validateFn = initValidator(schemaPath);
+    } catch {
+      logger.warn('rule-loader', 'Failed to load schema', {
+        code: 'rule-schema-load-failed',
+      });
+      return rules;
+    }
+  }
+
+  /** @type {string[]} */
+  let files;
+  try {
+    files = fs.readdirSync(rulesDir).filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'));
+  } catch {
+    logger.warn('rule-loader', 'Failed to read directory', {
+      code: 'rule-directory-read-failed',
+    });
+    return rules;
+  }
+
+  for (const file of files) {
+    const filePath = path.join(rulesDir, file);
+    let content;
+    try {
+      content = readRuleFile(filePath);
+    } catch {
+      logger.warn('rule-loader', 'Failed to read ruleset', { code: 'rule-file-read-failed' });
+      continue;
+    }
+    try {
+      /** @type {{ rules: Array<{ id: string; name: string; pattern: string; reason: string; category: string; risk?: string; tags?: string[]; enabled?: boolean; platform?: string }> }} */
+      const doc = /** @type {*} */ (yaml.load(content));
+
+      if (!validateFn(doc)) {
+        logger.warn('rule-loader', 'Invalid ruleset', {
+          code: 'rule-validation-failed',
+          issues: validateFn.errors?.length || 0,
+        });
+        continue;
+      }
+
+      for (const rawRule of doc.rules) {
+        if (rules.has(rawRule.id)) {
+          logger.warn('rule-loader', 'Duplicate rule ID — skipping', { code: 'rule-duplicate-id' });
+          continue;
+        }
+
+        try {
+          /** @type {LoadedRule} */
+          const loaded = {
+            id: rawRule.id,
+            name: rawRule.name,
+            pattern: compilePattern(rawRule.pattern),
+            reason: rawRule.reason,
+            category: rawRule.category,
+            risk: rawRule.risk || 'medium',
+            tags: rawRule.tags || [],
+            enabled:
+              overrides && Object.hasOwn(overrides, rawRule.id)
+                ? overrides[rawRule.id]
+                : rawRule.enabled !== undefined
+                  ? rawRule.enabled
+                  : true,
+            platform: rawRule.platform || 'all',
+          };
+          rules.set(loaded.id, loaded);
+        } catch {
+          logger.warn('rule-loader', 'Invalid pattern in rule', {
+            code: 'rule-pattern-invalid',
+          });
+        }
+      }
+    } catch {
+      logger.warn('rule-loader', 'Failed to parse', {
+        code: 'rule-parse-failed',
+      });
+    }
+  }
+
+  return rules;
+}
+
+/**
+ * Builds a category-to-rules index from the given rule map.
+ * Provides O(1) lookup by category instead of O(N) filtering.
+ * @param {Map<string, LoadedRule>} rules - Rule map to index
+ * @returns {Map<string, LoadedRule[]>}
+ */
+function buildCategoryIndex(rules) {
+  /** @type {Map<string, LoadedRule[]>} */
+  const index = new Map();
+  for (const rule of rules.values()) {
+    const bucket = index.get(rule.category);
+    if (bucket) {
+      bucket.push(rule);
+    } else {
+      index.set(rule.category, [rule]);
+    }
+  }
+  return index;
+}
+
+/**
+ * Returns all loaded rules.
+ * Loads from disk on first call (lazy init).
+ * @param {string} [rulesDir] - Optional custom rules directory
+ * @returns {Map<string, LoadedRule>}
+ */
+function getAllRules(rulesDir) {
+  if (ruleCache.size === 0) {
+    ruleCache = loadRules(rulesDir);
+    categoryIndex = buildCategoryIndex(ruleCache);
+  }
+  return ruleCache;
+}
+
+/**
+ * Returns rules filtered by category via pre-built index (O(1) lookup).
+ * @param {string} category - Category to filter by
+ * @param {string} [rulesDir] - Optional custom rules directory
+ * @returns {LoadedRule[]}
+ */
+function getRulesByCategory(category, rulesDir) {
+  getAllRules(rulesDir);
+  return categoryIndex.get(category) || [];
+}
+
+/**
+ * Returns a single rule by ID, or undefined if not found.
+ * @param {string} id - Rule ID (e.g. "AI001")
+ * @param {string} [rulesDir] - Optional custom rules directory
+ * @returns {LoadedRule | undefined}
+ */
+function getRuleById(id, rulesDir) {
+  return getAllRules(rulesDir).get(id);
+}
+
+/**
+ * Clears the cache and reloads all rules from disk.
+ * @param {string} [rulesDir] - Optional custom rules directory
+ * @returns {Map<string, LoadedRule>}
+ */
+function reloadRules(rulesDir) {
+  ruleCache.clear();
+  categoryIndex.clear();
+  validateFn = null;
+  ruleCache = loadRules(rulesDir);
+  categoryIndex = buildCategoryIndex(ruleCache);
+  return ruleCache;
+}
+
+module.exports = {
+  getAllRules,
+  getRulesByCategory,
+  getRuleById,
+  reloadRules,
+  setRuleOverridesProvider,
+  // Exposed for testing only
+  _loadRules: loadRules,
+};

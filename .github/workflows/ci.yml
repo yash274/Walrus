@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 2
+      - name: Select verification scope
+        id: scope
+        env:
+          AEGIS_CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/ci-scope.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: steps.scope.outputs.runtime == 'true'
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+        if: steps.scope.outputs.runtime == 'true'
+      - run: npm run build:renderer
+        if: steps.scope.outputs.runtime == 'true'
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 2
+      - name: Validate GitHub Actions workflows
+        shell: bash
+        run: |
+          toolRoot="$RUNNER_TEMP/aegis-actionlint"
+          mkdir -p "$toolRoot"
+          curl --fail --silent --show-error --location https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz --output "$toolRoot/actionlint.tar.gz"
+          printf '%s  %s\n' '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' "$toolRoot/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$toolRoot/actionlint.tar.gz" -C "$toolRoot"
+          "$toolRoot/actionlint" -version
+          "$toolRoot/actionlint" -shellcheck= -pyflakes=
+      - name: Select verification scope
+        id: scope
+        env:
+          AEGIS_CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/ci-scope.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: steps.scope.outputs.runtime == 'true'
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+        if: steps.scope.outputs.runtime == 'true'
+      - name: Check formatting
+        if: steps.scope.outputs.runtime == 'true'
+        run: npm run format:check
+      - name: lint
+        if: steps.scope.outputs.runtime == 'true'
+        run: npm run lint
+      - name: Validate project skill catalog
+        run: node scripts/sync-agent-skills.mjs
+
+  svelte-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 2
+      - name: Select verification scope
+        id: scope
+        env:
+          AEGIS_CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/ci-scope.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: steps.scope.outputs.runtime == 'true'
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+        if: steps.scope.outputs.runtime == 'true'
+      - run: npm run typecheck
+        if: steps.scope.outputs.runtime == 'true'
+      - run: npm run typecheck:svelte
+        if: steps.scope.outputs.runtime == 'true'
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 2
+      - name: Select verification scope
+        id: scope
+        env:
+          AEGIS_CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/ci-scope.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+        if: steps.scope.outputs.runtime == 'true'
+      - name: Install locked metadata dependencies for documentation checks
+        if: steps.scope.outputs.runtime == 'false'
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run test:coverage
+        if: steps.scope.outputs.runtime == 'true'
+      # Derives the repo's countable facts from the tree and fails on every tracked
+      # file that declares a different number (memory-bank/ai-mistakes.md #24: nothing
+      # went red when a hand-maintained count stopped being true). BLOCKING since the
+      # sweep that cleared the drift: `test` is a required context, so a stale count
+      # now stops the merge instead of being reported into a log nobody opens.
+      - name: Check derived counts against declared ones
+        run: npm run counts:check
+      - name: Upload coverage
+        if: always() && steps.scope.outputs.runtime == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-report
+          path: coverage/
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 2
+      - name: Select verification scope
+        id: scope
+        env:
+          AEGIS_CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/ci-scope.mjs
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: steps.scope.outputs.runtime == 'true'
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+        if: steps.scope.outputs.runtime == 'true'
+      - name: Security audit (production deps)
+        if: steps.scope.outputs.runtime == 'true'
+        run: npm audit --audit-level=high --omit=dev

@@ -1,0 +1,248 @@
+/**
+ * @file process.ts — Process scanning and platform types
+ * @module shared/types/process
+ * @description Types for process detection, platform operations, and scan results.
+ */
+
+/** Raw process entry from tasklist CSV output */
+export interface ProcessInfo {
+  readonly name: string;
+  readonly pid: number;
+}
+
+/**
+ * Where a generation witness came from. `sequence` = the kernel SequenceNumber
+ * (Microsoft's documented PID-reuse detector); `createTime100ns` = process creation
+ * time in 100 ns ticks; `startTimeMs` = the epoch-ms birth time, stringified — what
+ * the emergency CIM observation can offer; `linuxStartTicks` = boot ID plus fresh
+ * kernel start ticks. The source is compared alongside the
+ * value, so witnesses of different provenance are never equal.
+ */
+export type GenerationWitnessSource =
+  'sequence' | 'createTime100ns' | 'startTimeMs' | 'linuxStartTicks';
+
+/** Parent process info from a snapshot observation (sidecar, CIM or Linux procfs) */
+export interface ParentProcessInfo {
+  readonly name: string;
+  readonly ppid: number;
+  /**
+   * OS process-creation time (epoch ms). Windows supplies it directly; Linux derives
+   * it from fresh start ticks and a boot-ID-bound epoch reference. Null on failure
+   * or on platforms without a birth-time provider (currently macOS).
+   */
+  readonly startTime?: number | null;
+  /**
+   * Generation witness for this pid, always a string — 64-bit values that a JS
+   * number cannot hold without losing low digits. Supplied by the Windows sidecar
+   * or Linux procfs reader; the CIM fallback omits it and process-utils
+   * derives a `startTimeMs` witness instead.
+   */
+  readonly witness?: string | null;
+  /** Provenance of {@link ParentProcessInfo.witness}. */
+  readonly witnessSource?: GenerationWitnessSource | null;
+}
+
+/**
+ * Provenance of a {@link DetectedAgent.instanceId} — see main/process-identity.js.
+ * `os` = bound to an OS birth time (reuse-resistant); `synthetic` = named pid-0
+ * entity with no OS process; `unknown` = real pid whose birth time is unreadable.
+ */
+export type InstanceIdSource = 'os' | 'synthetic' | 'unknown';
+
+/** Raw TCP connection from the platform provider. */
+export interface RawTcpConnection {
+  /** Absent on legacy providers; null when the local endpoint is unavailable. */
+  readonly localIp?: string | null;
+  readonly localPort?: number | null;
+  readonly pid: number;
+  readonly ip: string;
+  readonly port: number;
+  readonly state: string;
+}
+
+/** Agent name + process-name patterns for matching */
+export interface AgentMatch {
+  readonly name: string;
+  readonly patterns: readonly string[];
+}
+
+/** Presentation-only application tree from one fresh observation. */
+export interface ApplicationProcessGroup {
+  /** Presentation key bound to the highest observed same-agent ancestor's identity. */
+  readonly id: string;
+  readonly rootPid: number;
+  /** Detected processes in this observed tree, including its root. Not a chat count. */
+  readonly processCount: number;
+}
+
+/** Agent detected by process scanner */
+export interface DetectedAgent {
+  /** Presentation-only nearest recognized editor ancestor observed during this fresh
+   * identity pass. Absent when any traversed generation or edge is uncertain.
+   * Equality requires PID, witness value AND witness source; label is insufficient.
+   * This observation establishes no session, authority, action target or delegation. */
+  readonly observedHostEditor?: {
+    readonly pid: number;
+    readonly label: string;
+    readonly startTime: number;
+    readonly generationWitness: string;
+    readonly generationWitnessSource: Exclude<GenerationWitnessSource, 'startTimeMs'>;
+    readonly source: 'fresh-process-table';
+  };
+  readonly agent: string;
+  readonly process: string;
+  readonly pid: number;
+  readonly status: 'running';
+  readonly category: string;
+  /** Fresh presentation metadata; absent for unobserved/synthetic process identities. */
+  readonly applicationGroup?: ApplicationProcessGroup;
+  /** Last successful external discovery; stale observations do not establish current liveness. */
+  readonly discoveryObservation?: { readonly observedAt: number | null; readonly stale: boolean };
+  readonly parentEditor?: string | null;
+  readonly cwd?: string | null;
+  readonly projectName?: string | null;
+  /**
+   * OS process-creation time (epoch ms), attached by
+   * `process-utils.enrichWithParentChains`. Null when the platform withholds it
+   * (darwin today) or for synthetic pid-0 agents. Distinct from the
+   * AEGIS-observed session `firstSeen`.
+   */
+  readonly startTime?: number | null;
+  /**
+   * Process instance key, `pid` bound to `startTime` — the reuse-resistant
+   * identity. Stamped by `process-utils.enrichWithParentChains`; absent on a raw
+   * scanner result. See main/process-identity.js for the three value spaces.
+   */
+  readonly instanceId?: string;
+  /** Where {@link DetectedAgent.instanceId} came from. */
+  readonly instanceIdSource?: InstanceIdSource;
+  /** Direct monitored parent observed during this record's fresh identity pass.
+   * This records a process-table relationship; delegation and data transfer are unproven. */
+  readonly parentRelation?: {
+    readonly parentPid: number;
+    readonly parentInstanceId: string;
+    readonly source: 'fresh-process-table';
+  };
+  /**
+   * Generation witness from THIS record's own enrichment pass — the proof that a
+   * cached parent chain or working directory still belongs to the process living
+   * under this pid. It gates cache reuse; stronger-than-millisecond witnesses also
+   * bind renderer process-control requests to that observation. The `startTimeMs`
+   * fallback cannot separate two births inside one millisecond and process control
+   * refuses it. The witness is deliberately absent from
+   * {@link DetectedAgent.instanceId}, so two instances sharing a pid and birth
+   * millisecond still collide in instance-keyed stores.
+   *
+   * `null` = enrichment ran and the observation produced no witness (nothing is
+   * proven); absent = this record never passed through enrichment, so no generation
+   * was established for it either way. Never read from a cache — a cache entry is
+   * shared by every record that ever used its key.
+   */
+  readonly generationWitness?: string | null;
+  /** Provenance of {@link DetectedAgent.generationWitness}. */
+  readonly generationWitnessSource?: GenerationWitnessSource | null;
+  /**
+   * `true` only on records fabricated by the browser demo engine
+   * (renderer/lib/stores/demo-data.js). ABSENT on everything the main process
+   * produces — a scanner has no way to set it, so absence is the observed case and
+   * presence is the claim. Read it through `isDemoPayload()`
+   * (renderer/lib/stores/demo-provenance.js), never by truthiness — the predicate lives
+   * apart from the engine so a production bundle can check provenance without carrying
+   * the demo data.
+   */
+  readonly _demo?: boolean;
+}
+
+/** Result of a process scan cycle */
+export interface ScanResult {
+  readonly agents: readonly DetectedAgent[];
+  readonly changed: boolean;
+}
+
+/** Result of kill/suspend/resume operations */
+export interface ProcessActionResult {
+  readonly success: boolean;
+  readonly error?: string;
+}
+
+/** Allowlisted container configuration facts; these observations do not establish isolation. */
+export interface ContainerConfigurationObservation {
+  readonly status: 'observed' | 'unavailable';
+  readonly observedAt: number | null;
+  readonly running?: boolean;
+  readonly privileged?: boolean;
+  readonly readOnlyRootFilesystem?: boolean;
+  readonly networkMode?: 'bridge' | 'host' | 'none' | 'other';
+  readonly pidMode?: 'host' | 'private' | 'container' | 'other';
+}
+
+/** Compatibility name for existing Docker configuration consumers. */
+export type DockerConfigurationObservation = ContainerConfigurationObservation;
+
+/** Docker image metadata matched a configured agent signature; host process identity is unobserved. */
+export interface DockerContainerCandidate {
+  readonly id: `docker:${string}`;
+  readonly containerId: string;
+  readonly name: string;
+  readonly image: string;
+  readonly agent: string;
+  readonly match: 'image';
+  readonly runtime: 'docker';
+  readonly configuration?: ContainerConfigurationObservation;
+}
+
+/** Independent Docker discovery state, including retained metadata after a failed attempt. */
+export interface DockerDiscoverySnapshot {
+  readonly status: 'pending' | 'ready' | 'unavailable';
+  readonly reason:
+    null | 'cli-missing' | 'daemon-unavailable' | 'timeout' | 'invalid-output' | 'remote-endpoint';
+  readonly observedAt: number | null;
+  readonly attemptedAt: number | null;
+  readonly stale: boolean;
+  readonly candidates: readonly DockerContainerCandidate[];
+}
+
+/** Podman image metadata matched a configured agent signature; host process identity is unobserved. */
+export interface PodmanContainerCandidate {
+  readonly id: `podman:${string}`;
+  readonly containerId: string;
+  readonly name: string;
+  readonly image: string;
+  readonly agent: string;
+  readonly match: 'image';
+  readonly runtime: 'podman';
+  readonly configuration?: ContainerConfigurationObservation;
+}
+
+/** Independent Podman discovery state, including retained metadata after a failed attempt. */
+export interface PodmanDiscoverySnapshot {
+  readonly status: 'pending' | 'ready' | 'unavailable';
+  readonly reason:
+    | null
+    | 'cli-missing'
+    | 'runtime-unavailable'
+    | 'timeout'
+    | 'invalid-output'
+    | 'unsupported-platform'
+    | 'remote-config';
+  readonly observedAt: number | null;
+  readonly attemptedAt: number | null;
+  readonly stale: boolean;
+  readonly candidates: readonly PodmanContainerCandidate[];
+}
+
+/** Names observed by a host-only running-distribution query; guest processes are unobserved. */
+export interface WslInventorySnapshot {
+  readonly status: 'pending' | 'ready' | 'unavailable';
+  readonly reason:
+    | null
+    | 'unsupported-platform'
+    | 'cli-missing'
+    | 'invalid-output'
+    | 'timeout'
+    | 'runtime-unavailable';
+  readonly observedAt: number | null;
+  readonly attemptedAt: number | null;
+  readonly stale: boolean;
+  readonly distributions: readonly string[];
+}

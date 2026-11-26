@@ -1,0 +1,101 @@
+import { describe, it, expect } from 'vitest';
+import {
+  radarGroups,
+  groupResource,
+  groupActivity,
+  groupEvidence,
+  riskBand,
+} from '../../frontend/observatory/runtime/radar';
+import { emptyTelemetry } from '../../frontend/observatory/runtime/host';
+import { getTrustGrade } from '../../src/renderer/lib/utils/risk-scoring';
+const instance = (id, pid, risk = 0) => ({
+  agent: 'Claude Code',
+  name: 'Claude Code',
+  instanceId: id,
+  pid,
+  riskScore: risk,
+});
+describe('Grouped radar observations', () => {
+  it('keeps every process accessible and group risk follows the highest observed score', () => {
+    const rows = [instance('a', 11, 3), instance('b', 12, 60), instance(null, 13, 0)];
+    const groups = radarGroups(rows);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].risk).toBe(60);
+    // F-W10: a letter grade must not turn a medium-risk radar group red.
+    expect(getTrustGrade(groups[0].risk)).toBe('D');
+    expect(riskBand(groups[0].risk)).toBe('medium');
+    expect(groups[0].members.map((a) => a.instanceId)).toEqual(['b', 'a', null]);
+    expect(rows[0].instanceId).toBe('a');
+  });
+  it('does not sum partial, stale or null-identity measurements into a misleading group total', () => {
+    const g = radarGroups([instance('a', 11), instance('b', 12)])[0];
+    const state = {
+      ...emptyTelemetry(),
+      ready: true,
+      stale: false,
+      resources: [
+        { instanceId: 'a', cpu: 0 },
+        { instanceId: null, cpu: 99 },
+      ],
+    };
+    expect(groupResource(g, state, 'cpu')).toBeNull();
+    state.resources.push({ instanceId: 'b', cpu: 2 });
+    expect(groupResource(g, state, 'cpu')).toBe(2);
+    expect(groupResource(g, { ...state, stale: true }, 'cpu')).toBeNull();
+    expect(groupResource(g, { ...state, ready: false }, 'cpu')).toBeNull();
+    expect(
+      groupResource(radarGroups([instance('a', 11), instance(null, 12)])[0], state, 'cpu'),
+    ).toBeNull();
+    expect(
+      groupResource(radarGroups([instance('a', 11), instance('a', 11)])[0], state, 'cpu'),
+    ).toBeNull();
+  });
+  it('only includes exact stamped group identities in the shared half-open timeline', () => {
+    const g = radarGroups([instance('a', 11), instance(null, 12)])[0];
+    const state = {
+      ...emptyTelemetry(),
+      events: [
+        { instanceId: 'a', timestamp: 100 },
+        { instanceId: null, timestamp: 100 },
+        { instanceId: 'old', timestamp: 100 },
+        { instanceId: 'a', timestamp: 300000 },
+      ],
+    };
+    expect(groupActivity(g, state, 300000).flatMap((b) => b.events)).toEqual([state.events[0]]);
+  });
+});
+
+describe('Observatory risk bands', () => {
+  it.each([
+    [-50, 'low'],
+    [0, 'low'],
+    [20, 'low'],
+    [34, 'low'],
+    [35, 'medium'],
+    [50, 'medium'],
+    [65, 'medium'],
+    [66, 'high'],
+    [80, 'high'],
+    [100, 'high'],
+    [200, 'high'],
+  ])('classifies score %s as %s', (score, band) => {
+    expect(riskBand(score)).toBe(band);
+  });
+});
+
+it('counts canonical Windows files consistently while keeping POSIX case distinct and exact ownership', () => {
+  const group = radarGroups([instance('a', 11)])[0];
+  const state = {
+    ...emptyTelemetry(),
+    events: [
+      { instanceId: 'a', file: 'C:/Work/Test.txt', timestamp: 1 },
+      { instanceId: 'a', file: 'c:\\work\\test.txt', timestamp: 2 },
+      { instanceId: 'a', file: '/work/Test.txt', timestamp: 3 },
+      { instanceId: 'a', file: '/work/test.txt', timestamp: 4 },
+      { instanceId: 'retired', file: 'C:/other.txt', timestamp: 5 },
+      { instanceId: 'a', file: '', timestamp: 6 },
+    ],
+  };
+  expect(groupEvidence(group, state).files).toBe(3);
+  expect(state.events).toHaveLength(6);
+});

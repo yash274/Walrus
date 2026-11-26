@@ -1,0 +1,109 @@
+/* Shared Observatory surfaces and controls across workspaces. */
+:root {
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --text-caption: calc(11px * var(--ui-scale));
+  --text-body: calc(12px * var(--ui-scale));
+  --text-section: calc(14px * var(--ui-scale));
+  --text-title: calc(20px * var(--ui-scale));
+  --text-metric: calc(26px * var(--ui-scale));
+  --control-height: calc(28px * var(--ui-scale));
+  --control-radius: 8px;
+  --surface-radius: 12px;
+  --panel-inset: var(--space-3);
+}
+.observatory-app .panel {
+  border-radius: var(--surface-radius);
+  border-color: var(--border);
+  background: var(--panel);
+}
+.observatory-app .panel > .panel-head {
+  padding: var(--panel-inset);
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.observatory-app .panel-head h2 {
+  font: 600 calc(14px * var(--ui-scale))/1.4 var(--sans);
+}
+.observatory-app .button,
+.observatory-app .icon-button,
+.observatory-app .segmented {
+  border-radius: var(--control-radius);
+}
+.observatory-app .button {
+  font-family: var(--sans);
+  border-color: var(--border);
+}
+.observatory-app .button:hover:not(:disabled) {
+  border-color: var(--strong-border);
+}
+.observatory-app .badge {
+  border-radius: 6px;
+  font: calc(10px * var(--ui-scale))/1.4 var(--sans);
+}
+.observatory-app th {
+  font: 600 calc(11px * var(--ui-scale))/1.4 var(--sans);
+}
+.observatory-app td {
+  font-size: calc(12px * var(--ui-scale));
+}
+.observatory-app .table-agent {
+  font: 600 calc(12px * var(--ui-scale))/1.4 var(--sans);
+}
+.observation-detail-resource {
+  margin-bottom: 16px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.observation-table .pagination {
+  margin: 0;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.observation-table .table-wrap {
+  border-radius: 0;
+}
+.report-grid {
+  align-items: start;
+}
+
+/* One control contract for pages and dialogs; range/checkbox controls retain native geometry. */
+:is(.observatory-app, .detail-shell, .editor-dialog, .command-panel)
+  :is(.button, select, input:not([type='checkbox']):not([type='radio']):not([type='range'])) {
+  min-height: var(--control-height);
+  padding: var(--space-1) var(--space-2);
+  font: 400 var(--text-body)/1.4 var(--sans);
+  border-radius: var(--control-radius);
+}
+:is(.observatory-app, .detail-shell, .editor-dialog, .command-panel) select {
+  height: var(--control-height);
+}
+:is(.observatory-app, .detail-shell, .editor-dialog, .command-panel) .text-button {
+  min-height: var(--control-height);
+  padding-block: var(--space-1);
+  font: 400 var(--text-body)/1.4 var(--sans);
+}
+:is(.observatory-app, .detail-shell, .editor-dialog, .command-panel) textarea {
+  font: 400 var(--text-body)/1.5 var(--sans);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--control-radius);
+}
+:is(.observatory-app, .detail-shell, .editor-dialog) .segmented button {
+  min-height: var(--control-height);
+  font-size: var(--text-body);
+  padding: var(--space-1) var(--space-2);
+}
+:is(.observatory-app, .detail-shell, .editor-dialog, .command-panel) .icon-button {
+  min-width: var(--control-height);
+  min-height: var(--control-height);
+}
+:is(.observatory-app, .detail-shell, .editor-dialog) :is(.panel-head, .toolbar, .filter-actions) {
+  gap: var(--space-2);
+}

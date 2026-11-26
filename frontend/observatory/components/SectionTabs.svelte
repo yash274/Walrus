@@ -1,0 +1,64 @@
+<script lang="ts">
+  import { t } from '../runtime/i18n';
+  import { tick } from 'svelte';
+  import Icon from './Icon.svelte';
+  import type { DetailTab } from '../runtime/detail-model';
+  let {
+    tabs,
+    selected,
+    change,
+    prefix,
+    label = 'Sections',
+  }: {
+    tabs: DetailTab[];
+    selected: string;
+    change: (_id: string) => void | Promise<void>;
+    prefix: string;
+    label?: string;
+  } = $props();
+  async function keydown(event: KeyboardEvent, index: number) {
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const buttons = (
+      event.currentTarget as HTMLElement
+    ).parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    const next =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? tabs.length - 1
+          : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    await change(tabs[next].id);
+    await tick();
+    buttons?.[next]?.focus({ preventScroll: true });
+    const button = buttons?.[next];
+    const strip = button?.parentElement;
+    if (button && strip) {
+      const bounds = strip.getBoundingClientRect();
+      const target = button.getBoundingClientRect();
+      // Reveal the tab horizontally without scrolling the surrounding page or dialog.
+      if (target.left < bounds.left) strip.scrollLeft += target.left - bounds.left;
+      else if (target.right > bounds.right) strip.scrollLeft += target.right - bounds.right;
+    }
+  }
+</script>
+
+<div class="section-tabs" role="tablist" aria-label={$t(label)}>
+  {#each tabs as tab, i (tab.id)}
+    <button
+      role="tab"
+      id={prefix + '-tab-' + tab.id}
+      aria-controls={prefix + '-panel-' + tab.id}
+      aria-selected={selected === tab.id}
+      tabindex={selected === tab.id ? 0 : -1}
+      onclick={() => change(tab.id)}
+      onkeydown={(event) => keydown(event, i)}
+    >
+      {#if tab.icon}<Icon name={tab.icon} />{/if}{$t(tab.label)}{#if tab.count !== undefined}<span
+          class="tab-count">{tab.count}</span
+        >{/if}
+    </button>
+  {/each}
+</div>

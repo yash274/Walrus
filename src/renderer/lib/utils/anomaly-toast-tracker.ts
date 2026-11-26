@@ -1,0 +1,124 @@
+/**
+ * anomaly-toast-tracker.ts — Seed-then-diff tracker for anomaly toasts
+ *
+ * Pure, no DOM dependency. Used by App.svelte to decide which anomaly scores
+ * are *newly* over-threshold and therefore warrant a toast.
+ *
+ * The first NON-EMPTY scores object SEEDS the known set and returns no keys, so
+ * anomalies already present when scores first arrive never trigger a toast storm
+ * (fixes C-12). Every later call diffs against the previous set and returns only
+ * the keys that have just crossed the threshold.
+ *
+ * Empty / null / non-object emissions are ignored entirely: they neither consume
+ * the seed nor wipe the known set. This matters because the `anomalies` store is
+ * `writable({})` — it emits `{}` at mount, before any scan batch lands. If `{}`
+ * consumed the seed, the first populated batch would arrive already-"initialized"
+ * and storm; if `{}` wiped the set, a transient empty emission would re-toast
+ * everything on the next batch.
+ *
+ * @module anomaly-toast-tracker
+ * @since v0.10.0-alpha
+ */
+
+// ═══ TYPES ═══
+
+/** Map of instance identity → anomaly score, as emitted by the `anomalies` store. */
+export type AnomalyScores = Record<string, unknown> | null | undefined;
+
+/** Stateful tracker returned by {@link createAnomalyToastTracker}. */
+export interface AnomalyToastTracker {
+  /**
+   * Fold a new batch of anomaly scores into the tracker.
+   *
+   * @param scores - Latest anomaly scores (tolerates null/undefined/non-object
+   *   and empty `{}`, all treated as no-ops).
+   * @returns Instance identities that are over threshold AND were not over threshold on
+   *   the previous non-empty call. Always `[]` for the first non-empty object
+   *   (seed) and for empty/invalid emissions.
+   */
+  ingest(scores: AnomalyScores): string[];
+}
+
+// ═══ PUBLIC API ═══
+
+/**
+ * The inclusive score at which an anomaly toasts — and at which the agent card enters
+ * its alert state (AgentCard.svelte `isDanger`). ONE constant with two readers, so the
+ * toast and the card cannot say two different things about the same number: the score
+ * both read is `anomalyScoresByInstance` as scan-loop.js merges it (the baseline
+ * deviation composite and the sequence-engine hold, max), keyed by instance and, for
+ * the toast, independently for each instance.
+ */
+export const ANOMALY_TOAST_THRESHOLD = 50;
+
+/**
+ * Whether a score crosses the toast gate. The tracker's own gate and the card's alert
+ * state both go through this function, which is what keeps them from drifting apart.
+ *
+ * @param score - Anything a scores map may hold. Only a number at or over the threshold
+ *   alerts; a string, `null`, `undefined` and `NaN` do not.
+ * @param threshold - Inclusive gate; {@link ANOMALY_TOAST_THRESHOLD} unless a caller
+ *   built its tracker on another one.
+ * @returns `true` when `score` is a number `>= threshold`.
+ */
+export function isAnomalyAlert(score: unknown, threshold = ANOMALY_TOAST_THRESHOLD): boolean {
+  return typeof score === 'number' && score >= threshold;
+}
+
+/**
+ * Create a seed-then-diff anomaly-toast tracker.
+ *
+ * @param threshold - Minimum score (inclusive) for an agent to count as an
+ *   anomaly. Defaults to {@link ANOMALY_TOAST_THRESHOLD}, the gate App.svelte
+ *   toasts on and AgentCard alerts on.
+ * @returns A tracker whose `ingest` returns only freshly-anomalous instance identities.
+ */
+export function createAnomalyToastTracker(
+  threshold = ANOMALY_TOAST_THRESHOLD,
+): AnomalyToastTracker {
+  let prevKeys = new Set<string>();
+  let initialized = false;
+  let awaitingMeasurement = new Set<string>();
+
+  return {
+    ingest(scores: AnomalyScores): string[] {
+      // Ignore empty/null/invalid emissions: do not seed, do not wipe state.
+      if (!scores || typeof scores !== 'object') return [];
+      const entries = Object.entries(scores);
+      if (entries.length === 0) return [];
+
+      // An observed instance without a measurement must establish its own baseline.
+      const pending = new Set<string>();
+      for (const [id, score] of entries) {
+        if (typeof score !== 'number' || !Number.isFinite(score)) {
+          if (awaitingMeasurement.has(id) || !prevKeys.has(id)) pending.add(id);
+        }
+      }
+      if (!entries.some(([, score]) => typeof score === 'number' && Number.isFinite(score))) {
+        awaitingMeasurement = pending;
+        return [];
+      }
+      const currentKeys = new Set<string>();
+      const fresh: string[] = [];
+
+      for (const [agent, score] of entries) {
+        if (typeof score !== 'number' || !Number.isFinite(score)) {
+          if (prevKeys.has(agent)) currentKeys.add(agent);
+        } else if (isAnomalyAlert(score, threshold)) {
+          currentKeys.add(agent);
+          // On the seed (first non-empty) call, `initialized` is false → nothing
+          // is reported, so anomalies present when scores first arrive do not
+          // produce a toast storm.
+          if (initialized && !prevKeys.has(agent) && !awaitingMeasurement.has(agent)) {
+            fresh.push(agent);
+          }
+        }
+      }
+
+      prevKeys = currentKeys;
+      awaitingMeasurement = pending;
+      initialized = true;
+      return fresh;
+    },
+  };
+}

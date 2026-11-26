@@ -1,0 +1,618 @@
+import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
+import Module from 'module';
+import { execFile as realExecFile } from 'node:child_process';
+
+const mockExecFile = vi.fn();
+const cimRows = (rows) =>
+  rows.map((row) => ({
+    OwningProcess: row.pid,
+    RemoteAddress: row.ip,
+    RemotePort: row.port,
+    LocalAddress: row.localIp,
+    LocalPort: row.localPort,
+    State: 5,
+  }));
+
+const originalLoad = Module._load;
+Module._load = function (request, _parent, _isMain) {
+  if (request === 'child_process') return { execFile: mockExecFile };
+  return originalLoad.apply(this, arguments);
+};
+
+afterAll(() => {
+  Module._load = originalLoad;
+  vi.unstubAllEnvs();
+});
+
+describe('platform/win32', () => {
+  let win32;
+
+  beforeEach(async () => {
+    vi.stubEnv('AEGIS_OBSERVER_PROVIDER', 'powershell');
+    mockExecFile.mockReset();
+    vi.resetModules();
+    const mod = await import('../../../src/main/platform/win32.js');
+    win32 = mod.default;
+  });
+
+  describe('IGNORE_FILE_PATTERNS', () => {
+    it('ignores C:\\Windows paths (case-insensitive)', () => {
+      expect(win32.IGNORE_FILE_PATTERNS.some((p) => p.test('C:\\Windows\\System32\\cmd.exe'))).toBe(
+        true,
+      );
+      expect(win32.IGNORE_FILE_PATTERNS.some((p) => p.test('c:\\windows\\explorer.exe'))).toBe(
+        true,
+      );
+    });
+
+    it('ignores C:\\Program Files\\Windows paths', () => {
+      expect(
+        win32.IGNORE_FILE_PATTERNS.some((p) => p.test('C:\\Program Files\\Windows Defender\\foo')),
+      ).toBe(true);
+    });
+
+    it('ignores pagefile.sys', () => {
+      expect(win32.IGNORE_FILE_PATTERNS.some((p) => p.test('C:\\pagefile.sys'))).toBe(true);
+    });
+
+    it('ignores swapfile.sys', () => {
+      expect(win32.IGNORE_FILE_PATTERNS.some((p) => p.test('C:\\swapfile.sys'))).toBe(true);
+    });
+
+    it('ignores $Extend', () => {
+      expect(win32.IGNORE_FILE_PATTERNS.some((p) => p.test('C:\\$Extend\\$UsnJrnl'))).toBe(true);
+    });
+
+    it('ignores System Volume Information', () => {
+      expect(
+        win32.IGNORE_FILE_PATTERNS.some((p) => p.test('C:\\System Volume Information\\foo')),
+      ).toBe(true);
+    });
+
+    it('ignores \\Device\\ paths', () => {
+      expect(win32.IGNORE_FILE_PATTERNS.some((p) => p.test('\\Device\\HarddiskVolume1'))).toBe(
+        true,
+      );
+    });
+
+    it('does NOT ignore user files', () => {
+      expect(
+        win32.IGNORE_FILE_PATTERNS.some((p) => p.test('C:\\Users\\me\\project\\main.js')),
+      ).toBe(false);
+    });
+  });
+
+  describe('listProcesses', () => {
+    it('bounds tasklist and rejects when the command times out', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        expect(cmd).toBe('tasklist');
+        expect(opts).toEqual({ timeout: 10000, maxBuffer: 4 * 1024 * 1024 });
+        cb(new Error('tasklist timed out'));
+      });
+
+      await expect(win32.listProcesses()).rejects.toThrow('tasklist timed out');
+    });
+
+    it('parses tasklist CSV output', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(
+          null,
+          '"claude.exe","1234","Console","1","50,000 K"\n"code.exe","5678","Console","1","100,000 K"\n',
+        );
+      });
+
+      const procs = await win32.listProcesses();
+      expect(procs).toEqual([
+        { name: 'claude.exe', pid: 1234 },
+        { name: 'code.exe', pid: 5678 },
+      ]);
+    });
+
+    it('skips malformed lines', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, 'this is not csv\n"node.exe","100","Console","1","50K"\n');
+      });
+
+      const procs = await win32.listProcesses();
+      expect(procs).toHaveLength(1);
+      expect(procs[0].name).toBe('node.exe');
+    });
+
+    it('rejects on error', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(new Error('tasklist failed'));
+      });
+
+      await expect(win32.listProcesses()).rejects.toThrow('tasklist failed');
+    });
+  });
+
+  describe('getParentProcessMap', () => {
+    it('parses PowerShell JSON output into Map (no CreationDate → startTime null)', async () => {
+      const psOutput = JSON.stringify({
+        100: { n: 'node.exe', p: 50 },
+        200: { n: 'claude.exe', p: 100 },
+      });
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, psOutput);
+      });
+
+      const map = await win32.getParentProcessMap();
+      expect(map).toBeInstanceOf(Map);
+      expect(map.get(100)).toEqual({ name: 'node.exe', ppid: 50, startTime: null });
+      expect(map.get(200)).toEqual({ name: 'claude.exe', ppid: 100, startTime: null });
+    });
+
+    it('maps the CreationDate epoch (t) field onto startTime when present', async () => {
+      const psOutput = JSON.stringify({
+        100: { n: 'claude.exe', p: 50, t: 1717000000000 },
+        200: { n: 'node.exe', p: 100 },
+      });
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, psOutput);
+      });
+
+      const map = await win32.getParentProcessMap();
+      expect(map.get(100).startTime).toBe(1717000000000);
+      // A row without the t field stays honest-null, never fabricates a time.
+      expect(map.get(200).startTime).toBeNull();
+    });
+
+    it('returns empty Map on error', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(new Error('fail'));
+      });
+
+      const map = await win32.getParentProcessMap();
+      expect(map.size).toBe(0);
+    });
+
+    it('returns empty Map on invalid JSON', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, 'not json');
+      });
+
+      const map = await win32.getParentProcessMap();
+      expect(map.size).toBe(0);
+    });
+
+    it('returns empty Map on empty stdout', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, '');
+      });
+
+      const map = await win32.getParentProcessMap();
+      expect(map.size).toBe(0);
+    });
+  });
+
+  describe('getRawTcpConnections', () => {
+    it('returns empty array for empty PID list', async () => {
+      const result = await win32.getRawTcpConnections([]);
+      expect(result).toEqual([]);
+    });
+
+    it('filters out invalid PIDs', async () => {
+      const result = await win32.getRawTcpConnections([0, -1, 1.5]);
+      expect(result).toEqual([]);
+    });
+
+    it('parses PowerShell connection output', async () => {
+      const conns = [
+        {
+          pid: 100,
+          ip: '52.1.2.3',
+          port: 443,
+          state: 'Established',
+          localIp: '10.0.0.1',
+          localPort: 52001,
+        },
+      ];
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, JSON.stringify(cimRows(conns)));
+      });
+
+      const result = await win32.getRawTcpConnections([100]);
+      expect(result).toEqual(conns);
+    });
+
+    it('requests and preserves both local endpoint fields for simultaneous sockets', async () => {
+      const rows = [52001, 52002].map((localPort) => ({
+        pid: 100,
+        ip: '52.1.2.3',
+        port: 443,
+        state: 'Established',
+        localIp: '10.0.0.1',
+        localPort,
+      }));
+      mockExecFile.mockImplementation((cmd, args, opts, cb) =>
+        cb(null, JSON.stringify(cimRows(rows))),
+      );
+      expect(await win32.getRawTcpConnections([100])).toEqual(rows);
+      const script = mockExecFile.mock.calls[0][1].at(-1);
+      expect(script).toContain('LocalAddress,LocalPort');
+    });
+
+    it('wraps single connection object in array', async () => {
+      const conn = {
+        pid: 100,
+        ip: '1.2.3.4',
+        port: 80,
+        state: 'Established',
+        localIp: '10.0.0.1',
+        localPort: 52001,
+      };
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, JSON.stringify(cimRows([conn])[0]));
+      });
+
+      const result = await win32.getRawTcpConnections([100]);
+      expect(result).toEqual([conn]);
+    });
+
+    it('rejects on provider error (B-S05 — not silent empty)', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(new Error('PS error'));
+      });
+
+      await expect(win32.getRawTcpConnections([100])).rejects.toThrow('PS error');
+    });
+
+    it('returns empty for "[]" output', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, '[]');
+      });
+
+      expect(await win32.getRawTcpConnections([100])).toEqual([]);
+    });
+
+    it('returns empty for empty stdout', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, '');
+      });
+
+      expect(await win32.getRawTcpConnections([100])).toEqual([]);
+    });
+
+    it('rejects unparseable output (B-S05 — not silent empty)', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, 'not json');
+      });
+
+      await expect(win32.getRawTcpConnections([100])).rejects.toBeTruthy();
+    });
+  });
+
+  describe('getFileHandles', () => {
+    it('returns empty array for invalid PID', async () => {
+      expect(await win32.getFileHandles(0)).toEqual([]);
+      expect(await win32.getFileHandles(-1)).toEqual([]);
+      expect(await win32.getFileHandles(1.5)).toEqual([]);
+      expect(await win32.getFileHandles('abc')).toEqual([]);
+    });
+
+    it('parses file handle output', async () => {
+      const files = ['C:\\Users\\me\\file.js', 'C:\\tmp\\log.txt'];
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, JSON.stringify(files));
+      });
+
+      expect(await win32.getFileHandles(100)).toEqual(files);
+    });
+
+    it('wraps single string result in array', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, '"C:\\\\Users\\\\me\\\\file.js"');
+      });
+
+      const result = await win32.getFileHandles(100);
+      expect(result).toEqual(['C:\\Users\\me\\file.js']);
+    });
+
+    it('rejects when the handle query times out instead of reporting a clean empty scan', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        expect(opts.timeout).toBe(15000);
+        cb(Object.assign(new Error('timed out'), { killed: true }));
+      });
+
+      await expect(win32.getFileHandles(100)).rejects.toThrow('handle-scan-failed');
+    });
+
+    it('returns empty for "[]" output', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, '[]');
+      });
+
+      expect(await win32.getFileHandles(100)).toEqual([]);
+    });
+
+    it.skipIf(process.platform !== 'win32')(
+      'rejects when handle.exe disappears after the startup capability probe',
+      async () => {
+        mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+          // Run the generated query with Get-Command shadowed so no handle binary
+          // can be found, regardless of this machine's PATH.
+          const script = `function Get-Command { $null }\n${args[3]}`;
+          realExecFile(cmd, [...args.slice(0, 3), script], opts, cb);
+        });
+
+        await expect(win32.getFileHandles(100)).rejects.toThrow('handle-scan-failed');
+      },
+    );
+
+    it.skipIf(process.platform !== 'win32')(
+      'keeps a successful empty handle query as a clean empty observation',
+      async () => {
+        mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+          const script = [
+            'function Invoke-EmptyHandle { param($p, $nobanner, $accepteula) }',
+            "function Get-Command { [pscustomobject]@{ Source = 'Invoke-EmptyHandle' } }",
+            args[3],
+          ].join('\n');
+          realExecFile(cmd, [...args.slice(0, 3), script], opts, cb);
+        });
+
+        await expect(win32.getFileHandles(100)).resolves.toEqual([]);
+      },
+    );
+
+    it.each(['', 'not-json', '{"not": "array"}', '[1]'])(
+      'rejects malformed query output %j instead of reporting a clean empty scan',
+      async (output) => {
+        mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+          cb(null, output);
+        });
+
+        await expect(win32.getFileHandles(100)).rejects.toThrow('handle-scan-failed');
+      },
+    );
+
+    // PR-A honesty — A1: the PS script must not fall back to loaded modules.
+    // White-box (the execFile mock can't simulate a real "binary absent" PS run,
+    // so we assert the script itself no longer contains the .Modules branch).
+    it('PS script has no .Modules / Get-Process fallback (no false-positive handles)', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => cb(null, '[]'));
+      await win32.getFileHandles(100);
+      expect(mockExecFile).toHaveBeenCalled();
+      const psScript = mockExecFile.mock.calls[0][1][3];
+      expect(psScript).not.toMatch(/Modules/);
+      expect(psScript).not.toMatch(/Get-Process/);
+    });
+
+    // PR-A honesty — A2: when read-detection is unavailable, getFileHandles must
+    // return [] WITHOUT spawning a powershell (honest zero + perf short-circuit).
+    it('returns [] without spawning when read-detection is unavailable', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => cb(null, ''));
+      await win32.probeReadDetection();
+      expect(win32.isReadDetectionAvailable()).toBe(false);
+      const callsAfterProbe = mockExecFile.mock.calls.length;
+      const result = await win32.getFileHandles(100);
+      expect(result).toEqual([]);
+      expect(mockExecFile.mock.calls.length).toBe(callsAfterProbe);
+    });
+  });
+
+  // PR-A — B: one-time startup probe drives the degraded flag honestly.
+  describe('probeReadDetection', () => {
+    it('sets readDetectionAvailable=true when a handle binary is found', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) =>
+        cb(null, 'C:\\tools\\handle64.exe\n'),
+      );
+      await win32.probeReadDetection();
+      expect(win32.isReadDetectionAvailable()).toBe(true);
+    });
+
+    it('sets readDetectionAvailable=false when no handle binary is found', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => cb(null, ''));
+      await win32.probeReadDetection();
+      expect(win32.isReadDetectionAvailable()).toBe(false);
+    });
+
+    it('sets readDetectionAvailable=false on probe error (fail honest, not optimistic)', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => cb(new Error('powershell missing')));
+      await win32.probeReadDetection();
+      expect(win32.isReadDetectionAvailable()).toBe(false);
+    });
+
+    // #2 two-flag honesty: read-detection has TWO capabilities now — the legacy
+    // handle.exe binary AND the Restart Manager. When handle.exe is ABSENT but RM
+    // is PRESENT, read-detection is AVAILABLE (via RM) and the degraded warning
+    // must NOT fire. The warning is gated by the SAME `!available` condition as
+    // this flag, so available===true proves no degraded warning was logged.
+    it('reports available (no degraded warning) when handle.exe is absent but RM works', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        const script = args[3]; // the -Command body
+        if (/AegisRm|GetHolders/.test(script))
+          cb(null, 'OK'); // RM probe succeeds
+        else cb(null, ''); // handle-binary probe: not found
+      });
+      const result = await win32.probeReadDetection();
+      expect(result.available).toBe(true);
+      expect(result.rm).toBe(true);
+      expect(result.handle).toBeNull();
+      expect(win32.isReadDetectionAvailable()).toBe(true);
+    });
+
+    it('reports unavailable (degraded) only when BOTH handle.exe and RM are absent', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        const script = args[3];
+        if (/AegisRm|GetHolders/.test(script))
+          cb(null, 'FAIL'); // RM probe fails
+        else cb(null, ''); // handle-binary probe: not found
+      });
+      const result = await win32.probeReadDetection();
+      expect(result.available).toBe(false);
+      expect(win32.isReadDetectionAvailable()).toBe(false);
+    });
+  });
+
+  describe('killProcess', () => {
+    it('uses one handle for creation-time verification and termination', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        expect(cmd).toBe('powershell.exe');
+        const script = args.at(-1);
+        expect(script).toContain('OpenProcess');
+        expect(script).toContain('GetProcessTimes');
+        expect(script).toContain('TerminateProcess($handle');
+        expect(script).toContain('CloseHandle($handle');
+        expect(script).toContain('133614736000000000');
+        cb(null, 'OK\n');
+      });
+
+      const result = await win32.killProcess(100, '133614736000000000');
+      expect(result.success).toBe(true);
+    });
+
+    it('rejects a mismatched creation time with a fixed error', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(null, 'STALE\n');
+      });
+
+      const result = await win32.killProcess(100, '133614736000000000');
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Process instance changed or is no longer observed');
+    });
+
+    it('fails closed before spawning when raw creation time is absent', async () => {
+      expect(await win32.killProcess(100)).toEqual({
+        success: false,
+        error: 'Invalid process instance',
+      });
+      expect(mockExecFile).not.toHaveBeenCalled();
+    });
+
+    it('does not expose PowerShell diagnostics on action failure', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(new Error('C:\\Private\\DiagnosticPath'));
+      });
+
+      const result = await win32.killProcess(100, '133614736000000000');
+      expect(result).toEqual({ success: false, error: 'Process control failed' });
+    });
+
+    it('does not expose a synchronous spawn failure', async () => {
+      mockExecFile.mockImplementation(() => {
+        throw new Error('C:\\Private\\DiagnosticPath');
+      });
+      expect(await win32.killProcess(100, '133614736000000000')).toEqual({
+        success: false,
+        error: 'Process control failed',
+      });
+    });
+  });
+
+  describe('suspendProcess', () => {
+    it('returns success on PowerShell success', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        expect(args.at(-1)).toContain('NtSuspendProcess($handle');
+        cb(null, 'OK\n');
+      });
+
+      const result = await win32.suspendProcess(100, '133614736000000000');
+      expect(result.success).toBe(true);
+    });
+
+    it('returns error on failure', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(new Error('Cannot suspend'));
+      });
+
+      const result = await win32.suspendProcess(100, '133614736000000000');
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('resumeProcess', () => {
+    it('returns success on PowerShell success', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        expect(args.at(-1)).toContain('NtResumeProcess($handle');
+        cb(null, 'OK\n');
+      });
+
+      const result = await win32.resumeProcess(100, '133614736000000000');
+      expect(result.success).toBe(true);
+    });
+
+    it('returns error on failure', async () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(new Error('Cannot resume'));
+      });
+
+      const result = await win32.resumeProcess(100, '133614736000000000');
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('actual CWD availability', () => {
+    it('returns null for invalid single PIDs without querying', async () => {
+      for (const pid of [0, -1, 'abc', 4294967296])
+        expect(await win32.getProcessCwd(pid)).toBeNull();
+      expect(mockExecFile).not.toHaveBeenCalled();
+    });
+    it('keeps single and batch CWD unavailable when the native provider is disabled', async () => {
+      expect(await win32.getProcessCwd(100)).toBeNull();
+      expect(await win32.getProcessCwds([100, 200])).toEqual(new Map());
+      expect(await win32.getProcessCwds([])).toEqual(new Map());
+      expect(mockExecFile).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('exports', () => {
+    it('exports all expected members', () => {
+      expect(typeof win32.listProcesses).toBe('function');
+      expect(typeof win32.getParentProcessMap).toBe('function');
+      expect(typeof win32.getRawTcpConnections).toBe('function');
+      expect(typeof win32.getFileHandles).toBe('function');
+      expect(typeof win32.getProcessCwd).toBe('function');
+      expect(typeof win32.getProcessCwds).toBe('function');
+      expect(typeof win32.killProcess).toBe('function');
+      expect(typeof win32.suspendProcess).toBe('function');
+      expect(typeof win32.resumeProcess).toBe('function');
+      expect(typeof win32.probeReadDetection).toBe('function');
+      expect(typeof win32.isReadDetectionAvailable).toBe('function');
+      expect(typeof win32.getSensitiveHolders).toBe('function');
+      expect(typeof win32.isRestartManagerAvailable).toBe('function');
+      expect(Array.isArray(win32.IGNORE_FILE_PATTERNS)).toBe(true);
+    });
+  });
+
+  // Gap F: the façade publishes the `proc-snapshot` leaf, so process-scanner no
+  // longer reaches around it with a lazy require. Everything here is asserted through
+  // win32's OWN surface — the submodule is deliberately not imported. This file
+  // overrides `Module._load`, and `vi.resetModules()` does not clear the transitive
+  // CJS cache behind it, so an ESM `import` of process-snapshot.js would hand back a
+  // DIFFERENT instance than the one win32 requires (the same CJS-vs-ESM split
+  // platform/index.test.js documents) and the comparison would prove nothing.
+  describe('getSnapshotHealth (gap F)', () => {
+    it('the façade publishes the proc-snapshot leaf', () => {
+      expect(typeof win32.getSnapshotHealth).toBe('function');
+    });
+
+    it('returns a real SensorHealth record, not a stub', () => {
+      const rec = win32.getSnapshotHealth();
+      expect(rec.sensorId).toBe('proc-snapshot');
+      expect(['STARTING', 'HEALTHY', 'DEGRADED', 'FAILED', 'DISABLED', 'UNSUPPORTED']).toContain(
+        rec.state,
+      );
+      expect(typeof rec.lossCount).toBe('number');
+      expect(rec).toHaveProperty('lastSuccessAt');
+    });
+
+    it('reports the live leaf, not a value captured when the façade was built', async () => {
+      // A plain function reference reads the submodule's live binding, so each call
+      // returns a fresh plain record that reflects the most recent pass. Replacing the
+      // export with a value taken at export time reds both assertions below.
+      const before = win32.getSnapshotHealth();
+      expect(win32.getSnapshotHealth()).not.toBe(before);
+
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        cb(new Error('provider down'));
+      });
+      await win32.getParentProcessMap();
+
+      const after = win32.getSnapshotHealth();
+      expect(typeof after.lastAttemptAt).toBe('number');
+      expect(after.state).not.toBe('STARTING');
+    });
+  });
+});

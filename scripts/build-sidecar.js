@@ -1,0 +1,307 @@
+/**
+ * @file scripts/build-sidecar.js
+ * @description Compile the Windows process-snapshot, resource-counter, observer,
+ *   and MCP Job helpers with the inbox C# compiler.
+ *
+ *   `csc.exe` under `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319` is present on
+ *   every Windows 10 1903+ and Windows 11 machine, and .NET Framework 4.8 is inbox
+ *   there too. That is the whole reason for the language choice: no SDK to install
+ *   for whoever builds, no runtime to install for whoever runs. The cost is a C# 5
+ *   era compiler — no string interpolation, no `out var`, no tuples — and no
+ *   System.Text.Json, which is why the sidecar serialises by hand.
+ *
+ *   Failing loudly matters more than succeeding quietly here: a silent skip would
+ *   ship an installer with no sidecar in it, and the app would fall back to the CIM
+ *   observation forever while every test stayed green.
+ *
+ *   Usage: npm run build:sidecar
+ */
+'use strict';
+
+const { execFileSync } = require('child_process');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+const ROOT = path.resolve(__dirname, '..');
+const SOURCE_DIR = path.join(ROOT, 'sidecar', 'procsnap');
+const OUT_DIR = path.join(ROOT, 'build', 'sidecar');
+const OUT_EXE = path.join(OUT_DIR, 'aegis-procsnap.exe');
+const SOURCES = ['Program.cs', 'NtSnapshot.cs', 'Json.cs'];
+
+/**
+ * @returns {string} path to csc.exe
+ * @throws {Error} when this is not a Windows machine with the inbox compiler.
+ */
+function findCsc() {
+  if (process.platform !== 'win32') {
+    throw new Error(
+      'The sidecars are Windows binaries and build on Windows only. ' +
+        'This is not an error on Linux CI — nothing there needs it.',
+    );
+  }
+  const windir = process.env.WINDIR || 'C:\\Windows';
+  const candidates = [
+    path.join(windir, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
+    path.join(windir, 'Microsoft.NET', 'Framework', 'v4.0.30319', 'csc.exe'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  throw new Error(
+    'No inbox C# compiler found. Looked in:\n  ' +
+      candidates.join('\n  ') +
+      '\nInstall the .NET Framework 4.x developer files, or build the sources in ' +
+      'sidecar/procsnap with `dotnet build` targeting net48 — the wire contract does ' +
+      'not care which compiler produced the binary.',
+  );
+}
+
+function main() {
+  const csc = findCsc();
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+
+  const sources = SOURCES.map((name) => {
+    const file = path.join(SOURCE_DIR, name);
+    if (!fs.existsSync(file)) throw new Error(`missing sidecar source: ${file}`);
+    return file;
+  });
+
+  // /platform:x64 is not cosmetic: the struct offsets the sidecar reads are the
+  // 64-bit layout of SYSTEM_PROCESS_INFORMATION, and a 32-bit process would read
+  // them wrong. The startup probe would catch it, but failing at build time is
+  // cheaper than failing at run time.
+  const args = [
+    '/nologo',
+    '/target:exe',
+    '/platform:x64',
+    '/optimize+',
+    '/warnaserror+',
+    `/out:${OUT_EXE}`,
+    ...sources,
+  ];
+  execFileSync(csc, args, { stdio: 'inherit' });
+
+  const resourceExe = path.join(OUT_DIR, 'aegis-resources.exe');
+  execFileSync(
+    csc,
+    [
+      '/nologo',
+      '/target:exe',
+      '/platform:x64',
+      '/optimize+',
+      '/warnaserror+',
+      '/reference:System.Management.dll',
+      `/out:${resourceExe}`,
+      path.join(ROOT, 'sidecar', 'resources', 'Program.cs'),
+    ],
+    { stdio: 'inherit' },
+  );
+  console.log(`built  ${resourceExe}`);
+
+  // Compile the exact existing RM implementation; keep fallback and helper in sync.
+  const rmSource = path.join(OUT_DIR, 'Rm.generated.cs');
+  fs.writeFileSync(rmSource, require('../src/main/platform/rm-csharp').RM_CSHARP);
+  const observerExe = path.join(OUT_DIR, 'aegis-observer.exe');
+  try {
+    execFileSync(
+      csc,
+      [
+        '/nologo',
+        '/target:exe',
+        '/platform:x64',
+        '/optimize+',
+        '/warnaserror+',
+        '/reference:System.Management.dll',
+        '/reference:System.Web.Extensions.dll',
+        `/out:${observerExe}`,
+        path.join(ROOT, 'sidecar', 'observer', 'Program.cs'),
+        path.join(ROOT, 'sidecar', 'observer', 'ClaudeSession.cs'),
+        rmSource,
+      ],
+      { stdio: 'inherit' },
+    );
+  } finally {
+    fs.unlinkSync(rmSource);
+  }
+  console.log(`built  ${observerExe}`);
+
+  // The stdio MCP gateway fails closed when this exact helper is absent.
+  const mcpJobExe = path.join(OUT_DIR, 'aegis-mcpjob.exe');
+  execFileSync(
+    csc,
+    [
+      '/nologo',
+      '/target:exe',
+      '/platform:x64',
+      '/optimize+',
+      '/warnaserror+',
+      '/reference:System.Web.Extensions.dll',
+      `/out:${mcpJobExe}`,
+      path.join(ROOT, 'sidecar', 'mcpjob', 'Program.cs'),
+      path.join(ROOT, 'sidecar', 'mcpjob', 'Native.cs'),
+      path.join(ROOT, 'sidecar', 'mcpjob', 'AppContainerProfile.cs'),
+      path.join(ROOT, 'sidecar', 'mcpjob', 'AppContainerWorkspace.cs'),
+      path.join(ROOT, 'sidecar', 'mcpjob', 'AppContainerWorkspaceInventory.cs'),
+      path.join(ROOT, 'sidecar', 'mcpjob', 'AppContainerInput.cs'),
+      path.join(ROOT, 'sidecar', 'mcpjob', 'AppContainerExecutable.cs'),
+    ],
+    { stdio: 'inherit' },
+  );
+  console.log(`built  ${mcpJobExe}`);
+
+  // Explicit selected-delete console broker; missing assets must fail packaging.
+  const ownerConsoleExe = path.join(OUT_DIR, 'aegis-owner-console.exe');
+  execFileSync(
+    csc,
+    [
+      '/nologo',
+      '/target:exe',
+      '/platform:x64',
+      '/optimize+',
+      '/warnaserror+',
+      `/out:${ownerConsoleExe}`,
+      ...[
+        'Program.cs',
+        'NativeLaunch.cs',
+        'PrivatePipe.cs',
+        'ProfileIsolation.cs',
+        'PeerIdentity.cs',
+        'ConsoleWorker.cs',
+        'Wire.cs',
+        'Authentication.cs',
+        'OwnerSession.cs',
+        'VerifierSession.cs',
+        'WorkerHost.cs',
+      ].map((name) => path.join(ROOT, 'sidecar', 'owner-console', name)),
+    ],
+    { stdio: 'inherit' },
+  );
+  console.log(`built  ${ownerConsoleExe}`);
+
+  // The separate session helper probes/refuses and inspects enrollment read-only.
+  const sessionExe = path.join(OUT_DIR, 'aegis-session.exe');
+  execFileSync(
+    csc,
+    [
+      '/nologo',
+      '/target:exe',
+      '/platform:x64',
+      '/optimize+',
+      '/warnaserror+',
+      `/out:${sessionExe}`,
+      '/reference:System.Management.dll',
+      path.join(ROOT, 'sidecar', 'session', 'Program.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'Protocol.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'EnrollmentNative.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'EnrollmentInspection.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'EnrollmentLease.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerNative.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerIdentity.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerRegistration.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'MainRegistrationEvidence.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerMainOperation.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerAdmission.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerEndpointNative.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerEndpoint.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerLauncher.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerLauncherNative.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerSession.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerBootstrap.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerBootstrapInput.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'CallerBootstrapFrame.cs'),
+      ...[
+        'InstalledOwnerPolicy',
+        'InstalledOwnerNative',
+        'InstalledOwnerService',
+        'InstalledOwnerBootstrap',
+        'InstalledOwnerRegistration',
+        'InstalledJobInventory',
+        'InstalledOwnerFiles',
+        'InstalledOwnerSession',
+        'InstalledFixedOperationRegistration',
+        'InstalledInspectionAuthorization',
+        'InstalledVmRegistration',
+        'InstalledVmInspection',
+        'InstalledRuntimeCandidate',
+        'RuntimeCandidateCodec',
+        'VmConfigurationObservation',
+        'VmConfigurationProfile',
+        'VmConfigurationRead',
+        'VmConfigurationNative',
+        'VmStorageInspection',
+        'VmStorageProtection',
+        'VmDiskImageNative',
+        'VmStorageNative',
+        'ProtectedOperationRecord',
+        'ProtectedOperationState',
+        'ProtectedJournalRegistration',
+        'ProtectedJournalNative',
+        'ProtectedJournalLease',
+        'InstalledJournalIssuer',
+        'HvSocketEndpoint',
+        'HvSocketNative',
+        'HvSocketTransport',
+      ].map((name) => path.join(ROOT, 'sidecar', 'session', `${name}.cs`)),
+      '/reference:System.Security.dll',
+      path.join(ROOT, 'sidecar', 'mcpjob', 'AppContainerExecutable.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'GuestJobNative.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'GuestJobInventory.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'OwnedVmLifecycle.cs'),
+      path.join(ROOT, 'sidecar', 'session', 'VmManagementNative.cs'),
+    ],
+    { stdio: 'inherit' },
+  );
+  console.log(`built  ${sessionExe}`);
+
+  // SCM owner and the Session-0 fixed controller share the maintained native guards.
+  const ownerSources = fs
+    .readdirSync(path.join(ROOT, 'sidecar', 'session'))
+    .filter((name) => name.endsWith('.cs') && name !== 'Program.cs')
+    .sort()
+    .map((name) => path.join(ROOT, 'sidecar', 'session', name));
+  ownerSources.push(path.join(ROOT, 'sidecar', 'mcpjob', 'AppContainerExecutable.cs'));
+  const ownedSources = fs
+    .readdirSync(path.join(ROOT, 'sidecar', 'owner'))
+    .filter((name) => name.endsWith('.cs'))
+    .sort()
+    .map((name) => path.join(ROOT, 'sidecar', 'owner', name));
+  for (const [filename, entrypoint] of [
+    ['aegis-owner.exe', 'Aegis.InstalledOwner.OwnerProgram'],
+    ['aegis-main.exe', 'Aegis.InstalledOwner.InstalledOwnerMain'],
+  ]) {
+    const output = path.join(OUT_DIR, filename);
+    execFileSync(
+      csc,
+      [
+        '/nologo',
+        '/target:exe',
+        '/platform:x64',
+        '/optimize+',
+        '/warnaserror+',
+        '/reference:System.Management.dll',
+        '/reference:System.Security.dll',
+        `/main:${entrypoint}`,
+        `/out:${output}`,
+        ...ownerSources,
+        ...ownedSources,
+      ],
+      { stdio: 'inherit' },
+    );
+    console.log(`built  ${output}`);
+  }
+
+  const bytes = fs.readFileSync(OUT_EXE);
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+  console.log(`built  ${OUT_EXE}`);
+  console.log(`bytes  ${bytes.length}`);
+  console.log(`sha256 ${sha256}`);
+  console.log(`csc    ${csc}`);
+}
+
+try {
+  main();
+} catch (err) {
+  console.error(`build-sidecar: ${err.message}`);
+  process.exit(1);
+}

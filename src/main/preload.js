@@ -1,0 +1,160 @@
+/**
+ * @file preload.js
+ * @module preload
+ * @description Secure IPC bridge exposing window.aegis API to the renderer process via contextBridge
+ * @requires electron
+ * @author AEGIS Contributors
+ * @license MIT
+ * @version 0.1.0
+ */
+
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('aegis', {
+  localSecurityReview: (request) => ipcRenderer.invoke('local-security:review', request),
+  getStats: () => ipcRenderer.invoke('get-stats'),
+  explainToolContext: (eventId) => ipcRenderer.invoke('tool-context:explain', eventId),
+  reviewClaudeHookProfile: (action) => ipcRenderer.invoke('claude-hook:review', action),
+  reviewGeminiHookProfile: (action) => ipcRenderer.invoke('gemini-hook:review', action),
+  controlProjectWatch: (action) => ipcRenderer.invoke('project-watch:control', action),
+  controlFileReads: (request) => ipcRenderer.invoke('file-reads:control', request),
+  quitApp: (confirmed) => ipcRenderer.invoke('app:quit', confirmed),
+  listSensitiveAlerts: () => ipcRenderer.invoke('sensitive-alerts:list'),
+  setSensitiveAlertReviewed: (eventId, reviewed) =>
+    ipcRenderer.invoke('sensitive-alerts:set-reviewed', eventId, reviewed),
+  getResourceUsage: () => ipcRenderer.invoke('get-resource-usage'),
+  exportLog: () => ipcRenderer.invoke('export-log'),
+  exportCsv: () => ipcRenderer.invoke('export-csv'),
+  generateReport: () => ipcRenderer.invoke('generate-report'),
+  getSettings: () => ipcRenderer.invoke('get-settings'),
+  getUpdateStatus: () => ipcRenderer.invoke('updates:status'),
+  checkForUpdates: () => ipcRenderer.invoke('updates:check'),
+  downloadUpdate: () => ipcRenderer.invoke('updates:download'),
+  installUpdate: () => ipcRenderer.invoke('updates:install'),
+  onUpdateStatus: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('updates:status', handler);
+    return () => ipcRenderer.removeListener('updates:status', handler);
+  },
+  saveSettings: (s, options) => ipcRenderer.invoke('save-settings', s, options),
+  analyzeAgent: (name) => ipcRenderer.invoke('analyze-agent', name),
+  analyzeSession: () => ipcRenderer.invoke('analyze-session'),
+  openThreatReport: (data) => ipcRenderer.invoke('open-threat-report', data),
+  getAllPermissions: () => ipcRenderer.invoke('get-all-permissions'),
+  saveAgentPermissions: (permMap) => ipcRenderer.invoke('save-agent-permissions', permMap),
+  saveInstancePermissions: (data) => ipcRenderer.invoke('save-instance-permissions', data),
+  resetPermissionsToDefaults: () => ipcRenderer.invoke('reset-permissions-to-defaults'),
+  onFileAccess: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('file-access', handler);
+    return () => ipcRenderer.removeListener('file-access', handler);
+  },
+  onStatsUpdate: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('stats-update', handler);
+    return () => ipcRenderer.removeListener('stats-update', handler);
+  },
+  onNetworkUpdate: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('network-update', handler);
+    return () => ipcRenderer.removeListener('network-update', handler);
+  },
+  onToggleTheme: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on('toggle-theme', handler);
+    return () => ipcRenderer.removeListener('toggle-theme', handler);
+  },
+  getAgentDatabase: () => ipcRenderer.invoke('get-agent-database'),
+  onNavigateView: (cb) => {
+    const handler = (_e, view) => {
+      if (view === 'settings') cb(view);
+    };
+    ipcRenderer.on('navigate-view', handler);
+    return () => ipcRenderer.removeListener('navigate-view', handler);
+  },
+  killProcess: (pid) => ipcRenderer.invoke('kill-process', pid),
+  suspendProcess: (pid) => ipcRenderer.invoke('suspend-process', pid),
+  resumeProcess: (pid) => ipcRenderer.invoke('resume-process', pid),
+  getCustomAgents: () => ipcRenderer.invoke('get-custom-agents'),
+  saveCustomAgents: (agents) => ipcRenderer.invoke('save-custom-agents', agents),
+  exportAgentDatabase: () => ipcRenderer.invoke('export-agent-database'),
+  importAgentDatabase: () => ipcRenderer.invoke('import-agent-database'),
+  getAuditStats: () => ipcRenderer.invoke('get-audit-stats'),
+  getAuditCustodyRevision: () => ipcRenderer.invoke('audit:custody-revision'),
+  onAuditCustodyRevision: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('audit:custody-revision', handler);
+    return () => ipcRenderer.removeListener('audit:custody-revision', handler);
+  },
+  reviewAuditIntegrity: (date) => ipcRenderer.invoke('audit:review-integrity', date),
+  getAuditEntriesBefore: (beforeTs, limit, types, boundaryOffset) =>
+    ipcRenderer.invoke('get-audit-entries-before', beforeTs, limit, types, boundaryOffset),
+  openAuditLogDir: () => ipcRenderer.invoke('open-audit-log-dir'),
+  exportFullAudit: () => ipcRenderer.invoke('export-full-audit'),
+  testNotification: () => ipcRenderer.invoke('test-notification'),
+  exportConfig: () => ipcRenderer.invoke('export-config'),
+  importConfig: () => ipcRenderer.invoke('import-config'),
+  revealInExplorer: (filePath) => ipcRenderer.invoke('reveal-in-explorer', filePath),
+  getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+  exportZip: () => ipcRenderer.invoke('export-zip'),
+  getFalsePositives: () => ipcRenderer.invoke('get-false-positives'),
+  addFalsePositive: (entry) => ipcRenderer.invoke('add-false-positive', entry),
+  openExternalUrl: (url) => ipcRenderer.invoke('open-external-url', url),
+  getRules: () => ipcRenderer.invoke('rules:getAll'),
+  reloadRules: () => ipcRenderer.invoke('rules:reload'),
+  setRuleEnabled: (id, enabled) => ipcRenderer.invoke('rules:setEnabled', id, enabled),
+  onRulesReloaded: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('rules:reloaded', handler);
+    return () => ipcRenderer.removeListener('rules:reloaded', handler);
+  },
+  onScanBatch: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('scan-batch', handler);
+    return () => ipcRenderer.removeListener('scan-batch', handler);
+  },
+  onScanStatus: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('scan-status', handler);
+    return () => ipcRenderer.removeListener('scan-status', handler);
+  },
+  // ── Per-agent resource usage + token costs (main → renderer push) ──
+  // `agent-resource-usage` carries the MONITORED AGENTS' load, keyed by instanceId.
+  // AEGIS's own load is a different measurement and travels separately, via
+  // `get-resource-usage` and the `resourceUsage` field of `scan-batch`.
+  onAgentResourceUsage: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('agent-resource-usage', handler);
+    return () => ipcRenderer.removeListener('agent-resource-usage', handler);
+  },
+  onTokenCosts: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('token-costs', handler);
+    return () => ipcRenderer.removeListener('token-costs', handler);
+  },
+  // ── Alert-only agent watchlist (renderer → main invoke) ──
+  blocklistAdd: (entry) => ipcRenderer.invoke('blocklist-add', entry),
+  blocklistRemove: (entry) => ipcRenderer.invoke('blocklist-remove', entry),
+  blocklistList: () => ipcRenderer.invoke('blocklist-list'),
+
+  // ── AI Agent Security, Intelligence & Control Platform ──
+  getPlatformOverview: () => ipcRenderer.invoke('platform:overview'),
+  listConnectors: () => ipcRenderer.invoke('connectors:list'),
+  listScanners: () => ipcRenderer.invoke('scanner:list'),
+  executeScan: (scannerId, targetPath, options) => ipcRenderer.invoke('scanner:execute', scannerId, targetPath, options),
+  getScanHistory: (limit) => ipcRenderer.invoke('scanner:history', limit),
+  runCodeReview: (options) => ipcRenderer.invoke('code-review:run', options),
+  listCodeReviews: (limit) => ipcRenderer.invoke('code-review:list', limit),
+  getCodeReview: (id) => ipcRenderer.invoke('code-review:get', id),
+  runAIInvestigation: (params) => ipcRenderer.invoke('ai:investigate', params),
+  listAIInvestigations: (limit) => ipcRenderer.invoke('ai:investigations-list', limit),
+  listIncidents: () => ipcRenderer.invoke('incidents:list'),
+  listFindings: (filters) => ipcRenderer.invoke('findings:list', filters),
+  updateFindingStatus: (id, status) => ipcRenderer.invoke('findings:update-status', id, status),
+  listPolicies: () => ipcRenderer.invoke('policies:list'),
+  addPolicy: (policy) => ipcRenderer.invoke('policies:add', policy),
+  resolvePolicyApproval: (approvalId, approved) => ipcRenderer.invoke('policies:resolve-approval', approvalId, approved),
+  proposeRemediation: (params) => ipcRenderer.invoke('remediation:propose', params),
+  applyRemediation: (proposalId) => ipcRenderer.invoke('remediation:apply', proposalId),
+  rollbackRemediation: (proposalId) => ipcRenderer.invoke('remediation:rollback', proposalId),
+});

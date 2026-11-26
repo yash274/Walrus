@@ -1,0 +1,176 @@
+# Kernel-File measurement probe
+
+Standalone Windows B1 experiment for provider
+`edd08927-9cc4-4e65-b970-c2560fb5c289`. It is not wired into AEGIS or its installer.
+Requires .NET 10 SDK to build, .NET 10 runtime to run. TraceEvent is pinned to 3.2.6.
+
+From the repository in a **normal terminal**:
+
+```powershell
+dotnet build sidecar/etw-probe/EtwProbe.csproj -c Release
+sidecar/etw-probe/bin/Release/net10.0-windows/EtwProbe.exe self-test
+sidecar/etw-probe/bin/Release/net10.0-windows/EtwProbe.exe fixture-check X:/tmp/aegis-etw-fixtures-new
+sidecar/etw-probe/bin/Release/net10.0-windows/EtwProbe.exe preflight X:/tmp/aegis-etw-preflight-new
+```
+
+Use new output directories each time. Preflight reads registered TDH metadata and
+OS version/edition without starting ETW. Fixture-check exercises six synthetic
+workloads and the ready/go/done/save protocol without elevation.
+
+Then, in **PowerShell as administrator**, run the already-built probe:
+
+```powershell
+& 'X:/Future/ESCAPE/AEGIS/sidecar/etw-probe/Run-Matrix.ps1' -OutputRoot 'X:/tmp/aegis-etw-matrix-20260908'
+```
+
+The eleven short runs take roughly two minutes, depending on session startup and
+drain time. The runner does not install packages, rebuild, change tracing policy,
+request elevation or stop other trace sessions. Each capture has a unique session
+name, two child processes and its own newly created synthetic 1 MiB files. Ctrl+C
+stops the owned session and children through the probe's cleanup path. If a process
+is forcibly terminated, inspect the exact GUID session name in `run.json` before
+manually stopping that session; never stop all ETW sessions.
+
+## Experiments and artifacts
+
+For the repeated load study, run this from a **normal terminal** (not administrator):
+
+```powershell
+& 'X:/Future/ESCAPE/AEGIS/sidecar/etw-probe/bin/Release/net10.0-windows/EtwProbe.exe' study 'X:/tmp/aegis-etw-load-20260908'
+```
+
+Accept one Windows UAC prompt for the collector. The normal coordinator runs three
+repetitions of idle, `npm --version`, and `npm run build:renderer`, rotating their
+order. Each ETW capture lasts 15 seconds plus drain, with mask 0x1B0, IDs
+10/12/13/14/15, no PID filter, close eviction and 64 MiB requested buffering.
+Expect roughly three to five minutes. Node and its npm CLI must already be on PATH;
+the probe must be built in this repository. npm measures CLI startup, not install.
+Renderer builds rewrite `dist/renderer`; no dependencies are installed or updated.
+
+The elevated child accepts no workload commands and only runs fixed capture options.
+It publishes `capture-ready.json` after enabling ETW and `capture-stopped.json` after
+stopping. The coordinator then writes `workload.json` with normal-token state, QPC
+intervals and exit codes, followed by `workload-done.json`. The next capture waits
+for that acknowledgement so a slow final build cannot spill into it. The last
+command may extend beyond its own capture window; preserve its recorded interval
+when interpreting rates. Marker polling contributes to the measured background.
+
+`study.json` records the plan, simulation flag, Node/npm versions and QPC frequency;
+`matrix.json` records collector outcomes. Workload output is drained and discarded.
+Failures create separate workload/collector failure records. Ctrl+C requests abort
+and stops the owned normal workload tree; the elevated collector polls that signal
+every 250 ms and cancels its active capture through session cleanup. A missing acknowledgement times out after 90 seconds;
+the trace has already stopped while awaiting it. Failed/incomplete studies must not
+be treated as nine successful load measurements.
+
+Development verification without UAC or ETW:
+
+```powershell
+sidecar/etw-probe/bin/Release/net10.0-windows/EtwProbe.exe study-check X:/tmp/aegis-etw-study-check-new
+```
+
+This runs real normal-user npm/build commands against a simulated collector, plus
+an extra idle interval after the build, and asserts the recorded protocol ordering.
+Its `simulation: true` artifacts are not live measurements. Existing CI does not
+build or run this standalone Windows probe.
+
+## Buffer comparison and sustained capture
+
+From a **normal PowerShell terminal**, run:
+
+```powershell
+& 'X:/Future/ESCAPE/AEGIS/sidecar/etw-probe/bin/Release/net10.0-windows/EtwProbe.exe' tune 'X:/tmp/aegis-etw-tune-20260908'
+```
+
+One UAC prompt starts the fixed collector. Expect about 13–15 minutes. First, nine
+15-second npm CLI captures compare requested buffers of 64, 32 and 16 MiB three
+times each, rotating their positions. Mask, IDs, workload and eviction stay fixed.
+Then one continuous ten-minute session uses the 16 MiB stress candidate while the
+normal coordinator cycles idle, npm CLI and renderer builds in one-minute phases.
+This preset does not select a production buffer size automatically. A command may
+finish after a phase boundary; `workload.json` retains its kind and QPC interval.
+The final idle phase provides a short recovery observation without forcing GC.
+
+`resources.json` records current working set, private bytes, managed live bytes,
+GC committed bytes, generation-2 collection count and native session loss counters
+every five seconds, plus initial/final observations. These samples are kept in
+memory and written after stop, capped at 200. The sampler stops before the ETW
+session. Missing metrics, unavailable counters, observed losses or sample overflow
+mark the run degraded. Final-stop losses remain outside the measured interval.
+
+Use actual buffer counts/sizes from native queries, not just the requested MiB.
+Working set, private allocation and GC memory are different quantities; do not sum
+them. `collectorPeakWorkingSetBytes` is still a process-lifetime high-water mark
+across the entire study, so it cannot establish growth or recovery by itself.
+The new timer/query cost is included in collector CPU; the 64 MiB comparison runs
+provide a baseline with the same instrumentation. Ten minutes on this host cannot
+prove leak freedom or universal buffer sufficiency. The idle fixture actors also
+do not stress the candidate path map with a large agent population.
+
+`tune-check <new-directory>` runs the rotated plan with short simulated captures,
+a six-second cycle and a following idle interval. It executes real normal-user
+npm/build workloads and verifies the protocol without elevation or ETW. Direct
+capture durations are bounded to 5–900 seconds; actor ledgers retain at most 5,000
+operation samples and expose omissions.
+
+`Run-Matrix.ps1` compares READ-only, names/read, lifecycle, target-PID filtering,
+preopened handles, asynchronous reads, warm mapped reads and three churn eviction
+policies. These are candidate configurations, not a ratified minimal set.
+Every comparison gets a fresh map and two separate actors: target and control.
+The PID-filter run requests only the target PID; compare control delivery against
+the unfiltered lifecycle run. Zero delivery alone does not prove filtering works.
+
+Each run retains:
+
+- `environment.json`, registered `kernel-file.manifest.xml`, and `run.json` with
+  options, owned session name and actor PIDs.
+- `events.json`: bounded selected samples, raw QPC plus relative milliseconds,
+  header PID/TID, payload TID, optional live thread-owner lookup, opaque per-run
+  pointer aliases and fixture-relative candidate path evidence.
+- `schemas.json`: delivered event IDs/versions and field names, without values.
+- `resources.json`: bounded time-series memory, GC and session-counter observations.
+- `summary.json`: all delivered provider event counts, decode/retention/map losses,
+  collector CPU milliseconds, lifetime peak working set, collection duration and
+  native session loss/buffer counters queried before stop.
+- Actor `*-operations.json`: successful API operations, QPC intervals, caller TIDs
+  and byte counts. Ledgers are written only after the parent stops ETW.
+
+Exit 0 means collection completed without the reported degradation conditions; it
+does **not** prove Read coverage, correct identity or adequate configuration.
+Exit 5 retains degraded measurements; 3 means the wrong elevation level; 2 means failure
+(type/HRESULT only). An unavailable counter is null, never a measured zero.
+
+The fixture files and selected metadata are retained; no raw ETL is persisted.
+Callbacks see machine-wide events when unfiltered, but persist no unrelated path
+values, command lines, file contents or raw kernel pointer values. Path matching
+accepts only exact target/control fixture paths; unsupported device/SUBST/UNC
+translations stay unresolved. Aggregate counts include unrelated activity.
+
+## Interpretation limits
+
+The ledger witnesses application API completion, not a one-to-one oracle for event
+15 emission. Async continuation TID can differ from the issuing TID. Header PID
+is not declared authoritative. `ThreadOwnerAtCallback` queries the live thread
+table and can race thread exit/reuse; it is a separate observation, not event-time
+identity. Selected samples can omit a read with both unknown path and non-actor
+header PID; global event counts still include it. Therefore this harness alone
+cannot prove absence or settle authoritative issuer attribution.
+
+Object/key maps are experimental. Rebinding to an unrelated observed name
+invalidates fixture evidence; disagreements remain conflicts. Dropped naming
+events can still leave stale associations. Maps and samples are capped and report
+overflow. Close/cleanup/no-eviction runs do not constitute a lifecycle proof.
+
+QPC values use the same host clock as `Stopwatch.GetTimestamp`; convert differences
+with `stopwatchFrequency` from the environment record. Collection duration includes
+startup after enabling and one second of tail drain. CPU measures the collector
+over that interval, excludes provider-wide kernel cost, and includes callback
+thread queries. Peak working set is the collector process lifetime peak.
+Loss is queried before stopping: final drain/stop losses are not measured.
+
+Warm buffered or mapped reads do not prove Fast I/O, cold page faults or coverage
+of every mapping path. For npm/build load, run a 30-second idle capture manually
+while running a known project workload in a separate **normal** terminal; record
+its duration and command separately. Do not run project build scripts elevated.
+Repeat representative runs at least three times and on Home, Pro and Hyper-V
+targets before generalizing. See the [evidence checklist](../../docs/recon/kernel-file-etw-measurements.md).

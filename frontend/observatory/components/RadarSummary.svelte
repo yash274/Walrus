@@ -1,0 +1,63 @@
+<script lang="ts">
+  import { t } from '../runtime/i18n';
+
+  import { riskBand, type RadarGroup } from '../runtime/radar';
+  import AgentLogo from './AgentLogo.svelte';
+  import Icon from './Icon.svelte';
+  let {
+    group,
+    ordinal,
+    selected,
+    active,
+    select,
+    clearSelection,
+  }: {
+    group: RadarGroup;
+    ordinal: number;
+    selected: string | null;
+    active?: boolean;
+    select: (_group: RadarGroup) => void;
+    clearSelection: () => void;
+  } = $props();
+  let chosen = $derived(
+    active ?? group.members.some((a) => !!selected && a.instanceId === selected),
+  );
+</script>
+
+<button
+  class="radar-agent-card"
+  aria-pressed={chosen}
+  onclick={() => select(group)}
+  onkeydown={(event) => {
+    if (event.key === 'Escape') clearSelection();
+  }}
+>
+  <span class="roster-number" aria-hidden="true">{ordinal}</span>
+  <AgentLogo id={group.key} name={group.name} size={24} />
+  <span class="roster-identity"
+    ><strong>{group.name}</strong><small
+      >{group.members.length} {group.members.length === 1 ? $t('process') : $t('processes')}</small
+    ></span
+  >
+  <span class={`roster-risk ${riskBand(group.risk)}`} title={$t('Highest process risk')}
+    >{group.risk}<small>{$t('risk')}</small></span
+  >
+  <Icon name="chevron" />
+</button>
+
+<style>
+  button.radar-agent-card {
+    min-height: 52px;
+    padding: var(--space-2) var(--panel-inset);
+    transition:
+      background-color var(--motion-fast) var(--ease-standard),
+      border-color var(--motion-fast) var(--ease-standard);
+  }
+  button.radar-agent-card[aria-pressed='true'] {
+    box-shadow: none;
+    border-color: var(--ink);
+  }
+  button.radar-agent-card:focus-visible {
+    transition: none;
+  }
+</style>

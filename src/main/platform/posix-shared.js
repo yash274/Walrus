@@ -1,0 +1,292 @@
+/**
+ * @file platform/posix-shared.js
+ * @description Shared POSIX utilities used by both darwin.js and linux.js.
+ * @since v0.3.0
+ */
+'use strict';
+
+const { execFile: _origExecFile } = require('child_process');
+const { isIP } = require('net');
+
+let _execFile = _origExecFile;
+/** @internal Override execFile (for tests). */
+function _setExecFileForTest(fn) {
+  _execFile = fn || _origExecFile;
+}
+
+/**
+ * Validate that pid is a positive integer.
+ * @param {unknown} pid
+ * @returns {boolean}
+ */
+function isValidPid(pid) {
+  const n = Number(pid);
+  return Number.isInteger(n) && n > 0;
+}
+
+/**
+ * Parse a textual PID token from parser output.
+ * Accepts only strings of decimal digits that represent a positive safe integer.
+ * Returns null for empty strings, strings with non-digit characters (including a leading
+ * minus sign), zero, and values outside the safe-integer range.
+ * @param {string} t
+ * @returns {number|null}
+ */
+function parsePidToken(t) {
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * Parse `ps -axo comm=,pid=` output into an array of {name, pid} objects.
+ * Extracts basename from full path. Does NOT handle OS-specific
+ * bundle formats (.app) — callers add that post-processing.
+ * @param {string} stdout - raw ps output
+ * @returns {Array<{name: string, pid: number}>}
+ * @since v0.6.0
+ */
+function parsePsOutput(stdout) {
+  const results = [];
+  const lines = stdout.trim().split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // pid is the last whitespace-separated token
+    const lastSpace = trimmed.lastIndexOf(' ');
+    if (lastSpace === -1) continue;
+    const comm = trimmed.slice(0, lastSpace).trim();
+    if (!comm) continue;
+    const pid = parsePidToken(trimmed.slice(lastSpace + 1));
+    if (pid === null) continue;
+    // Extract basename from full path
+    let name = comm;
+    const slashIdx = name.lastIndexOf('/');
+    if (slashIdx !== -1) name = name.slice(slashIdx + 1);
+    results.push({ name, pid });
+  }
+  return results;
+}
+
+/**
+ * Parse a numeric TCP endpoint emitted by ss/lsof, keeping IPv6 scope identifiers.
+ * Unavailable or malformed endpoints return null rather than a synthetic identity.
+ * @param {string} endpoint
+ * @returns {{ip: string, port: number}|null}
+ * @since v0.14.1
+ */
+function parseTcpEndpoint(endpoint) {
+  const lastColon = endpoint.lastIndexOf(':');
+  if (lastColon < 1) return null;
+  const host = endpoint.slice(0, lastColon);
+  const ip = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  const portText = endpoint.slice(lastColon + 1);
+  const port = Number(portText);
+  if (!isIP(ip) || !/^\d+$/.test(portText) || port < 1 || port > 65535) return null;
+  return { ip, port };
+}
+
+/**
+ * Parse lsof TCP output with per-file state and both endpoints.
+ * @param {string} stdout
+ * @param {Set<number>} pidSet
+ * @returns {import("../../shared/types/process").RawTcpConnection[]}
+ * @since v0.14.1
+ */
+function parseLsofOutput(stdout, pidSet) {
+  const results = [];
+  let currentPid = null;
+  let currentSocket = null;
+
+  for (const line of stdout.split('\n')) {
+    if (!line) continue;
+    const code = line[0];
+    const value = line.slice(1);
+    if (code === 'p') {
+      // An invalid p record clears the context so subsequent n/T records are not
+      // attributed to a previous valid PID or a partially parsed one.
+      currentPid = parsePidToken(value);
+      currentSocket = null;
+    } else if (code === 'f') {
+      currentSocket = null;
+    } else if (code === 'n') {
+      // Reset even for excluded sockets: their following TST must not mutate the
+      // most recent accepted socket of this PID.
+      currentSocket = null;
+      if (!pidSet.has(currentPid)) continue;
+      const arrow = value.indexOf('->');
+      if (arrow === -1) continue;
+      const remote = parseTcpEndpoint(value.slice(arrow + 2));
+      if (!remote) continue;
+      const { ip, port } = remote;
+      if (ip === '127.0.0.1' || ip === '::1' || ip === '0.0.0.0' || ip === '::') continue;
+      const local = parseTcpEndpoint(value.slice(0, arrow));
+      currentSocket = {
+        pid: currentPid,
+        ip,
+        port,
+        localIp: local?.ip ?? null,
+        localPort: local?.port ?? null,
+        state: 'Established',
+      };
+      results.push(currentSocket);
+    } else if (code === 'T' && value.startsWith('ST=') && currentSocket) {
+      currentSocket.state = value.slice(3);
+    }
+  }
+  return results;
+}
+
+/**
+ * Get file handles for a process via `lsof -p PID -F n`.
+ * @param {number} pid
+ * @returns {Promise<string[]>}
+ */
+function parseLsofFileHandles(pid) {
+  pid = Number(pid);
+  if (!isValidPid(pid)) return Promise.resolve([]);
+  return new Promise((resolve, reject) => {
+    _execFile(
+      'lsof',
+      ['-p', String(pid), '-F', 'n'],
+      { timeout: 15000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          // Exit 1 can mean no matching PID. Only a confirmed exit is a clean empty scan.
+          if (err.code === 1 && !err.killed && !err.signal) {
+            try {
+              process.kill(pid, 0);
+            } catch (probeErr) {
+              if (probeErr && probeErr.code === 'ESRCH') {
+                resolve([]);
+                return;
+              }
+            }
+          }
+          // An unconfirmed provider read is not proof that the process holds no files.
+          // Keep command diagnostics (which may contain private paths) out of health.
+          reject(new Error('lsof-file-handles-failed'));
+          return;
+        }
+        const files = [];
+        for (const line of stdout.split('\n')) {
+          if (line.startsWith('n/')) {
+            files.push(line.slice(1));
+          }
+        }
+        resolve(files);
+      },
+    );
+  });
+}
+
+/**
+ * @param {number} pid
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+function killProcess(pid) {
+  pid = Number(pid);
+  if (!isValidPid(pid)) return Promise.resolve({ success: false, error: 'Invalid PID' });
+  return new Promise((resolve) => {
+    _execFile('kill', ['-9', String(pid)], (err) => {
+      resolve(err ? { success: false, error: err.message } : { success: true });
+    });
+  });
+}
+
+/**
+ * @param {number} pid
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+function suspendProcess(pid) {
+  pid = Number(pid);
+  if (!isValidPid(pid)) return Promise.resolve({ success: false, error: 'Invalid PID' });
+  return new Promise((resolve) => {
+    _execFile('kill', ['-STOP', String(pid)], (err) => {
+      resolve(err ? { success: false, error: err.message } : { success: true });
+    });
+  });
+}
+
+/**
+ * @param {number} pid
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+function resumeProcess(pid) {
+  pid = Number(pid);
+  if (!isValidPid(pid)) return Promise.resolve({ success: false, error: 'Invalid PID' });
+  return new Promise((resolve) => {
+    _execFile('kill', ['-CONT', String(pid)], (err) => {
+      resolve(err ? { success: false, error: err.message } : { success: true });
+    });
+  });
+}
+
+/**
+ * Parse `ps -axo pid=,ppid=,comm=` output into a Map.
+ * @param {string} stdout
+ * @returns {Map<number, {name: string, ppid: number}>}
+ */
+function parseParentProcessMapFromPs(stdout) {
+  const map = new Map();
+  const lines = stdout.trim().split('\n');
+  for (const line of lines) {
+    const parts = line.trim().match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+    if (!parts) continue;
+    // pid must be a positive safe integer; ppid 0 is valid (init/launchd parent).
+    const pid = parsePidToken(parts[1]);
+    if (pid === null) continue;
+    const ppid = Number(parts[2]);
+    if (!Number.isSafeInteger(ppid)) continue;
+    let name = parts[3].trim();
+    const slashIdx = name.lastIndexOf('/');
+    if (slashIdx !== -1) name = name.slice(slashIdx + 1);
+    map.set(pid, { name, ppid });
+  }
+  return map;
+}
+
+/**
+ * Resolve a process's working directory via `lsof -d cwd -a -p PID -F n`.
+ * @param {number} pid
+ * @returns {Promise<string|null>}
+ * @since v0.5.0
+ */
+function parseLsofCwd(pid) {
+  pid = Number(pid);
+  if (!isValidPid(pid)) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    _execFile(
+      'lsof',
+      ['-d', 'cwd', '-a', '-p', String(pid), '-F', 'n'],
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) {
+          resolve(null);
+          return;
+        }
+        for (const line of stdout.split('\n')) {
+          if (line.startsWith('n/')) {
+            resolve(line.slice(1));
+            return;
+          }
+        }
+        resolve(null);
+      },
+    );
+  });
+}
+
+module.exports = {
+  isValidPid,
+  parsePsOutput,
+  parseLsofOutput,
+  parseTcpEndpoint,
+  parseLsofFileHandles,
+  parseLsofCwd,
+  killProcess,
+  suspendProcess,
+  resumeProcess,
+  parseParentProcessMapFromPs,
+  _setExecFileForTest,
+};

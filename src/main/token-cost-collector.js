@@ -1,0 +1,128 @@
+/**
+ * @file token-cost-collector.js
+ * @module main/token-cost-collector
+ * @description Per-tick bridge between the live scan loop and the token-feed /
+ *   token-tracker pair. Given the scan's current agent list it:
+ *     1. keeps only agents carrying a real OS birth-time (`startTime` is a
+ *        number) — the feed's PID-reuse guard needs an epoch-ms to trust a pid;
+ *     2. makes exactly ONE {@link module:main/token-feed} read for that batch;
+ *     3. folds every returned measured delta into {@link module:main/token-tracker}
+ *        under the delta's OWN pid (C-01 — never an index, never the loop var).
+ *
+ *   HONESTY (empirical-gap #1). If a live Claude Code agent is present on the
+ *   tick but had to be dropped because its birth-time was unreadable, its tokens
+ *   go unattributed and the readout silently undercounts. We refuse to be silent
+ *   about that: one `logger.warn` is emitted (once per AEGIS process) on every
+ *   platform. macOS does not currently supply birth times; Linux normally does,
+ *   but may lose them during an identity observation outage. The warn is emitted
+ *   BEFORE the empty-procs early return, because the dropped agent IS exactly
+ *   the case that leaves `procs` empty.
+ *
+ *   RELIABILITY (C-02). The feed read is wrapped in try/catch so a corrupt or
+ *   locked transcript can never throw out of here, drop the scan tick, or block
+ *   the caller's reentrancy-guard release. On error we warn once and return the
+ *   nothing we have — the tick continues.
+ *
+ *   This module holds NO token knowledge of its own: it fabricates no counts,
+ *   reads no disk, and adds no agent-specific logic. All of that lives in the
+ *   feed's adapters and the tracker's accounting.
+ * @author AEGIS Contributors
+ * @license MIT
+ * @version 0.1.0
+ */
+'use strict';
+
+const logger = require('./logger');
+const tokenFeed = require('./token-feed');
+const tokenTracker = require('./token-tracker');
+
+/**
+ * Display name (agent-database `displayName`) of the only agent family with a
+ * token-feed adapter today. Matched exactly — a substring like 'claude' would
+ * false-warn on other Claude-branded entries in the agent DB.
+ * @type {string}
+ */
+const CLAUDE_CODE_AGENT = 'Claude Code';
+
+/** One-time guards so the two honesty warnings below fire once, never per-tick. */
+let _warnedBirthtime = false;
+let _warnedReadError = false;
+
+/**
+ * Read any new measured per-PID token deltas for the live agents and accumulate
+ * them in the token-tracker. Pure orchestration — see the file header for the
+ * honesty and reliability contracts.
+ *
+ * @param {Array<{ agent?: string, pid?: number, startTime?: number }>} agents -
+ *   the scan tick's current agent list.
+ * @returns {Promise<Array>} the measured deltas applied this tick (possibly
+ *   empty — never throws).
+ * @since v0.11.0-alpha
+ */
+async function collectTokenCosts(agents) {
+  for (const baseline of tokenFeed.getHistoricalUsage())
+    tokenTracker.restoreHistoricalUsage(baseline);
+  const list = Array.isArray(agents) ? agents : [];
+
+  // C-01: build the procs batch ONLY from agents whose OS birth-time is a real
+  // epoch-ms number. The typeof check rejects both null (macOS or an identity
+  // observation outage) and undefined (not yet enriched) in a single predicate.
+  // identityByPid keeps the full agent object so the tracker can key the
+  // accounting by process INSTANCE (agent.instanceId, stamped upstream by
+  // enrichWithParentChains) instead of the recyclable bare pid.
+  const procs = [];
+  const identityByPid = new Map();
+  let droppedClaude = false;
+  for (const a of list) {
+    if (a && typeof a.startTime === 'number') {
+      procs.push({ pid: a.pid, startTime: a.startTime, agent: a.agent });
+      identityByPid.set(a.pid, a);
+    } else if (a && a.agent === CLAUDE_CODE_AGENT && Number.isInteger(a.pid) && a.pid > 0) {
+      droppedClaude = true;
+    }
+  }
+
+  // Honesty: surface a live-but-unattributable Claude Code agent once on every
+  // platform. Emitted before the early return — the dropped agent is the empty case.
+  if (droppedClaude && !_warnedBirthtime) {
+    _warnedBirthtime = true;
+    logger.warn(
+      'token',
+      'Live Claude Code agent skipped: OS birth-time unavailable, its token usage is unattributed',
+    );
+  }
+
+  if (procs.length === 0) return [];
+
+  let deltas;
+  try {
+    deltas = await tokenFeed.readUsageByPid(procs);
+  } catch {
+    // A corrupt/locked transcript must never drop the tick or block the caller's
+    // C-02 finally. Warn once, then carry on with nothing this cycle.
+    if (!_warnedReadError) {
+      _warnedReadError = true;
+      logger.warn('token', 'token-feed read failed; skipping token costs this tick', {
+        error: 'token-feed-read-failed',
+      });
+    }
+    return [];
+  }
+
+  // C-01: attribute each delta under the pid the SOURCE stamped on it, resolved
+  // to that pid's process INSTANCE from this tick's batch (subagent deltas are
+  // stamped with the MAIN pid, so the lookup always has a live entry). A miss
+  // falls back to the bare pid, which the tracker degrades honestly to its
+  // `"<pid>:u"` space rather than dropping the measured tokens.
+  for (const d of deltas) tokenTracker.trackTokens(identityByPid.get(d.pid) || d.pid, d);
+  return deltas;
+}
+
+/** Retained measured totals and independent collection health for the existing push.
+ * @returns {{records: Array, collection: Array}} @since 0.19.2
+ */
+function getTokenCostDelivery() {
+  return { records: tokenTracker.getAllCosts(), collection: tokenFeed.getCollectionStatus() };
+}
+
+module.exports = { collectTokenCosts, getTokenCostDelivery };

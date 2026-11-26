@@ -1,0 +1,401 @@
+import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
+import Module from 'module';
+
+// Mock electron via Module._load
+const mockTrayInstance = {
+  setImage: vi.fn(),
+  setToolTip: vi.fn(),
+  setContextMenu: vi.fn(),
+  on: vi.fn(),
+  destroy: vi.fn(),
+};
+const mockTrayConstructor = vi.fn(function () {
+  return mockTrayInstance;
+});
+const mockBuildFromTemplate = vi.fn((template) => template);
+const mockNotificationInstance = { show: vi.fn() };
+const mockNotificationIsSupported = vi.fn(() => true);
+const mockNotificationConstructor = vi.fn(function () {
+  return mockNotificationInstance;
+});
+mockNotificationConstructor.isSupported = mockNotificationIsSupported;
+const mockCreateFromBuffer = vi.fn((buf) => ({ buffer: buf, isNativeImage: true }));
+
+const fakeElectron = {
+  Tray: mockTrayConstructor,
+  Menu: { buildFromTemplate: mockBuildFromTemplate },
+  Notification: mockNotificationConstructor,
+  nativeImage: { createFromBuffer: mockCreateFromBuffer },
+};
+
+const originalLoad = Module._load;
+Module._load = function (request, _parent, _isMain) {
+  if (request === 'electron') return fakeElectron;
+  return originalLoad.apply(this, arguments);
+};
+
+afterAll(() => {
+  Module._load = originalLoad;
+});
+
+describe('tray-icon', () => {
+  let tray;
+
+  beforeEach(async () => {
+    mockTrayInstance.setImage.mockClear();
+    mockTrayInstance.setToolTip.mockClear();
+    mockTrayInstance.setContextMenu.mockClear();
+    mockTrayInstance.on.mockClear();
+    mockTrayInstance.destroy.mockClear();
+    mockTrayConstructor.mockClear();
+    mockBuildFromTemplate.mockClear();
+    mockNotificationConstructor.mockClear();
+    mockNotificationIsSupported.mockReset().mockReturnValue(true);
+    mockNotificationInstance.show.mockClear();
+    mockCreateFromBuffer.mockClear();
+
+    vi.resetModules();
+    const mod = await import('../../src/main/tray-icon.js');
+    tray = mod.default;
+  });
+
+  function initTray(overrides = {}) {
+    const state = {
+      tray: null,
+      currentTrayColor: 'green',
+      lastNotificationTime: 0,
+      getSensitiveCount: () =>
+        (overrides.activityLog || []).filter((event) => event.sensitive).length,
+      getSettings: () => ({ notificationsEnabled: true, ...overrides.settings }),
+      isMonitoringPaused: () => overrides.paused || false,
+      setMonitoringPaused: vi.fn(),
+      stopScanIntervals: vi.fn(),
+      startScanIntervals: vi.fn(),
+      getMainWindow: () =>
+        overrides.mainWindow || {
+          show: vi.fn(),
+          focus: vi.fn(),
+          isDestroyed: () => false,
+          webContents: { send: vi.fn() },
+        },
+      setIsQuitting: vi.fn(),
+      appQuit: vi.fn(),
+      openWindow: vi.fn(),
+    };
+    tray.init(state);
+    return state;
+  }
+
+  describe('createTrayIconImage', () => {
+    it('creates a valid PNG buffer for green', () => {
+      tray.createTrayIconImage('green');
+      expect(mockCreateFromBuffer).toHaveBeenCalled();
+      const buf = mockCreateFromBuffer.mock.calls[0][0];
+      expect(buf[0]).toBe(137);
+      expect(buf[1]).toBe(80);
+      expect(buf[2]).toBe(78);
+      expect(buf[3]).toBe(71);
+    });
+
+    it('creates images for all color variants', () => {
+      for (const color of ['green', 'yellow', 'red']) {
+        const img = tray.createTrayIconImage(color);
+        expect(img).toBeDefined();
+      }
+    });
+
+    it('defaults to green for unknown color', () => {
+      const img = tray.createTrayIconImage('purple');
+      expect(img).toBeDefined();
+    });
+  });
+
+  describe('updateTrayIcon', () => {
+    it('does nothing when state not initialized', () => {
+      const state = initTray();
+      state.tray = null;
+      tray.updateTrayIcon();
+    });
+
+    it('updates color when threat level changes', () => {
+      const state = initTray({
+        activityLog: Array.from({ length: 6 }, () => ({ sensitive: true })),
+      });
+      state.tray = { setImage: vi.fn(), setToolTip: vi.fn(), setContextMenu: vi.fn() };
+      state.currentTrayColor = 'green';
+      tray.updateTrayIcon();
+      expect(state.currentTrayColor).toBe('red');
+      expect(state.tray.setImage).toHaveBeenCalled();
+    });
+
+    it('does not update image when color unchanged', () => {
+      const state = initTray({ activityLog: [] });
+      state.tray = { setImage: vi.fn(), setToolTip: vi.fn(), setContextMenu: vi.fn() };
+      state.currentTrayColor = 'green';
+      tray.updateTrayIcon();
+      expect(state.tray.setImage).not.toHaveBeenCalled();
+    });
+
+    it('shows [PAUSED] in tooltip when monitoring is paused', () => {
+      const state = initTray({ paused: true, activityLog: [] });
+      state.tray = { setImage: vi.fn(), setToolTip: vi.fn(), setContextMenu: vi.fn() };
+      tray.updateTrayIcon();
+      const tooltip = state.tray.setToolTip.mock.calls[0][0];
+      expect(tooltip).toContain('[PAUSED]');
+    });
+
+    it('tooltip identifies a retained observation count rather than a threat severity', () => {
+      const state = initTray({
+        activityLog: [{ sensitive: true }, { sensitive: true }, { sensitive: false }],
+      });
+      state.tray = { setImage: vi.fn(), setToolTip: vi.fn(), setContextMenu: vi.fn() };
+      tray.updateTrayIcon();
+      const tooltip = state.tray.setToolTip.mock.calls[0][0];
+      expect(tooltip).toContain('2 retained sensitive observations');
+      expect(tooltip).not.toContain('Critical');
+    });
+  });
+
+  describe('getTrayThreatColor (tested via updateTrayIcon)', () => {
+    it('green for 0 sensitive events', () => {
+      const state = initTray({ activityLog: [] });
+      state.tray = { setImage: vi.fn(), setToolTip: vi.fn(), setContextMenu: vi.fn() };
+      state.currentTrayColor = 'red';
+      tray.updateTrayIcon();
+      expect(state.currentTrayColor).toBe('green');
+    });
+
+    it('yellow for 1-5 sensitive events', () => {
+      const state = initTray({
+        activityLog: [{ sensitive: true }, { sensitive: true }, { sensitive: true }],
+      });
+      state.tray = { setImage: vi.fn(), setToolTip: vi.fn(), setContextMenu: vi.fn() };
+      state.currentTrayColor = 'green';
+      tray.updateTrayIcon();
+      expect(state.currentTrayColor).toBe('yellow');
+    });
+
+    it('red for 6+ sensitive events', () => {
+      const state = initTray({
+        activityLog: Array.from({ length: 10 }, () => ({ sensitive: true })),
+      });
+      state.tray = { setImage: vi.fn(), setToolTip: vi.fn(), setContextMenu: vi.fn() };
+      state.currentTrayColor = 'green';
+      tray.updateTrayIcon();
+      expect(state.currentTrayColor).toBe('red');
+    });
+  });
+
+  describe('notifySensitive', () => {
+    it('shows notification for sensitive events', () => {
+      initTray();
+      const events = [
+        {
+          sensitive: true,
+          agent: 'Claude',
+          action: 'read',
+          file: '/home/.ssh/id_rsa',
+          reason: 'SSH key',
+        },
+      ];
+      tray.notifySensitive(events);
+      expect(mockNotificationConstructor).toHaveBeenCalledTimes(1);
+      const notifArgs = mockNotificationConstructor.mock.calls[0][0];
+      expect(notifArgs.title).toContain('Sensitive File Activity');
+      expect(notifArgs.urgency).toBe('normal');
+      expect(notifArgs.body).toContain('Claude');
+      expect(notifArgs.body).toContain('id_rsa');
+    });
+
+    it('does not notify when notifications disabled', () => {
+      initTray({ settings: { notificationsEnabled: false } });
+      tray.notifySensitive([{ sensitive: true, agent: 'A', file: '/f', reason: 'r' }]);
+      expect(mockNotificationConstructor).not.toHaveBeenCalled();
+    });
+
+    it('does not notify for non-sensitive events', () => {
+      initTray();
+      tray.notifySensitive([{ sensitive: false, agent: 'A', file: '/f' }]);
+      expect(mockNotificationConstructor).not.toHaveBeenCalled();
+    });
+
+    it('throttles notifications to 30s apart', () => {
+      initTray();
+      const events = [{ sensitive: true, agent: 'A', action: 'r', file: '/f', reason: 'r' }];
+      tray.notifySensitive(events);
+      expect(mockNotificationConstructor).toHaveBeenCalledTimes(1);
+      tray.notifySensitive(events);
+      expect(mockNotificationConstructor).toHaveBeenCalledTimes(1);
+    });
+
+    it('labels an unattributed event "Unknown source" instead of a blank name', () => {
+      initTray();
+      tray.notifySensitive([
+        {
+          sensitive: true,
+          agent: '',
+          action: 'modified',
+          file: '/home/user/.ssh/id_rsa',
+          reason: 'SSH keys/config',
+          attribution: { status: 'unattributed', evidence: ['no-owner-match'] },
+        },
+      ]);
+      expect(mockNotificationConstructor).toHaveBeenCalledTimes(1);
+      const body = mockNotificationConstructor.mock.calls[0][0].body;
+      expect(body).toContain('Unknown source');
+      // Without the label the body would open with a bare space.
+      expect(body.startsWith(' ')).toBe(false);
+      expect(body).toContain('id_rsa');
+    });
+
+    it('labels path-inferred ownership instead of presenting it as confirmed', () => {
+      initTray();
+      tray.notifySensitive([
+        {
+          sensitive: true,
+          agent: 'Claude',
+          action: 'read',
+          file: '/home/user/.ssh/id_rsa',
+          reason: 'SSH key',
+          attribution: { status: 'inferred', evidence: ['cwd-containment'] },
+        },
+      ]);
+      expect(mockNotificationConstructor.mock.calls[0][0].body).toContain('Claude (inferred)');
+    });
+
+    it('uses Unknown source when attribution says unattributed even if a stale agent name exists', () => {
+      initTray();
+      tray.notifySensitive([
+        {
+          sensitive: true,
+          agent: 'Claude',
+          action: 'read',
+          file: '/home/user/.ssh/id_rsa',
+          reason: 'SSH key',
+          attribution: { status: 'unattributed', evidence: ['no-owner-match'] },
+        },
+      ]);
+      const body = mockNotificationConstructor.mock.calls[0][0].body;
+      expect(body).toContain('Unknown source');
+      expect(body).not.toContain('Claude');
+    });
+
+    it('skips unsupported native notifications without consuming the throttle window', () => {
+      const state = initTray();
+      const events = [{ sensitive: true, agent: 'A', file: '/f', reason: 'r' }];
+      mockNotificationIsSupported.mockReturnValueOnce(false);
+      expect(() => tray.notifySensitive(events)).not.toThrow();
+      expect(mockNotificationConstructor).not.toHaveBeenCalled();
+      expect(state.lastNotificationTime).toBe(0);
+      tray.notifySensitive(events);
+      expect(mockNotificationConstructor).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['support probe', 'constructor', 'show'])(
+      'does not interrupt monitoring or consume the throttle when native %s throws',
+      (failure) => {
+        const state = initTray();
+        const events = [{ sensitive: true, agent: 'A', file: '/f', reason: 'r' }];
+        if (failure === 'support probe') {
+          mockNotificationIsSupported.mockImplementationOnce(() => {
+            throw new Error('native notification unavailable');
+          });
+        } else if (failure === 'constructor') {
+          mockNotificationConstructor.mockImplementationOnce(function () {
+            throw new Error('native notification unavailable');
+          });
+        } else {
+          mockNotificationInstance.show.mockImplementationOnce(() => {
+            throw new Error('native notification unavailable');
+          });
+        }
+        expect(() => tray.notifySensitive(events)).not.toThrow();
+        expect(state.lastNotificationTime).toBe(0);
+        tray.notifySensitive(events);
+        expect(mockNotificationInstance.show).toHaveBeenCalled();
+        expect(state.lastNotificationTime).toBeGreaterThan(0);
+      },
+    );
+
+    it('shows (+N more) for multiple sensitive events', () => {
+      initTray();
+      const events = [
+        { sensitive: true, agent: 'Claude', action: 'read', file: '/a', reason: 'SSH' },
+        { sensitive: true, agent: 'Claude', action: 'read', file: '/b', reason: 'AWS' },
+        { sensitive: true, agent: 'Claude', action: 'read', file: '/c', reason: 'key' },
+      ];
+      tray.notifySensitive(events);
+      const body = mockNotificationConstructor.mock.calls[0][0].body;
+      expect(body).toContain('+2 more');
+    });
+  });
+
+  describe('createTray', () => {
+    it('creates tray with green icon and sets up context menu', () => {
+      const state = initTray();
+      tray.createTray();
+      expect(mockTrayConstructor).toHaveBeenCalled();
+      expect(state.tray).toBeDefined();
+    });
+  });
+
+  describe('rebuildTrayMenu', () => {
+    it('opens settings, toggles monitoring both ways and quits through the existing lifecycle', () => {
+      const state = initTray();
+      let paused = false;
+      state.isMonitoringPaused = () => paused;
+      state.setMonitoringPaused.mockImplementation((value) => {
+        paused = value;
+      });
+      tray.createTray();
+      const menu = () => mockBuildFromTemplate.mock.calls.at(-1)[0];
+      const click = (id) =>
+        menu()
+          .find((item) => item.id === id)
+          .click();
+      click('open');
+      click('settings');
+      expect(state.openWindow.mock.calls).toEqual([[], ['settings']]);
+      const doubleClick = mockTrayInstance.on.mock.calls.find(
+        ([name]) => name === 'double-click',
+      )[1];
+      doubleClick();
+      expect(state.openWindow).toHaveBeenLastCalledWith();
+      click('monitoring');
+      expect(paused).toBe(true);
+      expect(state.stopScanIntervals).toHaveBeenCalledTimes(1);
+      expect(menu().find((item) => item.id === 'monitoring').label).toBe('Resume Monitoring');
+      click('monitoring');
+      expect(paused).toBe(false);
+      expect(state.startScanIntervals).toHaveBeenCalledTimes(1);
+      expect(menu().find((item) => item.id === 'monitoring').label).toBe('Pause Monitoring');
+      click('quit');
+      expect(state.setIsQuitting).toHaveBeenCalledWith(true);
+      expect(state.appQuit).toHaveBeenCalledTimes(1);
+    });
+    it('does nothing when no tray exists', () => {
+      const state = initTray();
+      state.tray = null;
+      tray.rebuildTrayMenu();
+    });
+
+    it('builds menu with correct items', () => {
+      const state = initTray();
+      state.tray = { setContextMenu: vi.fn() };
+      tray.rebuildTrayMenu();
+      expect(mockBuildFromTemplate).toHaveBeenCalled();
+      const template = mockBuildFromTemplate.mock.calls[0][0];
+      expect(template.some((item) => item.label === 'Open AEGIS')).toBe(true);
+      expect(template.some((item) => item.label === 'Pause Monitoring')).toBe(true);
+      expect(template.some((item) => item.label === 'Quit')).toBe(true);
+    });
+
+    it('shows "Resume Monitoring" when paused', () => {
+      const state = initTray({ paused: true });
+      state.tray = { setContextMenu: vi.fn() };
+      tray.rebuildTrayMenu();
+      const template = mockBuildFromTemplate.mock.calls[0][0];
+      expect(template.some((item) => item.label === 'Resume Monitoring')).toBe(true);
+    });
+  });
+});

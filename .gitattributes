@@ -1,0 +1,25 @@
+# Linguist — Svelte is the real renderer stack, own it
+*.svelte linguist-language=Svelte
+
+# Normalize line endings
+* text=auto
+
+# Bench replay fixtures are byte-exact recordings of real runs, and the replay
+# tests assert byte equality against them. `* text=auto` above plus a Windows
+# checkout would hand those tests CRLF files that no rebuild can reproduce, so
+# these are excluded from conversion in both directions.
+tests/fixtures/bench/** -text
+
+# Sensor wire goldens are byte-exact length-prefixed UTF-8 payloads.
+tests/fixtures/sensor-wire/*.bin -text
+
+# The release signing public key is compared and parsed byte for byte. `* text=auto`
+# above would hand a Windows checkout - including the windows-latest release runner -
+# a CRLF PEM, so this file is excluded from conversion in both directions.
+keys/** -text
+
+# Source-bound cloud qualification receipts keep their downloaded byte hashes.
+docs/roadmap/enforcement-e2/evidence/20261007/*.json -text whitespace=cr-at-eol
+
+# Signed public Claude metadata and retained provenance source are byte-exact.
+scripts/qualification/claude-public/** -text

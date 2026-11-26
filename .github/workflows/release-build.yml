@@ -1,0 +1,140 @@
+name: Build Windows Installer
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and upload the installer for (e.g. aegis-v0.11.0-alpha)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to build and upload the installer for'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      RuntimeFrameworkVersion: '10.0.14'
+      TargetLatestRuntimePatch: 'false'
+    steps:
+      # First step on purpose. A missing key costs a minute here instead of failing
+      # after a ten-minute build, and nothing can reach the Release before it passes.
+      #
+      # Secrets do NOT cross `workflow_call` on their own: on the release-please path
+      # this workflow is called as a reusable workflow, and without `secrets: inherit`
+      # in the caller the expression below is the empty string. That is precisely the
+      # failure this step exists to make loud rather than silently unsigned.
+      - name: Require the release signing key
+        shell: bash
+        env:
+          AEGIS_RELEASE_SIGNING_KEY: ${{ secrets.AEGIS_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$AEGIS_RELEASE_SIGNING_KEY" ]; then
+            echo '::error::AEGIS_RELEASE_SIGNING_KEY is not available to this job - refusing to publish an unsigned release. On the release-please path the caller must pass secrets: inherit.'
+            exit 1
+          fi
+          echo "Release signing key is present."
+
+      # `inputs` is null on a `release` event, so this falls through to the released tag.
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: echo "name=${{ inputs.tag || github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.tag.outputs.name }}
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Allocate .NET job paths
+        shell: pwsh
+        run: |
+          @(
+            ('DOTNET_INSTALL_DIR=' + (Join-Path $env:RUNNER_TEMP 'aegis-dotnet-10.0.403'))
+            ('DOTNET_CLI_HOME=' + (Join-Path $env:RUNNER_TEMP 'aegis-dotnet-home'))
+            ('NUGET_PACKAGES=' + (Join-Path $env:RUNNER_TEMP 'aegis-nuget'))
+          ) | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '10.0.403'
+
+      - name: Verify selected .NET SDK
+        shell: pwsh
+        run: |
+          $sdk = dotnet --version
+          if ($LASTEXITCODE -or $sdk.Trim() -ne '10.0.403') { throw 'Expected .NET SDK 10.0.403' }
+          $hostPath = (Get-Command dotnet).Source
+          if (-not $hostPath.StartsWith([IO.Path]::GetFullPath($env:DOTNET_INSTALL_DIR).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'dotnet escaped the job-local installation' }
+
+      - run: npm ci
+
+      - name: Build renderer
+        run: npm run build:renderer
+
+      - name: Build Windows .exe
+        run: npx electron-builder --win --publish never
+
+      - name: Verify published .NET runtime
+        shell: pwsh
+        run: |
+          $runtime = Get-Content -LiteralPath dist/win-unpacked/resources/etw-file/EtwFile.runtimeconfig.json -Raw | ConvertFrom-Json
+          $frameworks = @($runtime.runtimeOptions.includedFrameworks)
+          if ($frameworks.Count -ne 1 -or $frameworks[0].name -ne 'Microsoft.NETCore.App' -or $frameworks[0].version -ne '10.0.14') { throw 'Expected self-contained .NET runtime 10.0.14' }
+          $deps = Get-Content -LiteralPath dist/win-unpacked/resources/etw-file/EtwFile.deps.json -Raw | ConvertFrom-Json
+          $packs = @($deps.libraries.PSObject.Properties.Name | Where-Object { $_ -like 'runtimepack.Microsoft.NETCore.App.Runtime.*' })
+          if ($packs.Count -ne 1 -or $packs[0] -ne 'runtimepack.Microsoft.NETCore.App.Runtime.win-x64/10.0.14') { throw 'Unexpected runtime pack in published dependencies' }
+
+      # Everything that gets uploaded is staged here first, so the set that is hashed
+      # is exactly the set that is published - not a superset of dist/ that happens to
+      # overlap with it.
+      - name: Stage release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp dist/*.exe release-assets/
+          ls -l release-assets
+
+      - name: Sign the release manifest
+        shell: bash
+        env:
+          AEGIS_RELEASE_SIGNING_KEY: ${{ secrets.AEGIS_RELEASE_SIGNING_KEY }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: node scripts/release-sign.js --dir release-assets --tag "$TAG"
+
+      # The self-check that makes the signature worth anything: the manifest just
+      # produced by the SECRET is verified against the PUBLIC key committed in this
+      # repository, before a byte is uploaded. A secret that does not pair with the
+      # pinned key stops the release here instead of publishing a manifest that no
+      # downloader could ever verify (memory-bank/ai-mistakes.md #25).
+      - name: Verify the manifest against the committed public key
+        shell: bash
+        run: node scripts/release-verify.js --dir release-assets
+
+      - name: Upload the signed release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "::error::release-assets is empty - nothing to upload"
+            exit 1
+          fi
+          printf 'Uploading %s\n' "${assets[@]}"
+          gh release upload "$TAG" "${assets[@]}" --clobber

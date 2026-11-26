@@ -1,0 +1,3871 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createRequire } from 'module';
+import Module from 'node:module';
+import os from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
+
+describe('scan-loop', () => {
+  let scanLoop;
+  const require_ = createRequire(import.meta.url);
+  const originalLoad = Module._load;
+  const fakeElectron = {
+    app: { getPath: () => os.tmpdir() },
+    safeStorage: { isEncryptionAvailable: () => false },
+  };
+
+  /**
+   * Inert command runner for resource-monitor, installed for the WHOLE file.
+   *
+   * `doProcessScan` fires `resourceMonitor.getResourcesForPids` for every scanned
+   * pid > 0, so EVERY test here that drives a scan reaches it — not just the
+   * `agent-resource-usage` block that asserts on the result. Left unstubbed, that
+   * is the real `execFile`: a live `powershell.exe` / `nvidia-smi` per scanning
+   * test, in CI as much as locally.
+   *
+   * Those spawns settle on REAL time while the tests run on fake timers, so a
+   * chain started in one test resumes during whichever test happens to be running
+   * when the OS answers — and calls the exec THAT test installed. That is how a
+   * backlog of earlier scans landed on `makeVaryingExec` below and drove its
+   * sample counter past the value the test had just measured (`expected 5 to be
+   * 1`). An already-resolved promise keeps every chain inside the test that
+   * started it, and `_setExecForTest` is module-level state that `_resetForTest`
+   * deliberately does NOT restore, so it is re-armed on both sides of each test.
+   * @returns {Promise<string>}
+   */
+  const inertExec = () => Promise.resolve('');
+
+  /** Reset resource-monitor's module state and re-arm the inert exec. */
+  function isolateResourceMonitor() {
+    const rm = require_('../../src/main/resource-monitor.js');
+    rm._resetForTest();
+    rm._setLoggerForTest({ warn: vi.fn() });
+    rm._setExecForTest(inertExec);
+  }
+
+  beforeEach(() => {
+    // Collaborators use native CommonJS require, outside vi.mock's transform.
+    // Unit scans must not trigger Electron 44's lazy binary download.
+    Module._load = function (request) {
+      if (request === 'electron') return fakeElectron;
+      return originalLoad.apply(this, arguments);
+    };
+    vi.useFakeTimers();
+    // Clear CJS cache so each test gets fresh module-level state
+    const scanLoopPath = require_.resolve('../../src/main/scan-loop.js');
+    delete require_.cache[scanLoopPath];
+    // Also clear llm-runtime-detector (required inside enrichWithLocalModels)
+    const llmPath = require_.resolve('../../src/main/llm-runtime-detector.js');
+    delete require_.cache[llmPath];
+    // resource-monitor survives that cache clear — it is required at scan-loop's
+    // module scope and holds the exec, so it is isolated explicitly instead.
+    isolateResourceMonitor();
+    scanLoop = require_('../../src/main/scan-loop.js');
+  });
+
+  afterEach(async () => {
+    try {
+      scanLoop.stopScanIntervals();
+      // Settle the fire-and-forget resource push INSIDE the test that started it,
+      // while its own exec is still the installed one. Pending timers are not run;
+      // this only drains microtasks, which is all an inert exec needs.
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+      isolateResourceMonitor();
+    } finally {
+      Module._load = originalLoad;
+    }
+  });
+
+  /**
+   * Fresh mock deps for one scan run — every collaborator `doProcessScan` reaches
+   * for, stubbed inert. Each caller overrides only the collaborator its assertions
+   * are about, so a new dependency in scan-loop is added here once instead of in
+   * every block that drives a scan.
+   * @param {Object} [overrides]
+   * @returns {Object}
+   */
+  function makeDeps(overrides = {}) {
+    return {
+      scanner: { scanProcesses: vi.fn().mockResolvedValue({ agents: [], changed: false }) },
+      procUtil: {
+        enrichWithParentChains: vi.fn().mockResolvedValue(),
+        annotateHostApps: vi.fn(),
+        annotateWorkingDirs: vi.fn().mockResolvedValue(),
+      },
+      watcher: {
+        pruneKnownHandles: vi.fn(),
+        scanAllFileHandles: vi.fn().mockResolvedValue([]),
+      },
+      network: {
+        isNetworkScanRunning: vi.fn().mockReturnValue(false),
+        setNetworkScanRunning: vi.fn(),
+        scanNetworkConnections: vi.fn().mockResolvedValue([]),
+      },
+      baselines: { recordNetworkEndpoint: vi.fn() },
+      anomaly: {
+        checkDeviations: vi.fn().mockReturnValue([]),
+        calculateAnomalyScore: vi.fn().mockReturnValue({ score: 0 }),
+      },
+      audit: { log: vi.fn() },
+      tray: { updateTrayIcon: vi.fn(), notifySensitive: vi.fn() },
+      logger: { error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+      sendToRenderer: vi.fn(),
+      fileAccessBatcher: { push: vi.fn() },
+      statsUpdateBatcher: { push: vi.fn(), pushLazy: vi.fn() },
+      getStats: vi.fn().mockReturnValue({}),
+      getResourceUsage: vi.fn().mockReturnValue({}),
+      getLatestAgents: vi.fn().mockReturnValue([]),
+      setAgents: vi.fn(),
+      setLatestNetConnections: vi.fn(),
+      getPreviousPids: vi.fn().mockReturnValue(new Map()),
+      setPreviousPids: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it('retains TCP observation time and snapshot when the next provider poll fails', async () => {
+    const agents = [{ pid: 100, agent: 'Claude', instanceId: '100:start' }];
+    const rows = [
+      {
+        ...agents[0],
+        timestamp: 1700000001000,
+        remoteIp: '1.2.3.4',
+        remotePort: 443,
+        flagged: true,
+      },
+    ];
+    let latest = [];
+    const scanNetworkConnections = vi
+      .fn()
+      .mockResolvedValueOnce(rows)
+      .mockRejectedValueOnce(new Error('fixture provider unavailable'));
+    const deps = makeDeps({
+      getLatestAgents: () => agents,
+      setLatestNetConnections: vi.fn((connections) => {
+        latest = connections;
+      }),
+      securityEvents: { push: vi.fn() },
+      network: {
+        isNetworkScanRunning: () => false,
+        setNetworkScanRunning: vi.fn(),
+        scanNetworkConnections,
+      },
+    });
+    scanLoop.init(deps);
+    scanLoop.doNetworkScan();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(latest).toBe(rows);
+    expect(deps.securityEvents.push).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'network-connection',
+        timestamp: 1700000001000,
+      }),
+    );
+
+    await vi.advanceTimersByTimeAsync(60000);
+    scanLoop.doNetworkScan();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(scanNetworkConnections).toHaveBeenCalledTimes(2);
+    expect(deps.logger.error).toHaveBeenCalled();
+    expect(deps.setLatestNetConnections).toHaveBeenCalledTimes(1);
+    expect(latest).toBe(rows);
+    expect(latest[0].timestamp).toBe(1700000001000);
+    expect(
+      deps.sendToRenderer.mock.calls.filter(([channel]) => channel === 'network-update'),
+    ).toEqual([['network-update', rows]]);
+  });
+
+  it('routes real scan security observations through the durable batcher before live dedup', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-scan-pipe-'));
+    const rows = [];
+    const pipeline = require_('../../src/main/ipc-batcher').createSecurityBatcher({
+      directory,
+      intervalMs: 60000,
+      consume: (records) => {
+        rows.push(...records);
+        return true;
+      },
+    });
+    require_('../../src/main/session-tracker')._resetForTest();
+    const agent = {
+      agent: 'Claude Code',
+      process: 'claude.exe',
+      pid: 100,
+      startTime: 1717000000000,
+      instanceId: '100:1717000000000',
+      instanceIdSource: 'os',
+      category: 'ai',
+    };
+    const agents = [agent];
+    const event = {
+      ...agent,
+      file: '/fixture/.ssh/key',
+      action: 'holding',
+      sensitive: true,
+      timestamp: 1717000000100,
+      attribution: { status: 'confirmed', evidence: ['handle-scan-pid'] },
+    };
+    const connection = {
+      ...agent,
+      remoteIp: '203.0.113.1',
+      remotePort: 443,
+      state: 'ESTABLISHED',
+      timestamp: 1717000000200,
+      cmdline: 'PRIVATE_COMMAND',
+    };
+    const sequenceEngine = { ingest: vi.fn(), sweep: vi.fn() };
+    const deps = makeDeps({
+      securityEvents: pipeline,
+      sequenceEngine,
+      scanner: {
+        scanProcesses: vi
+          .fn()
+          .mockResolvedValue({ agents: [agent], reliable: true, changed: false }),
+      },
+      getLatestAgents: () => agents,
+      watcher: {
+        pruneKnownHandles: vi.fn(),
+        scanAllFileHandles: vi.fn().mockResolvedValue([{ ...event }, { ...event }]),
+      },
+      network: {
+        isNetworkScanRunning: () => false,
+        setNetworkScanRunning: vi.fn(),
+        scanNetworkConnections: vi.fn().mockResolvedValue([connection]),
+      },
+    });
+    try {
+      scanLoop.init(deps);
+      const processObservedAt =
+        Date.now() + require_('../../src/main/scan-schedule').STARTUP_MS.process;
+      scanLoop.staggeredStartup(5000, true);
+      await vi.advanceTimersByTimeAsync(12000);
+      pipeline.flush();
+      expect(rows.filter((r) => r.type === 'agent-enter')).toHaveLength(1);
+      expect(rows.filter((r) => r.type === 'network-connection')).toHaveLength(1);
+      expect(rows.find((r) => r.type === 'agent-enter')).toMatchObject({
+        timestamp: processObservedAt,
+        sensor: 'process',
+        details: {
+          pid: agent.pid,
+          instanceId: agent.instanceId,
+          extra: { startTime: processObservedAt },
+        },
+      });
+      expect(rows.find((r) => r.type === 'network-connection')).toMatchObject({
+        timestamp: connection.timestamp,
+        sensor: 'network',
+        details: {
+          pid: agent.pid,
+          instanceId: agent.instanceId,
+          path: '203.0.113.1:443',
+          extra: { remoteIp: connection.remoteIp, remotePort: connection.remotePort },
+        },
+      });
+      expect(rows.filter((r) => r.type === 'file-access')).toHaveLength(2);
+      expect(
+        rows
+          .filter((r) => r.type === 'file-access')
+          .every(
+            (r) => r.timestamp === event.timestamp && r.details.instanceId === agent.instanceId,
+          ),
+      ).toBe(true);
+      expect(sequenceEngine.ingest.mock.calls.filter(([r]) => r.file)).toHaveLength(1);
+      expect(
+        deps.audit.log.mock.calls.filter(([type]) =>
+          ['file-access', 'agent-enter', 'network-connection'].includes(type),
+        ),
+      ).toEqual([]);
+      expect(JSON.stringify(rows)).not.toContain('PRIVATE_COMMAND');
+    } finally {
+      scanLoop.stopScanIntervals();
+      pipeline.destroy();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['provider', 'identity', 'birth-time', 'late-suspend', 'confirmed'])(
+    'freezes token compaction on %s observation unless the pass is confirmed',
+    async (condition) => {
+      const tracker = require_('../../src/main/token-tracker.js');
+      const sessions = require_('../../src/main/session-tracker.js');
+      tracker._resetForTest();
+      sessions._resetForTest();
+      let suspendCount = 0;
+      const live = { agent: 'A', process: 'a.exe', pid: 42, instanceId: '42:live' };
+      tracker.trackTokens(live, { model: 'gpt-4o', inputTokens: 7, outputTokens: 3 });
+      for (let i = 1; i <= 1000; i++) {
+        tracker.trackTokens(
+          { pid: i + 100, instanceId: `${i + 100}:old` },
+          {
+            model: 'gpt-4o',
+            inputTokens: 1,
+            outputTokens: 0,
+          },
+        );
+      }
+      const deps = makeDeps({
+        scanner: {
+          scanProcesses: vi.fn().mockResolvedValue({
+            agents: condition === 'provider' ? [] : [live],
+            reliable: condition !== 'provider',
+          }),
+          isIdentityDegraded: () => condition === 'identity',
+          getUnwitnessedPids: () => new Set(condition === 'birth-time' ? [42] : []),
+        },
+        observationGap: { snapshot: () => ({ suspendCount }), noteObserved: vi.fn() },
+      });
+      if (condition === 'late-suspend') {
+        deps.procUtil.annotateWorkingDirs.mockImplementation(async () => {
+          suspendCount++;
+        });
+      }
+      try {
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+        const pushed = deps.sendToRenderer.mock.calls.filter(
+          ([channel]) => channel === 'token-costs',
+        );
+        expect(pushed).toHaveLength(1);
+        expect(pushed[0][1].records).toHaveLength(condition === 'confirmed' ? 258 : 1001);
+        expect(pushed[0][1].records.reduce((sum, row) => sum + row.totalTokens, 0)).toBe(1010);
+        expect(pushed[0][1].collection).toEqual(expect.any(Array));
+        expect(tracker.getCost(live).totalTokens).toBe(10);
+        if (condition === 'confirmed') {
+          // A single reliable miss is inside session exit grace, not a confirmed exit.
+          deps.scanner.scanProcesses.mockResolvedValue({ agents: [], reliable: true });
+          await vi.advanceTimersByTimeAsync(5000);
+          expect(sessions.hasInstance(live.instanceId)).toBe(true);
+          expect(tracker.getCost(live).totalTokens).toBe(10);
+        }
+      } finally {
+        tracker._resetForTest();
+        sessions._resetForTest();
+      }
+    },
+  );
+
+  it('prepares the settled identity before publishing the agent batch', async () => {
+    const order = [],
+      agents = [{ agent: 'Claude Code', process: 'claude.exe', pid: 71 }];
+    let published = [];
+    const deps = makeDeps({
+      scanner: { scanProcesses: vi.fn().mockResolvedValue({ agents, reliable: true }) },
+      getLatestAgents: () => published,
+      setAgents: (rows) => {
+        published = rows;
+      },
+      onAgentsObserved: vi.fn(() => {
+        order.push('prepare');
+        expect(published[0].createTime100ns).toBe('134333333333333337');
+      }),
+      sendToRenderer: vi.fn((channel) => {
+        if (channel === 'scan-batch') order.push('batch');
+      }),
+    });
+    deps.procUtil.enrichWithParentChains.mockImplementation(async (rows) => {
+      rows[0].createTime100ns = '134333333333333337';
+      rows[0].instanceId = '71:1788859733333';
+      order.push('stamp');
+    });
+    scanLoop.init(deps);
+    scanLoop.startScanIntervals(5000);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(deps.onAgentsObserved).toHaveBeenCalled();
+    expect(order.slice(0, 3)).toEqual(['stamp', 'prepare', 'batch']);
+  });
+
+  it('publishes the fresh population before a slow identity stamp can leave stale PIDs', async () => {
+    const agents = [{ agent: 'Claude Code', process: 'claude.exe', pid: 100 }];
+    let published = [
+      {
+        agent: 'Old Agent',
+        process: 'old.exe',
+        pid: 100,
+        instanceId: '100:111',
+        createTime100ns: '133000000000000001',
+        generationWitness: '133000000000000001',
+        generationWitnessSource: 'createTime100ns',
+      },
+    ];
+    let finishStamp;
+    const deps = makeDeps({
+      getLatestAgents: () => published,
+      setAgents: vi.fn((rows) => {
+        published = rows;
+      }),
+      scanner: {
+        scanProcesses: vi.fn().mockResolvedValue({ agents, reliable: true, changed: false }),
+      },
+      procUtil: {
+        enrichWithParentChains: vi.fn(
+          () =>
+            new Promise((resolve) => {
+              finishStamp = () => {
+                agents[0].instanceId = '100:111';
+                agents[0].instanceIdSource = 'os';
+                agents[0].createTime100ns = '133000000000000002';
+                agents[0].generationWitness = '133000000000000002';
+                agents[0].generationWitnessSource = 'createTime100ns';
+                resolve();
+              };
+            }),
+        ),
+        annotateHostApps: vi.fn(),
+        annotateWorkingDirs: vi.fn().mockResolvedValue(),
+      },
+    });
+    scanLoop.init(deps);
+    scanLoop.startScanIntervals(5000);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(deps.procUtil.enrichWithParentChains).toHaveBeenCalledOnce();
+    expect(published[0].agent).toBe('Claude Code');
+    expect(published[0].instanceId).toBeUndefined();
+    finishStamp();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(published[0]).toMatchObject({ instanceId: '100:111', instanceIdSource: 'os' });
+    expect(deps.watcher.pruneKnownHandles).toHaveBeenCalledWith(agents, {
+      preservePids: new Set(),
+      previousAgents: [
+        {
+          pid: 100,
+          instanceId: '100:111',
+          createTime100ns: '133000000000000001',
+          generationWitness: '133000000000000001',
+          generationWitnessSource: 'createTime100ns',
+        },
+      ],
+    });
+  });
+
+  it('publishes lineage only after identity stamping and invalidates it on failed observations or stop', async () => {
+    const population = [{ agent: 'A', process: 'a', pid: 10 }];
+    const sequenceEngine = { observePopulation: vi.fn() };
+    const deps = makeDeps({ sequenceEngine });
+    deps.scanner.scanProcesses.mockResolvedValue({ agents: population, reliable: true });
+    deps.procUtil.enrichWithParentChains.mockImplementation(async (rows) => {
+      rows[0].instanceId = 'fresh:10';
+      rows[0].instanceIdSource = 'os';
+    });
+    scanLoop.init(deps);
+    scanLoop.startScanIntervals(5000);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sequenceEngine.observePopulation).toHaveBeenLastCalledWith(
+      [expect.objectContaining({ instanceId: 'fresh:10' })],
+      true,
+    );
+    deps.scanner.scanProcesses.mockResolvedValue({ agents: population, reliable: false });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sequenceEngine.observePopulation).toHaveBeenLastCalledWith(population, false);
+    deps.scanner.scanProcesses.mockRejectedValue(new Error('provider failed'));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sequenceEngine.observePopulation).toHaveBeenLastCalledWith([], false);
+    sequenceEngine.observePopulation.mockClear();
+    scanLoop.stopScanIntervals();
+    expect(sequenceEngine.observePopulation).toHaveBeenCalledWith([], false);
+  });
+
+  it('does not restore lineage when an in-flight scan completes after monitoring stops', async () => {
+    const population = [{ agent: 'A', process: 'a', pid: 10 }];
+    const sequenceEngine = { observePopulation: vi.fn() };
+    const deps = makeDeps({ sequenceEngine });
+    let finish;
+    deps.scanner.scanProcesses.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    scanLoop.init(deps);
+    scanLoop.startScanIntervals(5000);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(finish).toBeTypeOf('function');
+    scanLoop.stopScanIntervals();
+    sequenceEngine.observePopulation.mockClear();
+    finish({ agents: population, reliable: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sequenceEngine.observePopulation).toHaveBeenCalledWith(population, false);
+    expect(sequenceEngine.observePopulation.mock.calls.some(([, reliable]) => reliable)).toBe(
+      false,
+    );
+  });
+
+  // ── dedupFileEvent (F-E03: instanceId-scoped, not display-name) ──
+
+  describe('dedupFileEvent', () => {
+    it('does not trust or delete a non-configurable forged optional audit identity', () => {
+      const { createLiveToolContext } = require_('../../src/main/live-tool-context');
+      const live = createLiveToolContext({ getAgents: () => [], now: Date.now, auditProof: () => ({ unique: () => true }) });
+      const push = vi.fn();
+      scanLoop.init(makeDeps({ securityEvents: { push }, prepareFileObservation: live.prepare }));
+      const event = { eventId: 'aaaaaaaa-1111-4111-8111-111111111111',
+        agent: 'Claude Code', instanceId: '42:1', pid: 42, timestamp: Date.now(),
+        file: path.resolve(os.tmpdir(), 'sensitive-fixture'), action: 'read', sensitive: true };
+      Object.defineProperty(event, 'auditIdentity', { value: { eventId: 'forged' }, configurable: false });
+      expect(scanLoop.dedupFileEvent(event)).toBe(event);
+      expect(() => live.record(event)).not.toThrow();
+      expect(push).toHaveBeenCalledOnce();
+      expect(push.mock.calls[0][0].details.auditIdentity.eventId).toBe(event.eventId);
+      expect(push.mock.calls[0][0].details.auditIdentity).not.toEqual(event.auditIdentity);
+    });
+
+    it('admits the sensitive event without identity when custody preparation throws', () => {
+      const push = vi.fn();
+      scanLoop.init(makeDeps({ securityEvents: { push }, prepareFileObservation: () => { throw Error('unavailable'); } }));
+      const event = { agent: 'Claude Code', instanceId: '42:1', pid: 42, timestamp: Date.now(),
+        file: path.resolve(os.tmpdir(), 'sensitive-fixture'), action: 'read', sensitive: true };
+      Object.defineProperty(event, 'auditIdentity', { value: { eventId: 'forged' }, configurable: false });
+      expect(scanLoop.dedupFileEvent(event)).toBe(event);
+      expect(push).toHaveBeenCalledOnce();
+      expect(push.mock.calls[0][0].details).not.toHaveProperty('auditIdentity');
+    });
+
+    it('admits sensitive identities before dedup and revokes a duplicated UUID', async () => {
+      const { createLiveToolContext } = require_('../../src/main/live-tool-context');
+      const live = createLiveToolContext({ getAgents: () => [], now: Date.now, auditProof: () => ({ unique: () => true }) });
+      const push = vi.fn();
+      scanLoop.init(makeDeps({ securityEvents: { push }, prepareFileObservation: live.prepare }));
+      const first = {
+        eventId: 'aaaaaaaa-1111-4111-8111-111111111111',
+        agent: 'Claude Code',
+        instanceId: '42:1',
+        pid: 42,
+        timestamp: Date.now(),
+        file: path.resolve(os.tmpdir(), 'sensitive-fixture'),
+        action: 'read',
+        sensitive: true,
+      };
+      expect(scanLoop.dedupFileEvent(first)).toBe(first);
+      live.record(first);
+      const initial = push.mock.calls[0][0];
+      const row = require_('../../src/main/audit-observation-identity').rememberAuditOrigin({
+        type: initial.type,
+        pid: initial.details.pid,
+        instanceId: initial.details.instanceId,
+        action: initial.details.action,
+        path: initial.details.path,
+        seq: 1,
+        hash: 'a'.repeat(64),
+        details: { auditIdentity: initial.details.auditIdentity },
+      }, 'aegis-audit-2026-10-27.json', 1);
+      const token = live.auditLookup(row);
+      expect(token).toBeTypeOf('string');
+      const duplicate = { ...first, eventId: first.eventId.toUpperCase() };
+      expect(scanLoop.dedupFileEvent(duplicate)).toBeNull();
+      expect(push).toHaveBeenCalledTimes(2);
+      expect(push.mock.calls[1][0].details.auditIdentity.eventId).toBe(first.eventId);
+      expect(live.auditLookup(row)).toBeNull();
+      expect((await live.explain(token)).toolContext.reasons).toContain('context-unavailable');
+    });
+
+    it('gives identical sensitive observations distinct IDs before one is deduped', () => {
+      const { createLiveToolContext } = require_('../../src/main/live-tool-context');
+      const live = createLiveToolContext({ getAgents: () => [], now: Date.now, auditProof: () => ({ unique: () => true }) });
+      const push = vi.fn();
+      scanLoop.init(makeDeps({ securityEvents: { push }, prepareFileObservation: live.prepare }));
+      const first = {
+        agent: 'Claude Code',
+        instanceId: '42:1',
+        pid: 42,
+        timestamp: Date.now(),
+        file: path.resolve(os.tmpdir(), 'sensitive-fixture'),
+        action: 'read',
+        sensitive: true,
+      };
+      const second = { ...first };
+      expect(scanLoop.dedupFileEvent(first)).toBe(first);
+      live.record(first);
+      expect(scanLoop.dedupFileEvent(second)).toBeNull();
+      expect(push).toHaveBeenCalledTimes(2);
+      const ids = push.mock.calls.map(([record]) => record.details.auditIdentity.eventId);
+      expect(ids[0]).not.toBe(ids[1]);
+      expect(ids).toEqual([first.eventId, second.eventId]);
+      const rows = push.mock.calls.map(([record], index) => require_('../../src/main/audit-observation-identity').rememberAuditOrigin({
+        type: record.type,
+        pid: record.details.pid,
+        instanceId: record.details.instanceId,
+        action: record.details.action,
+        path: record.details.path,
+        seq: 1,
+        hash: 'a'.repeat(64),
+        details: { auditIdentity: record.details.auditIdentity },
+      }, 'aegis-audit-2026-10-27.json', index));
+      expect(live.auditLookup(rows[0])).toBeTypeOf('string');
+      expect(live.auditLookup(rows[1])).toBeNull();
+    });
+
+    it('passes through first event for a stamped instance', () => {
+      const ev = { agent: 'Cursor', instanceId: '1:aaa', file: '/etc/passwd' };
+      const result = scanLoop.dedupFileEvent(ev);
+      expect(result).not.toBeNull();
+      expect(result.agent).toBe('Cursor');
+      expect(result.repeatCount).toBe(1);
+    });
+
+    it('A: same instance + same path within 30s is suppressed', () => {
+      const ev1 = { agent: 'Cursor', instanceId: '1:aaa', file: '/etc/passwd' };
+      scanLoop.dedupFileEvent(ev1);
+      const ev2 = { agent: 'Cursor', instanceId: '1:aaa', file: '/etc/passwd' };
+      const result = scanLoop.dedupFileEvent(ev2);
+      expect(result).toBeNull();
+    });
+
+    it.each([
+      { action: 'accessed' },
+      { attribution: { status: 'confirmed', evidence: ['cwd-containment'] } },
+      { attribution: { status: 'confirmed', evidence: ['handle-scan-pid'] } },
+      { attribution: { status: 'inferred', evidence: ['self-config-path'] } },
+      { sensitive: true },
+      { selfAccess: true },
+      { reason: 'SSH credentials' },
+      { source: 'handle-scan' },
+      { category: 'credential' },
+    ])('preserves a changed observation within the suppression window: %j', (change) => {
+      const base = {
+        instanceId: '123:start',
+        file: '/work/config',
+        action: 'modified',
+        attribution: { status: 'inferred', evidence: ['cwd-containment'] },
+        sensitive: false,
+        selfAccess: false,
+        reason: '',
+        source: 'watcher',
+        category: 'ai',
+      };
+      expect(scanLoop.dedupFileEvent({ ...base })).not.toBeNull();
+      expect(scanLoop.dedupFileEvent({ ...base, ...change })).not.toBeNull();
+    });
+
+    it('treats evidence as an unordered set without changing the source array', () => {
+      const first = {
+        instanceId: '123:start',
+        file: '/x',
+        attribution: {
+          status: 'confirmed',
+          evidence: ['handle-scan-pid', 'self-config-path'],
+        },
+      };
+      const second = {
+        ...first,
+        attribution: {
+          status: 'confirmed',
+          evidence: ['self-config-path', 'handle-scan-pid'],
+        },
+      };
+      expect(scanLoop.dedupFileEvent(first)).not.toBeNull();
+      expect(scanLoop.dedupFileEvent(second)).toBeNull();
+      expect(second.attribution.evidence).toEqual(['self-config-path', 'handle-scan-pid']);
+    });
+
+    it('keeps counts independent for modified and accessed observations', () => {
+      const base = { instanceId: '123:start', file: '/x' };
+      scanLoop.dedupFileEvent({ ...base, action: 'modified' });
+      scanLoop.dedupFileEvent({ ...base, action: 'modified' });
+      expect(scanLoop.dedupFileEvent({ ...base, action: 'accessed' }).repeatCount).toBe(1);
+      vi.advanceTimersByTime(31000);
+      expect(scanLoop.dedupFileEvent({ ...base, action: 'modified' }).repeatCount).toBe(2);
+    });
+
+    it('passes an observation after the wall clock moves backward', () => {
+      vi.setSystemTime(60000);
+      const base = { instanceId: '123:start', file: '/x' };
+      scanLoop.dedupFileEvent({ ...base });
+      vi.setSystemTime(1000);
+      expect(scanLoop.dedupFileEvent({ ...base })).not.toBeNull();
+    });
+
+    it('passes through after 30 second window for the same instance', () => {
+      const ev1 = { agent: 'Cursor', instanceId: '1:aaa', file: '/etc/passwd' };
+      scanLoop.dedupFileEvent(ev1);
+      vi.advanceTimersByTime(31000);
+      const ev2 = { agent: 'Cursor', instanceId: '1:aaa', file: '/etc/passwd' };
+      const result = scanLoop.dedupFileEvent(ev2);
+      expect(result).not.toBeNull();
+      expect(result.repeatCount).toBe(1);
+    });
+
+    it('B: same display name, different instanceIds, same path — both survive', () => {
+      // Historical bug: key was `${ev.agent}|${ev.file}` → second Claude Code dropped.
+      const ev1 = { agent: 'Claude Code', instanceId: '100:t1', file: '/home/user/.ssh/id_rsa' };
+      const ev2 = { agent: 'Claude Code', instanceId: '200:t2', file: '/home/user/.ssh/id_rsa' };
+      expect(scanLoop.dedupFileEvent(ev1)).not.toBeNull();
+      expect(scanLoop.dedupFileEvent(ev2)).not.toBeNull();
+    });
+
+    it('C: recycled PID with new instanceId is not suppressed by the old lifetime', () => {
+      // Same pid number can reappear; stamped instanceId differs → independent buckets.
+      const oldLife = { agent: 'Cursor', pid: 42, instanceId: '42:startA', file: '/tmp/x' };
+      const newLife = { agent: 'Cursor', pid: 42, instanceId: '42:startB', file: '/tmp/x' };
+      expect(scanLoop.dedupFileEvent(oldLife)).not.toBeNull();
+      expect(scanLoop.dedupFileEvent(newLife)).not.toBeNull();
+    });
+
+    it('keeps two RM holders born in the same millisecond independent', () => {
+      const base = {
+        agent: 'Cursor',
+        pid: 42,
+        instanceId: '42:1717000000000',
+        file: '/home/user/.ssh',
+        action: 'holding',
+      };
+      expect(
+        scanLoop.dedupFileEvent({ ...base, createTime100ns: '133000000000000000' }),
+      ).not.toBeNull();
+      expect(
+        scanLoop.dedupFileEvent({ ...base, createTime100ns: '133000000000000001' }),
+      ).not.toBeNull();
+    });
+
+    it.each([null, '133444736050000001'])(
+      'keeps a modified observation when candidate birth changes from %s within the window',
+      (firstBirth) => {
+        const base = {
+          agent: 'Claude Code',
+          pid: 42,
+          instanceId: '42:1700000005000',
+          file: '/owned/output.txt',
+          action: 'modified',
+          attribution: { status: 'inferred', evidence: ['cwd-containment'] },
+        };
+        const first = { ...base, createTime100ns: firstBirth };
+        const second = { ...base, createTime100ns: '133444736050000007' };
+        expect(scanLoop.dedupFileEvent(first)).toBe(first);
+        expect(scanLoop.dedupFileEvent(second)).toBe(second);
+        expect(second.attribution.status).toBe('inferred');
+        expect(scanLoop.dedupFileEvent({ ...second })).toBeNull();
+      },
+    );
+
+    it('D: unattributed events for the same path do not collapse into a null bucket', () => {
+      // Historical bug: key was `''|path` for all unattributed → one observation
+      // suppressed all later independent unattributed hits within 30s.
+      const u1 = {
+        agent: '',
+        pid: null,
+        instanceId: null,
+        file: '/home/user/.aws/credentials',
+        attribution: { status: 'unattributed', evidence: ['no-ai-agents-online'] },
+      };
+      const u2 = {
+        agent: '',
+        pid: null,
+        instanceId: null,
+        file: '/home/user/.aws/credentials',
+        attribution: { status: 'unattributed', evidence: ['no-owner-match'] },
+      };
+      expect(scanLoop.dedupFileEvent(u1)).not.toBeNull();
+      expect(scanLoop.dedupFileEvent(u2)).not.toBeNull();
+      expect(u1.instanceId).toBeNull();
+      expect(u2.instanceId).toBeNull();
+    });
+
+    it('D: empty-string instanceId is treated as unattributed (no shared bucket)', () => {
+      const a = { agent: '', instanceId: '', file: '/tmp/secret' };
+      const b = { agent: '', instanceId: '', file: '/tmp/secret' };
+      expect(scanLoop.dedupFileEvent(a)).not.toBeNull();
+      expect(scanLoop.dedupFileEvent(b)).not.toBeNull();
+    });
+
+    it('E: same instance, different paths remain independent', () => {
+      const x = { agent: 'Cursor', instanceId: '1:aaa', file: '/path/x' };
+      const y = { agent: 'Cursor', instanceId: '1:aaa', file: '/path/y' };
+      expect(scanLoop.dedupFileEvent(x)).not.toBeNull();
+      expect(scanLoop.dedupFileEvent(y)).not.toBeNull();
+    });
+
+    it('tracks repeat count across suppressed same-instance events', () => {
+      scanLoop.dedupFileEvent({ agent: 'A', instanceId: 'id:A', file: 'x' });
+      scanLoop.dedupFileEvent({ agent: 'A', instanceId: 'id:A', file: 'x' });
+      scanLoop.dedupFileEvent({ agent: 'A', instanceId: 'id:A', file: 'x' });
+      scanLoop.dedupFileEvent({ agent: 'A', instanceId: 'id:A', file: 'x' });
+      vi.advanceTimersByTime(31000);
+      const result = scanLoop.dedupFileEvent({ agent: 'A', instanceId: 'id:A', file: 'x' });
+      expect(result).not.toBeNull();
+      // count starts at 1 on first registration, then +1 per suppressed event
+      expect(result.repeatCount).toBe(4);
+    });
+
+    it('cleans up stale entries beyond 500', () => {
+      for (let i = 0; i < 501; i++) {
+        scanLoop.dedupFileEvent({ agent: 'A', instanceId: 'id:A', file: `f${i}` });
+      }
+      vi.advanceTimersByTime(61000);
+      const result = scanLoop.dedupFileEvent({ agent: 'A', instanceId: 'id:A', file: 'trigger' });
+      expect(result).not.toBeNull();
+    });
+
+    it('preserves burst counts, expiry, clock rollback and the 1000-entry cap', () => {
+      vi.setSystemTime(1_000_000);
+      const event = (file) => ({ instanceId: 'burst:1', file, action: 'accessed' });
+      for (let i = 0; i < 501; i += 1) {
+        expect(scanLoop.dedupFileEvent(event(`burst-${i}`))?.repeatCount).toBe(1);
+      }
+      expect(scanLoop.dedupFileEvent(event('burst-0'))).toBeNull();
+
+      // At exactly 60s, expiry uses a strict greater-than comparison.
+      vi.setSystemTime(1_060_000);
+      expect(scanLoop.dedupFileEvent(event('boundary'))?.repeatCount).toBe(1);
+      expect(scanLoop.dedupFileEvent(event('burst-0'))?.repeatCount).toBe(2);
+      vi.setSystemTime(1_060_001);
+      expect(scanLoop.dedupFileEvent(event('expiry-trigger'))?.repeatCount).toBe(1);
+      expect(scanLoop.dedupFileEvent(event('burst-1'))?.repeatCount).toBe(1);
+
+      vi.setSystemTime(900_000);
+      expect(scanLoop.dedupFileEvent(event('burst-0'))?.repeatCount).toBe(1);
+      expect(scanLoop.dedupFileEvent(event('burst-0'))).toBeNull();
+
+      // A full unique burst still clears the map at the existing 1001-entry limit.
+      for (let i = 0; i < 1001; i += 1) {
+        expect(scanLoop.dedupFileEvent(event(`cap-${i}`))?.repeatCount).toBe(1);
+      }
+      expect(scanLoop.dedupFileEvent(event('cap-0'))?.repeatCount).toBe(1);
+    });
+  });
+
+  // ── logAuditForFile ──
+
+  describe('logAuditForFile', () => {
+    it('logs file-access for normal file events', () => {
+      const auditLog = vi.fn();
+      scanLoop.init({ audit: { log: auditLog } });
+
+      scanLoop.logAuditForFile({
+        agent: 'Cursor',
+        action: 'read',
+        file: '/home/user/.bashrc',
+        sensitive: true,
+        reason: 'dotfile',
+        attribution: { status: 'confirmed', evidence: ['handle-scan-pid'] },
+      });
+
+      expect(auditLog).toHaveBeenCalledOnce();
+      // Event Schema v1: the FULL attribution object is top-level. v0 kept only the
+      // derived status string inside `extra`, losing the evidence array.
+      expect(auditLog).toHaveBeenCalledWith('file-access', {
+        agent: 'Cursor',
+        pid: null,
+        instanceId: null,
+        action: 'read',
+        path: '/home/user/.bashrc',
+        severity: 'sensitive',
+        attribution: { status: 'confirmed', evidence: ['handle-scan-pid'] },
+      });
+    });
+
+    it('records the unattributed status so an empty agent is not read as a legacy entry', () => {
+      const auditLog = vi.fn();
+      scanLoop.init({ audit: { log: auditLog } });
+
+      scanLoop.logAuditForFile({
+        agent: '',
+        action: 'modified',
+        file: '/home/user/.ssh/id_rsa',
+        sensitive: true,
+        reason: 'SSH keys/config',
+        attribution: { status: 'unattributed', evidence: ['no-owner-match'] },
+      });
+
+      expect(auditLog).toHaveBeenCalledWith('file-access', {
+        agent: '',
+        pid: null,
+        instanceId: null,
+        action: 'modified',
+        path: '/home/user/.ssh/id_rsa',
+        severity: 'sensitive',
+        attribution: { status: 'unattributed', evidence: ['no-owner-match'] },
+      });
+    });
+
+    it('reports attribution null, not a fabricated status, for a pre-v0.11.0 event', () => {
+      const auditLog = vi.fn();
+      scanLoop.init({ audit: { log: auditLog } });
+
+      scanLoop.logAuditForFile({
+        agent: 'Cursor',
+        action: 'read',
+        file: '/home/user/.bashrc',
+        sensitive: false,
+        reason: '',
+      });
+
+      // `null` says the question is unanswered for this record. Substituting
+      // 'unattributed' would assert a determination nobody made.
+      expect(auditLog.mock.calls[0][1].attribution).toBeNull();
+      expect(auditLog.mock.calls[0][1].extra).toBeUndefined();
+    });
+
+    it('logs config-access for AI agent config events', () => {
+      const auditLog = vi.fn();
+      scanLoop.init({ audit: { log: auditLog } });
+
+      scanLoop.logAuditForFile({
+        agent: 'Copilot',
+        action: 'write',
+        file: '/home/.copilot/config.json',
+        sensitive: false,
+        reason: 'AI agent config modification',
+        attribution: { status: 'inferred', evidence: ['self-config-path'] },
+      });
+
+      expect(auditLog).toHaveBeenCalledWith('config-access', {
+        agent: 'Copilot',
+        pid: null,
+        instanceId: null,
+        action: 'write',
+        path: '/home/.copilot/config.json',
+        severity: 'normal',
+        attribution: { status: 'inferred', evidence: ['self-config-path'] },
+      });
+    });
+  });
+
+  // ── startScanIntervals / stopScanIntervals ──
+
+  describe('startScanIntervals / stopScanIntervals', () => {
+    it('starts intervals that can be stopped', () => {
+      // We need to init with mock deps that the interval callbacks use
+      const mockDeps = {
+        scanner: { scanProcesses: vi.fn().mockResolvedValue({ agents: [], changed: false }) },
+        procUtil: {
+          enrichWithParentChains: vi.fn().mockResolvedValue(),
+          annotateHostApps: vi.fn(),
+          annotateWorkingDirs: vi.fn().mockResolvedValue(),
+        },
+        watcher: {
+          pruneKnownHandles: vi.fn(),
+          scanAllFileHandles: vi.fn().mockResolvedValue([]),
+        },
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn().mockResolvedValue([]),
+        },
+        baselines: { recordNetworkEndpoint: vi.fn() },
+        anomaly: {
+          checkDeviations: vi.fn().mockReturnValue([]),
+          calculateAnomalyScore: vi.fn().mockReturnValue({ score: 0 }),
+        },
+        audit: { log: vi.fn() },
+        tray: { updateTrayIcon: vi.fn(), notifySensitive: vi.fn() },
+        logger: { error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+        sendToRenderer: vi.fn(),
+        fileAccessBatcher: { push: vi.fn() },
+        statsUpdateBatcher: { push: vi.fn(), pushLazy: vi.fn() },
+        getStats: vi.fn().mockReturnValue({}),
+        getResourceUsage: vi.fn().mockReturnValue({}),
+        getLatestAgents: vi.fn().mockReturnValue([]),
+        setAgents: vi.fn(),
+        setLatestNetConnections: vi.fn(),
+        getPreviousPids: vi.fn().mockReturnValue(new Map()),
+        setPreviousPids: vi.fn(),
+      };
+      scanLoop.init(mockDeps);
+      scanLoop.startScanIntervals(5000);
+
+      // Process scan should fire at 5000ms
+      vi.advanceTimersByTime(5000);
+      expect(mockDeps.scanner.scanProcesses).toHaveBeenCalled();
+
+      // Stop and verify no more calls
+      scanLoop.stopScanIntervals();
+      const callCount = mockDeps.scanner.scanProcesses.mock.calls.length;
+      vi.advanceTimersByTime(10000);
+      expect(mockDeps.scanner.scanProcesses.mock.calls.length).toBe(callCount);
+    });
+  });
+
+  // ── IDE-extension injection and legacy WSL guest-agent exclusion ──
+
+  describe('external-agent injection into scan-batch', () => {
+    it('passes only a reliable current process map to the IDE detector', async () => {
+      const ide = require_('../../src/main/ide-extension-detector.js');
+      const origIde = ide.getCachedExtensionAgents;
+      const getCachedExtensionAgents = vi.fn().mockReturnValue([]);
+      ide.getCachedExtensionAgents = getCachedExtensionAgents;
+      try {
+        const processMap = new Map([[100, { name: 'Code.exe' }]]);
+        const deps = makeDeps({
+          scanner: {
+            scanProcesses: vi
+              .fn()
+              .mockResolvedValueOnce({ agents: [], changed: false, reliable: true, processMap })
+              .mockResolvedValueOnce({ agents: [], changed: false, reliable: false, processMap }),
+          },
+        });
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(5000);
+
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(getCachedExtensionAgents).toHaveBeenLastCalledWith(processMap);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(getCachedExtensionAgents).toHaveBeenLastCalledWith(undefined);
+      } finally {
+        ide.getCachedExtensionAgents = origIde;
+      }
+    });
+
+    it.each([
+      ['during identity stamping', [0, 1, 1]],
+      ['during working-directory lookup', [0, 0, 1]],
+    ])('does not reuse a process map after system sleep %s', async (_phase, suspendCounts) => {
+      const ide = require_('../../src/main/ide-extension-detector.js');
+      const origIde = ide.getCachedExtensionAgents;
+      const getCachedExtensionAgents = vi.fn().mockReturnValue([]);
+      ide.getCachedExtensionAgents = getCachedExtensionAgents;
+      try {
+        const processMap = new Map([[100, { name: 'Code.exe' }]]);
+        let observation = 0;
+        const deps = makeDeps({
+          scanner: {
+            scanProcesses: vi
+              .fn()
+              .mockResolvedValue({ agents: [], changed: false, reliable: true, processMap }),
+          },
+          observationGap: {
+            snapshot: vi.fn(() => ({
+              suspendCount: suspendCounts[Math.min(observation++, suspendCounts.length - 1)],
+            })),
+            noteObserved: vi.fn(),
+          },
+        });
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(5000);
+
+        await vi.advanceTimersByTimeAsync(5000);
+
+        expect(getCachedExtensionAgents).toHaveBeenCalledWith(undefined);
+      } finally {
+        ide.getCachedExtensionAgents = origIde;
+      }
+    });
+
+    it('injects cached IDE-extension agents into the scan-batch payload before sending', async () => {
+      const ide = require_('../../src/main/ide-extension-detector.js');
+      const origIde = ide.getCachedExtensionAgents;
+      const synthetic = {
+        agent: 'Kilo Code',
+        process: 'code.exe',
+        pid: 0,
+        status: 'running',
+        category: 'ai',
+        parentEditor: 'VS Code',
+        detectionMethod: 'ide-extension',
+      };
+      ide.getCachedExtensionAgents = () => [synthetic];
+      try {
+        const sendToRenderer = vi.fn();
+        const mockDeps = {
+          scanner: { scanProcesses: vi.fn().mockResolvedValue({ agents: [], changed: false }) },
+          procUtil: {
+            enrichWithParentChains: vi.fn().mockResolvedValue(),
+            annotateHostApps: vi.fn(),
+            annotateWorkingDirs: vi.fn().mockResolvedValue(),
+          },
+          watcher: {
+            pruneKnownHandles: vi.fn(),
+            scanAllFileHandles: vi.fn().mockResolvedValue([]),
+          },
+          network: {
+            isNetworkScanRunning: vi.fn().mockReturnValue(false),
+            setNetworkScanRunning: vi.fn(),
+            scanNetworkConnections: vi.fn().mockResolvedValue([]),
+          },
+          baselines: { recordNetworkEndpoint: vi.fn() },
+          anomaly: {
+            checkDeviations: vi.fn().mockReturnValue([]),
+            calculateAnomalyScore: vi.fn().mockReturnValue({ score: 0 }),
+          },
+          audit: { log: vi.fn() },
+          tray: { updateTrayIcon: vi.fn(), notifySensitive: vi.fn() },
+          logger: { error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+          sendToRenderer,
+          fileAccessBatcher: { push: vi.fn() },
+          statsUpdateBatcher: { push: vi.fn(), pushLazy: vi.fn() },
+          getStats: vi.fn().mockReturnValue({}),
+          getResourceUsage: vi.fn().mockReturnValue({}),
+          getLatestAgents: vi.fn().mockReturnValue([]),
+          setAgents: vi.fn(),
+          setLatestNetConnections: vi.fn(),
+          getPreviousPids: vi.fn().mockReturnValue(new Map()),
+          setPreviousPids: vi.fn(),
+        };
+        scanLoop.init(mockDeps);
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+
+        const batchCall = sendToRenderer.mock.calls.find((c) => c[0] === 'scan-batch');
+        expect(batchCall).toBeTruthy();
+        const names = batchCall[1].agents.map((a) => a.agent);
+        expect(names).toContain('Kilo Code');
+      } finally {
+        ide.getCachedExtensionAgents = origIde;
+      }
+    });
+
+    it('excludes a monkey-patched stale WSL guest-agent cache from scan-batch', async () => {
+      const wsl = require_('../../src/main/wsl-detector.js');
+      const origWsl = wsl.getCachedWslAgents;
+      const getCachedWslAgents = vi.fn().mockReturnValue([
+        {
+          agent: 'opencode',
+          process: 'node',
+          pid: 0,
+          status: 'running',
+          category: 'ai',
+          parentEditor: 'WSL',
+          host: 'wsl',
+          wslPid: 4318,
+          detectionMethod: 'wsl-process',
+        },
+      ]);
+      wsl.getCachedWslAgents = getCachedWslAgents;
+      try {
+        const deps = makeDeps();
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+        const batchCall = deps.sendToRenderer.mock.calls.find(
+          ([channel]) => channel === 'scan-batch',
+        );
+        expect(batchCall).toBeTruthy();
+        expect(batchCall[1].agents).toEqual([]);
+        expect(deps.setAgents).toHaveBeenCalledWith([]);
+        expect(getCachedWslAgents).not.toHaveBeenCalled();
+      } finally {
+        wsl.getCachedWslAgents = origWsl;
+      }
+    });
+  });
+
+  // ── instanceId coverage across the WHOLE scan-batch payload ──
+
+  describe('scan-batch instanceId invariant', () => {
+    /**
+     * Deps whose `enrichWithParentChains` stamps identity exactly as the real one
+     * does — via the same `identify()` — so the test measures the INJECTION gap
+     * and not a stub that hands out keys for free.
+     * @param {Function} sendToRenderer
+     * @param {boolean} changed - the scanner's changed-pid-set flag
+     * @returns {Object}
+     */
+    function makeStampingDeps(sendToRenderer, changed = false) {
+      const { identify } = require_('../../src/main/process-identity.js');
+      return makeDeps({
+        scanner: {
+          // A FRESH array per tick, which is what the real scanner returns — the
+          // injected synthetics live only in the previous tick's array and must
+          // never be carried back into the identity stamp. `mockResolvedValue`
+          // would hand out one shared array and quietly model the opposite.
+          scanProcesses: vi.fn().mockImplementation(async () => ({
+            agents: [
+              { agent: 'Claude Code', process: 'claude.exe', pid: 100, startTime: 1717000000000 },
+              { agent: 'Cursor', process: 'cursor.exe', pid: 200, startTime: 1717000100000 },
+            ],
+            changed,
+          })),
+        },
+        procUtil: {
+          enrichWithParentChains: vi.fn(async (agents) => {
+            for (const a of agents) {
+              const id = identify(a);
+              a.instanceId = id.instanceId;
+              a.instanceIdSource = id.instanceIdSource;
+            }
+          }),
+          annotateHostApps: vi.fn(),
+          annotateWorkingDirs: vi.fn().mockResolvedValue(),
+        },
+        sendToRenderer,
+      });
+    }
+
+    /**
+     * Run one full process scan with the IDE-extension detector stubbed, and return
+     * the `scan-batch` payload.
+     * @param {Array} ideAgents
+     * @param {boolean} [changed]
+     * @returns {Promise<{batch: Object, deps: Object}>}
+     */
+    async function runScanWithSynthetics(ideAgents, changed = false) {
+      const ide = require_('../../src/main/ide-extension-detector.js');
+      const origIde = ide.getCachedExtensionAgents;
+      ide.getCachedExtensionAgents = () => ideAgents;
+      try {
+        const sendToRenderer = vi.fn();
+        const mockDeps = makeStampingDeps(sendToRenderer, changed);
+        scanLoop.init(mockDeps);
+        // A helper may be called twice in one test (the across-ticks case); drop
+        // the previous interval so each call runs exactly one scan.
+        scanLoop.stopScanIntervals();
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+        const batchCall = sendToRenderer.mock.calls.find((c) => c[0] === 'scan-batch');
+        expect(batchCall).toBeTruthy();
+        return { batch: batchCall[1], deps: mockDeps };
+      } finally {
+        ide.getCachedExtensionAgents = origIde;
+      }
+    }
+
+    /**
+     * Both IDE-extension agents carry the SAME `process` (the editor host exe) —
+     * that is what the real detector emits, and the reason the synthetic key
+     * cannot be derived from `process`.
+     */
+    const IDE_SYNTHETICS = [
+      {
+        agent: 'Kilo Code',
+        process: 'code.exe',
+        pid: 0,
+        status: 'running',
+        category: 'ai',
+        parentEditor: 'VS Code',
+        detectionMethod: 'ide-extension',
+      },
+      {
+        agent: 'Cline',
+        process: 'code.exe',
+        pid: 0,
+        status: 'running',
+        category: 'ai',
+        parentEditor: 'VS Code',
+        detectionMethod: 'ide-extension',
+      },
+    ];
+    it('every agent in the scan-batch payload carries a non-empty instanceId', async () => {
+      const { batch } = await runScanWithSynthetics(IDE_SYNTHETICS.map((a) => ({ ...a })));
+
+      // The invariant is asserted over the WHOLE batch, and the count is pinned
+      // first so a batch that lost its synthetics cannot pass vacuously
+      // (memory-bank/ai-mistakes.md#21): 2 scanned + 2 IDE.
+      expect(batch.agents).toHaveLength(4);
+      const missing = batch.agents
+        .filter((a) => typeof a.instanceId !== 'string' || a.instanceId.length === 0)
+        .map((a) => a.agent);
+      expect(missing).toEqual([]);
+      // And every source is one of the three declared value spaces.
+      for (const a of batch.agents) {
+        expect(['os', 'synthetic', 'unknown']).toContain(a.instanceIdSource);
+      }
+    });
+
+    it('two distinct pid-0 agents sharing a process name get distinct instanceIds', async () => {
+      const { batch } = await runScanWithSynthetics(IDE_SYNTHETICS.map((a) => ({ ...a })));
+
+      const byName = new Map(batch.agents.map((a) => [a.agent, a.instanceId]));
+      // Keyed on `process` these would collapse: 0:code.exe twice.
+      expect(byName.get('Kilo Code')).toBe('0:kilo-code');
+      expect(byName.get('Cline')).toBe('0:cline');
+      // No two agents in the batch share a key, synthetic or otherwise.
+      const ids = batch.agents.map((a) => a.instanceId);
+      expect(new Set(ids).size).toBe(ids.length);
+    });
+
+    it('the synthetic key is stable across ticks — a card does not churn', async () => {
+      const first = await runScanWithSynthetics(IDE_SYNTHETICS.map((a) => ({ ...a })));
+      const second = await runScanWithSynthetics(IDE_SYNTHETICS.map((a) => ({ ...a })));
+      const idsOf = (b) =>
+        b.agents.filter((a) => a.pid === 0).map((a) => `${a.agent}=${a.instanceId}`);
+      // Pinned literally, so two ticks of `undefined` cannot satisfy "stable".
+      expect(idsOf(first.batch)).toEqual(['Kilo Code=0:kilo-code', 'Cline=0:cline']);
+      expect(idsOf(second.batch)).toEqual(idsOf(first.batch));
+    });
+  });
+
+  // ── identity degradation freezes sessions instead of splitting them ──
+
+  describe('identity degradation during a snapshot outage', () => {
+    /**
+     * The predicate itself, exercised on the REAL process-scanner.
+     *
+     * It lives here rather than in `process-scanner.test.js` because this is the
+     * consumer that acts on it: nothing else in the codebase gates on identity
+     * quality (`getIdentityQuality` is annotation by design), so the contract and
+     * the only thing that reads it are asserted together.
+     */
+    describe('scanner.isIdentityDegraded()', () => {
+      let scanner;
+      let SENSOR_HEALTH_STATE;
+
+      beforeEach(() => {
+        scanner = require_('../../src/main/process-scanner.js');
+        SENSOR_HEALTH_STATE = require_('../../src/main/sensor-health.js').SENSOR_HEALTH_STATE;
+        scanner._resetForTest();
+      });
+
+      afterEach(() => {
+        // Module-level overrides — restore, or a later test inherits this
+        // platform's identity story.
+        scanner._resetForTest();
+      });
+
+      /**
+       * @param {boolean} providesStartTime
+       * @param {string} snapshotState
+       * @returns {boolean}
+       */
+      function degradedWith(providesStartTime, snapshotState) {
+        scanner._setPlatformForTest({
+          providesStartTime,
+          getSnapshotHealth: () => ({ state: snapshotState }),
+        });
+        return scanner.isIdentityDegraded();
+      }
+
+      it('a birth-time platform whose observation FAILED is degraded', () => {
+        expect(degradedWith(true, SENSOR_HEALTH_STATE.FAILED)).toBe(true);
+      });
+
+      it('a birth-time platform that has not observed yet is degraded', () => {
+        expect(degradedWith(true, SENSOR_HEALTH_STATE.STARTING)).toBe(true);
+      });
+
+      it('a healthy observation is not degraded', () => {
+        expect(degradedWith(true, SENSOR_HEALTH_STATE.HEALTHY)).toBe(false);
+      });
+
+      it('the CIM fallback is not degradation — the keys still form the same way', () => {
+        expect(degradedWith(true, SENSOR_HEALTH_STATE.DEGRADED)).toBe(false);
+      });
+
+      it('platforms without birth times are NEVER degraded, whatever the snapshot says', () => {
+        // `<pid>:u` is their steady state, not an outage. Reading their permanent
+        // `identityQuality: 'unknown'` as degradation would freeze session tracking
+        // on those platforms forever.
+        expect(degradedWith(false, SENSOR_HEALTH_STATE.FAILED)).toBe(false);
+        expect(degradedWith(false, SENSOR_HEALTH_STATE.STARTING)).toBe(false);
+        expect(degradedWith(false, SENSOR_HEALTH_STATE.HEALTHY)).toBe(false);
+        expect(scanner.isIdentityDegraded([{ pid: 100, instanceIdSource: 'unknown' }])).toBe(false);
+        expect(scanner.getUnwitnessedPids([{ pid: 100, instanceIdSource: 'unknown' }])).toEqual(
+          new Set(),
+        );
+      });
+    });
+
+    /**
+     * Deps for a birth-time platform whose process map can be taken away.
+     *
+     * `enrichWithParentChains` is faithful to `_stampFromFreshBirthTimes`: the birth
+     * time comes from THIS pass's map or is null, and `identify()` does the rest —
+     * so an emptied map produces `<pid>:u` here for the same reason it does in
+     * production. `isIdentityDegraded` answers off the same map, which is the
+     * coupling process-snapshot.js publishes (an empty map is a failed observation).
+     * @param {{map: Map<number, number>}} state - mutable, so a tick can take the
+     *   observation away between two `advanceTimersByTimeAsync` calls.
+     * @returns {Object}
+     */
+    function makeOutageDeps(state) {
+      const { identify } = require_('../../src/main/process-identity.js');
+      return makeDeps({
+        scanner: {
+          scanProcesses: vi.fn().mockImplementation(async () => ({
+            agents: [
+              { agent: 'Claude Code', process: 'claude.exe', pid: 100 },
+              { agent: 'Cursor', process: 'cursor.exe', pid: 200 },
+            ],
+            changed: false,
+            reliable: true,
+          })),
+          isIdentityDegraded: vi.fn(() => state.map.size === 0),
+          getUnwitnessedPids: vi.fn(
+            (agents) =>
+              new Set(
+                agents
+                  .filter((agent) => agent.pid > 0 && agent.instanceIdSource !== 'os')
+                  .map((agent) => agent.pid),
+              ),
+          ),
+        },
+        procUtil: {
+          enrichWithParentChains: vi.fn(async (agents) => {
+            for (const a of agents) {
+              a.startTime = state.map.has(a.pid) ? state.map.get(a.pid) : null;
+              const id = identify(a);
+              a.instanceId = id.instanceId;
+              a.instanceIdSource = id.instanceIdSource;
+            }
+          }),
+          annotateHostApps: vi.fn(),
+          annotateWorkingDirs: vi.fn().mockResolvedValue(),
+        },
+      });
+    }
+
+    /** The birth times the two agents keep for their whole life. */
+    const LIVE_MAP = () =>
+      new Map([
+        [100, 1717000000000],
+        [200, 1717000100000],
+      ]);
+
+    /**
+     * @param {Object} deps
+     * @param {string} type
+     * @returns {Array<Object>} the audit payloads of one kind, in order.
+     */
+    function auditOf(deps, type) {
+      return deps.audit.log.mock.calls.filter((c) => c[0] === type).map((c) => c[1]);
+    }
+
+    it('a snapshot outage emits no agent-exit and no duplicate agent-enter', async () => {
+      // session-tracker holds module state that this file's cache clear does not
+      // reach, so this block starts from an empty session set explicitly.
+      require_('../../src/main/session-tracker.js')._resetForTest();
+
+      const state = { map: LIVE_MAP() };
+      const deps = makeOutageDeps(state);
+      scanLoop.init(deps);
+      scanLoop.stopScanIntervals();
+      scanLoop.startScanIntervals(5000);
+
+      await vi.advanceTimersByTimeAsync(5000); // tick 1 — both agents enter
+      state.map = new Map(); // the provider falls over
+      await vi.advanceTimersByTimeAsync(5000); // tick 2 — keys would flip to :u
+      await vi.advanceTimersByTimeAsync(5000); // tick 3 — grace 2 would fire here
+      expect(deps.watcher.pruneKnownHandles).toHaveBeenCalledTimes(1);
+      state.map = LIVE_MAP(); // the provider comes back
+      await vi.advanceTimersByTimeAsync(5000); // tick 4 — mirror pair would fire here
+      expect(deps.watcher.pruneKnownHandles).toHaveBeenCalledTimes(2);
+
+      const entered = auditOf(deps, 'agent-enter');
+      expect(auditOf(deps, 'agent-exit')).toHaveLength(0);
+      expect(entered).toHaveLength(2);
+      expect(entered.map((e) => e.instanceId).sort()).toEqual([
+        '100:1717000000000',
+        '200:1717000100000',
+      ]);
+    });
+
+    it('preserves holder history across partial birth-time loss and recovery', async () => {
+      require_('../../src/main/session-tracker.js')._resetForTest();
+      const state = { map: LIVE_MAP() };
+      const deps = makeOutageDeps(state);
+      deps.sequenceEngine = { observePopulation: vi.fn() };
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(deps.watcher.pruneKnownHandles).toHaveBeenCalledTimes(1);
+      state.map = new Map([
+        [100, null],
+        [200, 1717000100000],
+      ]);
+      await vi.advanceTimersByTimeAsync(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(deps.sequenceEngine.observePopulation).toHaveBeenLastCalledWith(
+        [
+          expect.objectContaining({ pid: 100, instanceIdSource: 'unknown' }),
+          expect.objectContaining({ pid: 200, instanceIdSource: 'os' }),
+        ],
+        true,
+      );
+      expect(deps.watcher.pruneKnownHandles).toHaveBeenCalledTimes(3);
+      expect(deps.watcher.pruneKnownHandles).toHaveBeenLastCalledWith(expect.any(Array), {
+        preservePids: new Set([100]),
+        previousAgents: expect.any(Array),
+      });
+      expect(deps.scanner.getUnwitnessedPids).toHaveBeenLastCalledWith([
+        expect.objectContaining({ pid: 100, instanceId: '100:u' }),
+        expect.objectContaining({ pid: 200, instanceId: '200:1717000100000' }),
+      ]);
+      expect(deps.audit.log.mock.calls.filter((call) => call[0] === 'agent-enter')).toHaveLength(2);
+      expect(deps.audit.log.mock.calls.filter((call) => call[0] === 'agent-exit')).toHaveLength(0);
+
+      state.map = LIVE_MAP();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(deps.watcher.pruneKnownHandles).toHaveBeenCalledTimes(4);
+      expect(deps.audit.log.mock.calls.filter((call) => call[0] === 'agent-enter')).toHaveLength(2);
+      expect(deps.audit.log.mock.calls.filter((call) => call[0] === 'agent-exit')).toHaveLength(0);
+    });
+
+    it('the scan-batch still carries the honest degraded key while frozen', async () => {
+      // Freezing is about SESSION state. The batch is an observation and must keep
+      // reporting what was actually observed — `<pid>:u`, not a remembered key.
+      require_('../../src/main/session-tracker.js')._resetForTest();
+
+      const state = { map: LIVE_MAP() };
+      const deps = makeOutageDeps(state);
+      scanLoop.init(deps);
+      scanLoop.stopScanIntervals();
+      scanLoop.startScanIntervals(5000);
+
+      await vi.advanceTimersByTimeAsync(5000);
+      state.map = new Map();
+      await vi.advanceTimersByTimeAsync(5000);
+
+      const batches = deps.sendToRenderer.mock.calls.filter((c) => c[0] === 'scan-batch');
+      expect(batches).toHaveLength(2);
+      expect(batches[1][1].agents.map((a) => a.instanceId)).toEqual(['100:u', '200:u']);
+    });
+  });
+
+  // ── attachModels order + instanceId stamp (local LLM runtimes) ──
+
+  describe('attachModels before scan-batch', () => {
+    /**
+     * Point llm-runtime-detector at fixed async results for this test, then restore.
+     * @param {{ollama?: {running:boolean,models:string[]}, lmstudio?: {running:boolean,models:string[]}}} responses
+     * @param {() => Promise<void>} body
+     */
+    async function withLlmDetectors(responses, body) {
+      const llm = require_('../../src/main/llm-runtime-detector.js');
+      const origO = llm.detectOllamaModels;
+      const origL = llm.detectLMStudioModels;
+      llm.detectOllamaModels =
+        typeof responses.ollama === 'function'
+          ? responses.ollama
+          : async () => responses.ollama || { running: false, models: [] };
+      llm.detectLMStudioModels =
+        typeof responses.lmstudio === 'function'
+          ? responses.lmstudio
+          : async () => responses.lmstudio || { running: false, models: [] };
+      try {
+        await body();
+      } finally {
+        llm.detectOllamaModels = origO;
+        llm.detectLMStudioModels = origL;
+      }
+    }
+
+    it('starts both model probes during CWD enrichment and waits for one complete batch', async () => {
+      const deferred = () => {
+        let resolve;
+        const promise = new Promise((done) => {
+          resolve = done;
+        });
+        return { promise, resolve };
+      };
+      const cwd = deferred();
+      const ollama = deferred();
+      const studio = deferred();
+      const detectOllama = vi.fn(() => ollama.promise);
+      const detectStudio = vi.fn(() => studio.promise);
+      await withLlmDetectors({ ollama: detectOllama, lmstudio: detectStudio }, async () => {
+        const sendToRenderer = vi.fn();
+        const agents = [
+          {
+            agent: 'Ollama',
+            process: 'ollama.exe',
+            pid: 42,
+            instanceId: '42:birth',
+            instanceIdSource: 'os',
+          },
+        ];
+        const deps = makeDeps({
+          scanner: { scanProcesses: vi.fn().mockResolvedValue({ agents, changed: false }) },
+          procUtil: {
+            enrichWithParentChains: vi.fn().mockResolvedValue(),
+            annotateHostApps: vi.fn(),
+            annotateWorkingDirs: vi.fn(() => cwd.promise),
+          },
+          sendToRenderer,
+        });
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(deps.procUtil.annotateWorkingDirs).toHaveBeenCalledOnce();
+        expect(detectOllama).toHaveBeenCalledOnce();
+        expect(detectStudio).toHaveBeenCalledOnce();
+        expect(sendToRenderer.mock.calls.some(([channel]) => channel === 'scan-batch')).toBe(false);
+
+        ollama.resolve({ running: true, models: ['llama3'] });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(sendToRenderer.mock.calls.some(([channel]) => channel === 'scan-batch')).toBe(false);
+        cwd.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(sendToRenderer.mock.calls.some(([channel]) => channel === 'scan-batch')).toBe(false);
+        studio.resolve({ running: true, models: ['mistral'] });
+        await vi.advanceTimersByTimeAsync(0);
+        const batches = sendToRenderer.mock.calls.filter(([channel]) => channel === 'scan-batch');
+        expect(batches).toHaveLength(1);
+        expect(batches[0][1].agents.find((agent) => agent.agent === 'Ollama')).toMatchObject({
+          instanceId: '42:birth',
+          localModels: ['llama3'],
+        });
+        expect(batches[0][1].agents.find((agent) => agent.agent === 'LM Studio')).toMatchObject({
+          pid: 0,
+          instanceId: '0:lm-studio',
+          localModels: ['mistral'],
+        });
+      });
+    });
+
+    it('keeps an early probe failure out of the batch until CWD settles', async () => {
+      let finishCwd;
+      let failOllama;
+      const cwd = new Promise((resolve) => {
+        finishCwd = resolve;
+      });
+      const ollama = new Promise((_resolve, reject) => {
+        failOllama = reject;
+      });
+      await withLlmDetectors(
+        {
+          ollama: () => ollama,
+          lmstudio: async () => ({ running: false, models: [] }),
+        },
+        async () => {
+          const deps = makeDeps({
+            procUtil: {
+              enrichWithParentChains: vi.fn().mockResolvedValue(),
+              annotateHostApps: vi.fn(),
+              annotateWorkingDirs: vi.fn(() => cwd),
+            },
+          });
+          const previousModels = scanLoop.getLatestLocalModels();
+          scanLoop.init(deps);
+          scanLoop.startScanIntervals(5000);
+          await vi.advanceTimersByTimeAsync(5000);
+          failOllama(new Error('PRIVATE_PROBE_ERROR'));
+          await vi.advanceTimersByTimeAsync(0);
+          expect(deps.sendToRenderer.mock.calls.some(([channel]) => channel === 'scan-batch')).toBe(
+            false,
+          );
+          finishCwd();
+          await vi.advanceTimersByTimeAsync(0);
+          expect(deps.sendToRenderer.mock.calls.some(([channel]) => channel === 'scan-batch')).toBe(
+            false,
+          );
+          expect(scanLoop.getLatestLocalModels()).toBe(previousModels);
+          expect(deps.logger.error).toHaveBeenCalledWith('main', 'Process scan failed', {
+            error: 'process-scan-failed',
+          });
+          expect(JSON.stringify(deps.logger.error.mock.calls)).not.toContain('PRIVATE');
+        },
+      );
+    });
+
+    it('overlaps controlled 70 ms CWD and 50 ms model probe delays', async () => {
+      const wait = (ms, result) => new Promise((resolve) => setTimeout(() => resolve(result), ms));
+      await withLlmDetectors(
+        {
+          ollama: () => wait(50, { running: false, models: [] }),
+          lmstudio: () => wait(50, { running: true, models: ['mistral'] }),
+        },
+        async () => {
+          let batchAt = null;
+          const deps = makeDeps({
+            procUtil: {
+              enrichWithParentChains: vi.fn().mockResolvedValue(),
+              annotateHostApps: vi.fn(),
+              annotateWorkingDirs: vi.fn(() => wait(70)),
+            },
+            sendToRenderer: vi.fn((channel) => {
+              if (channel === 'scan-batch') batchAt = Date.now();
+            }),
+          });
+          scanLoop.init(deps);
+          scanLoop.startScanIntervals(5000);
+          await vi.advanceTimersByTimeAsync(5000);
+          const startedAt = Date.now();
+          await vi.advanceTimersByTimeAsync(120);
+          expect(batchAt - startedAt).toBe(70);
+        },
+      );
+    });
+
+    it('includes a stamped Ollama synthetic in the scan-batch (not a post-send ghost)', async () => {
+      await withLlmDetectors(
+        { ollama: { running: true, models: ['llama3'] }, lmstudio: { running: false, models: [] } },
+        async () => {
+          const sendToRenderer = vi.fn();
+          const deps = makeDeps({
+            scanner: {
+              scanProcesses: vi.fn().mockResolvedValue({
+                agents: [
+                  {
+                    agent: 'Claude Code',
+                    process: 'claude.exe',
+                    pid: 100,
+                    startTime: 1717000000000,
+                    instanceId: '100:1717000000000',
+                    instanceIdSource: 'os',
+                  },
+                ],
+                changed: false,
+              }),
+            },
+            sendToRenderer,
+          });
+          scanLoop.init(deps);
+          scanLoop.startScanIntervals(5000);
+          await vi.advanceTimersByTimeAsync(5000);
+
+          const batchCall = sendToRenderer.mock.calls.find((c) => c[0] === 'scan-batch');
+          expect(batchCall).toBeTruthy();
+          const ollama = batchCall[1].agents.find((a) => a.agent === 'Ollama');
+          expect(ollama).toBeTruthy();
+          expect(ollama.localModels).toEqual(['llama3']);
+          // Space 2 synthetic from display name (not process host, not name fabrication beyond identify).
+          expect(ollama.instanceId).toBe('0:ollama');
+          expect(ollama.instanceIdSource).toBe('synthetic');
+          // Distinct from the real scanned agent — same-name cross-association cannot apply.
+          expect(ollama.instanceId).not.toBe('100:1717000000000');
+        },
+      );
+    });
+
+    it('preserves an already-stamped instanceId when only attaching models', async () => {
+      await withLlmDetectors({ ollama: { running: true, models: ['mistral'] } }, async () => {
+        const stampedId = '4242:1717000999999';
+        const sendToRenderer = vi.fn();
+        const deps = makeDeps({
+          scanner: {
+            scanProcesses: vi.fn().mockResolvedValue({
+              agents: [
+                {
+                  agent: 'Ollama',
+                  process: 'ollama.exe',
+                  pid: 4242,
+                  startTime: 1717000999999,
+                  instanceId: stampedId,
+                  instanceIdSource: 'os',
+                },
+              ],
+              changed: false,
+            }),
+          },
+          // Parent-chain stub must NOT wipe the stamp (real path preserves it).
+          procUtil: {
+            enrichWithParentChains: vi.fn().mockResolvedValue(),
+            annotateHostApps: vi.fn(),
+            annotateWorkingDirs: vi.fn().mockResolvedValue(),
+          },
+          sendToRenderer,
+        });
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+
+        const batch = sendToRenderer.mock.calls.find((c) => c[0] === 'scan-batch')[1];
+        const ollama = batch.agents.find((a) => a.agent === 'Ollama');
+        expect(ollama.localModels).toEqual(['mistral']);
+        // attachModels must not re-derive over an authoritative stamp (PID reuse / name traps).
+        expect(ollama.instanceId).toBe(stampedId);
+        expect(ollama.instanceIdSource).toBe('os');
+      });
+    });
+
+    it('stamps two concurrent local runtimes distinctly by name, not pid', async () => {
+      await withLlmDetectors(
+        {
+          ollama: { running: true, models: ['a'] },
+          lmstudio: { running: true, models: ['b'] },
+        },
+        async () => {
+          const sendToRenderer = vi.fn();
+          scanLoop.init(
+            makeDeps({
+              scanner: {
+                scanProcesses: vi.fn().mockResolvedValue({ agents: [], changed: false }),
+              },
+              sendToRenderer,
+            }),
+          );
+          scanLoop.startScanIntervals(5000);
+          await vi.advanceTimersByTimeAsync(5000);
+
+          const agents = sendToRenderer.mock.calls.find((c) => c[0] === 'scan-batch')[1].agents;
+          const ollama = agents.find((a) => a.agent === 'Ollama');
+          const lm = agents.find((a) => a.agent === 'LM Studio');
+          expect(ollama.instanceId).toBe('0:ollama');
+          expect(lm.instanceId).toBe('0:lm-studio');
+          expect(ollama.instanceId).not.toBe(lm.instanceId);
+          // Both are pid 0 — pid alone would collide; identity is not the bare pid.
+          expect(ollama.pid).toBe(0);
+          expect(lm.pid).toBe(0);
+        },
+      );
+    });
+
+    it('does not invent identity from name when the runtime is not running', async () => {
+      await withLlmDetectors(
+        { ollama: { running: false, models: [] }, lmstudio: { running: false, models: [] } },
+        async () => {
+          const sendToRenderer = vi.fn();
+          scanLoop.init(
+            makeDeps({
+              scanner: {
+                scanProcesses: vi.fn().mockResolvedValue({ agents: [], changed: false }),
+              },
+              sendToRenderer,
+            }),
+          );
+          scanLoop.startScanIntervals(5000);
+          await vi.advanceTimersByTimeAsync(5000);
+
+          const agents = sendToRenderer.mock.calls.find((c) => c[0] === 'scan-batch')[1].agents;
+          expect(agents.find((a) => a.agent === 'Ollama')).toBeUndefined();
+          expect(agents.find((a) => a.agent === 'LM Studio')).toBeUndefined();
+        },
+      );
+    });
+  });
+
+  // ── cwd annotation forceRefresh wiring ──
+
+  describe('annotateWorkingDirs forceRefresh wiring', () => {
+    it('retires baseline data only after reliable exit grace, and rejects late native records', async () => {
+      const sessions = require_('../../src/main/session-tracker.js');
+      sessions._resetForTest();
+      const agent = { agent: 'Fixture', process: 'fixture.exe', pid: 300, instanceId: '300:1000' };
+      const finalizeInstances = vi.fn();
+      const forgetInstances = vi.fn();
+      const initialize = vi.fn();
+      const scan = vi.fn().mockResolvedValue({ agents: [agent], reliable: true });
+      const d = makeDeps({ scanner: { scanProcesses: scan } });
+      d.baselines = { ...d.baselines, init: initialize, finalizeInstances };
+      d.anomaly.forgetInstances = forgetInstances;
+      scanLoop.init(d);
+      const valid = initialize.mock.calls[0][0].isInstanceActive;
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(valid(agent.instanceId)).toBe(true);
+      scan.mockResolvedValue({ agents: [], reliable: false });
+      await vi.advanceTimersByTimeAsync(20000);
+      expect(finalizeInstances).not.toHaveBeenCalled();
+      expect(valid(agent.instanceId)).toBe(true);
+      scan.mockResolvedValue({ agents: [], reliable: true });
+      for (let i = 1; i < sessions.DEFAULT_EXIT_GRACE; i++) {
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(finalizeInstances).not.toHaveBeenCalled();
+      }
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(finalizeInstances).toHaveBeenCalledOnce();
+      expect(finalizeInstances.mock.calls[0][0][0].instanceId).toBe(agent.instanceId);
+      expect(forgetInstances).toHaveBeenCalledWith([agent.instanceId]);
+      expect(valid(agent.instanceId)).toBe(false);
+      sessions._resetForTest();
+    });
+
+    /** @param {boolean} changed @returns {Promise<Object>} the procUtil mock after one scan */
+    async function scanWithChanged(changed, processMap) {
+      const mockDeps = makeDeps({
+        scanner: {
+          scanProcesses: vi
+            .fn()
+            .mockResolvedValue({ agents: [{ agent: 'Cursor', pid: 300 }], changed, processMap }),
+        },
+      });
+      scanLoop.init(mockDeps);
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      return mockDeps.procUtil;
+    }
+
+    it('passes forceRefresh true when the scanned pid set changed, mirroring the identity stamp', async () => {
+      const procUtil = await scanWithChanged(true);
+      expect(procUtil.annotateWorkingDirs).toHaveBeenCalledWith(expect.any(Array), {
+        forceRefresh: true,
+      });
+      // The two calls agree — a tick that re-identifies must also re-read the cwd.
+      expect(procUtil.enrichWithParentChains).toHaveBeenCalledWith(expect.any(Array), {
+        forceRefresh: true,
+      });
+    });
+
+    it('passes the exact population observation through to identity enrichment', async () => {
+      const processMap = new Map([[300, { name: 'cursor.exe', startTime: 1000 }]]);
+      const procUtil = await scanWithChanged(false, processMap);
+      expect(procUtil.enrichWithParentChains.mock.calls[0][1].processMap).toBe(processMap);
+    });
+
+    it('passes forceRefresh false on an unchanged pid set, so the cache still serves', async () => {
+      const procUtil = await scanWithChanged(false);
+      expect(procUtil.annotateWorkingDirs).toHaveBeenCalledWith(expect.any(Array), {
+        forceRefresh: false,
+      });
+    });
+  });
+
+  // ── getLatestLocalModels ──
+
+  describe('getLatestLocalModels', () => {
+    it('returns default empty models before any scan', () => {
+      const models = scanLoop.getLatestLocalModels();
+      expect(models.ollama).toEqual({ running: false, models: [] });
+      expect(models.lmstudio).toEqual({ running: false, models: [] });
+    });
+  });
+
+  // ── reentrancy guard (doProcessScan) ──
+
+  describe('WSL inventory scheduling', () => {
+    it('refreshes on its own cadence while process enumeration remains pending', async () => {
+      const refreshWslInventory = vi.fn(() => new Promise(() => {}));
+      const deps = makeDeps({
+        refreshWslInventory,
+        scanner: { scanProcesses: vi.fn(() => new Promise(() => {})) },
+      });
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(30000);
+      expect(refreshWslInventory).toHaveBeenCalledTimes(2);
+      expect(deps.scanner.scanProcesses).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['throws', 'rejects'])(
+      'keeps host scanning independent when inventory %s',
+      async (failure) => {
+        const refreshWslInventory = vi.fn(() => {
+          if (failure === 'throws') throw new Error('inventory unavailable');
+          return Promise.reject(new Error('inventory unavailable'));
+        });
+        const refreshDockerDiscovery = vi.fn();
+        const refreshPodmanDiscovery = vi.fn();
+        const deps = makeDeps({
+          refreshWslInventory,
+          refreshDockerDiscovery,
+          refreshPodmanDiscovery,
+        });
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(refreshWslInventory).toHaveBeenCalledTimes(1);
+        expect(refreshDockerDiscovery).toHaveBeenCalledTimes(1);
+        expect(refreshPodmanDiscovery).toHaveBeenCalledTimes(1);
+        expect(deps.scanner.scanProcesses).toHaveBeenCalledTimes(1);
+        expect(deps.sendToRenderer.mock.calls.some(([channel]) => channel === 'scan-batch')).toBe(
+          true,
+        );
+        expect(deps.logger.error).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['docker', 'podman'])(
+      'cancels %s discovery between ps and inspect and permits resume',
+      async (engine) => {
+        const module = require_(
+          `../../src/main/${engine === 'docker' ? 'container' : 'podman'}-scanner`,
+        );
+        const create =
+          engine === 'docker' ? module.createDockerDiscovery : module.createPodmanDiscovery;
+        const callbacks = [];
+        const kill = vi.fn();
+        const onUpdate = vi.fn();
+        const execFile = vi.fn((file, args, options, callback) => {
+          callbacks.push(callback);
+          return { kill };
+        });
+        const discovery = create({
+          platform: 'linux',
+          execFile,
+          onUpdate,
+          fs: {
+            realpathSync: (file) => file,
+            lstatSync: (file) => ({
+              uid: 0,
+              mode: 0o755,
+              isSymbolicLink: () => false,
+              isFile: () => file === `/usr/bin/${engine}`,
+              isDirectory: () => file !== `/usr/bin/${engine}`,
+            }),
+            statSync: () => ({ isFile: () => true }),
+            accessSync: () => {},
+          },
+        });
+        let pending;
+        const refresh = () => {
+          pending = discovery.refresh();
+          return pending;
+        };
+        scanLoop.init(
+          makeDeps({
+            [engine === 'docker' ? 'refreshDockerDiscovery' : 'refreshPodmanDiscovery']: refresh,
+            [engine === 'docker' ? 'cancelDockerDiscovery' : 'cancelPodmanDiscovery']: () =>
+              discovery.cancelRefresh(),
+          }),
+        );
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+        const row = JSON.stringify({
+          ID: 'a'.repeat(64),
+          Image: 'agent0ai/agent-zero:latest',
+          Names: 'agent-zero',
+          ...(engine === 'podman' ? { State: 'running' } : {}),
+        });
+        callbacks[0](null, row);
+        scanLoop.stopScanIntervals();
+        await vi.advanceTimersByTimeAsync(4000);
+        await pending;
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(onUpdate).not.toHaveBeenCalled();
+        expect(discovery.snapshot().candidates).toEqual([]);
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(execFile).toHaveBeenCalledTimes(2);
+        callbacks[1](null, '');
+        await pending;
+        expect(onUpdate).toHaveBeenCalledTimes(1);
+        discovery.stop();
+      },
+    );
+
+    it('cancels an in-flight refresh on stop and resumes with one timer', async () => {
+      let paused = false;
+      const refreshWslInventory = vi.fn(() => new Promise(() => {}));
+      const cancelWslInventory = vi.fn();
+      scanLoop.init(
+        makeDeps({ refreshWslInventory, cancelWslInventory, isMonitoringPaused: () => paused }),
+      );
+      scanLoop.startScanIntervals(5000);
+      expect(refreshWslInventory).toHaveBeenCalledTimes(1);
+      paused = true;
+      scanLoop.stopScanIntervals();
+      expect(cancelWslInventory).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60000);
+      expect(refreshWslInventory).toHaveBeenCalledTimes(1);
+      paused = false;
+      scanLoop.startScanIntervals(5000);
+      expect(refreshWslInventory).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(30000);
+      expect(refreshWslInventory).toHaveBeenCalledTimes(3);
+    });
+
+    it('never launches from paused startup or a stopped deferred startup', async () => {
+      const refreshWslInventory = vi.fn();
+      const deps = makeDeps({ refreshWslInventory });
+      scanLoop.init(deps);
+      scanLoop.staggeredStartup(5000, true);
+      await vi.advanceTimersByTimeAsync(60000);
+      expect(refreshWslInventory).not.toHaveBeenCalled();
+      scanLoop.staggeredStartup(5000, false);
+      scanLoop.stopScanIntervals();
+      await vi.advanceTimersByTimeAsync(60000);
+      expect(refreshWslInventory).not.toHaveBeenCalled();
+    });
+
+    it('keeps one background timer through the warmup transition', async () => {
+      const refreshWslInventory = vi.fn();
+      scanLoop.init(makeDeps({ refreshWslInventory }));
+      scanLoop.staggeredStartup(5000, false);
+      await vi.advanceTimersByTimeAsync(14999);
+      expect(refreshWslInventory).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(60001);
+      expect(refreshWslInventory).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('container discovery scheduling', () => {
+    it('publishes host agents while both metadata discoveries are still pending', async () => {
+      const refreshDockerDiscovery = vi.fn(() => new Promise(() => {}));
+      const refreshPodmanDiscovery = vi.fn(() => new Promise(() => {}));
+      const deps = makeDeps({ refreshDockerDiscovery, refreshPodmanDiscovery });
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(refreshDockerDiscovery).toHaveBeenCalledTimes(1);
+      expect(refreshPodmanDiscovery).toHaveBeenCalledTimes(1);
+      expect(deps.scanner.scanProcesses).toHaveBeenCalledTimes(1);
+      expect(deps.sendToRenderer.mock.calls.some(([channel]) => channel === 'scan-batch')).toBe(
+        true,
+      );
+    });
+
+    it.each([
+      ['Docker', 'throws'],
+      ['Docker', 'rejects'],
+      ['Podman', 'throws'],
+      ['Podman', 'rejects'],
+    ])(
+      'keeps the other runtime and host scan alive when %s discovery %s',
+      async (runtime, failure) => {
+        const refreshDockerDiscovery = vi.fn();
+        const refreshPodmanDiscovery = vi.fn();
+        const failedRefresh =
+          runtime === 'Docker' ? refreshDockerDiscovery : refreshPodmanDiscovery;
+        failedRefresh.mockImplementation(() => {
+          if (failure === 'throws') throw new Error('discovery unavailable');
+          return Promise.reject(new Error('discovery unavailable'));
+        });
+        const deps = makeDeps({ refreshDockerDiscovery, refreshPodmanDiscovery });
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(5000);
+
+        await vi.advanceTimersByTimeAsync(5000);
+
+        expect(refreshDockerDiscovery).toHaveBeenCalledTimes(1);
+        expect(refreshPodmanDiscovery).toHaveBeenCalledTimes(1);
+        expect(deps.scanner.scanProcesses).toHaveBeenCalledTimes(1);
+        expect(deps.sendToRenderer.mock.calls.some(([channel]) => channel === 'scan-batch')).toBe(
+          true,
+        );
+        expect(deps.logger.error).not.toHaveBeenCalled();
+      },
+    );
+
+    it('does not refresh discovery from a paused startup tick', async () => {
+      const refreshDockerDiscovery = vi.fn();
+      const refreshPodmanDiscovery = vi.fn();
+      const deps = makeDeps({
+        refreshDockerDiscovery,
+        refreshPodmanDiscovery,
+        isMonitoringPaused: () => true,
+      });
+      scanLoop.init(deps);
+      scanLoop.staggeredStartup(5000, true);
+
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(deps.scanner.scanProcesses).toHaveBeenCalledTimes(1);
+      expect(refreshDockerDiscovery).not.toHaveBeenCalled();
+      expect(refreshPodmanDiscovery).not.toHaveBeenCalled();
+    });
+
+    it('does not refresh discovery from a skipped overlapping process tick', async () => {
+      const refreshDockerDiscovery = vi.fn();
+      const refreshPodmanDiscovery = vi.fn();
+      const deps = makeDeps({
+        refreshDockerDiscovery,
+        refreshPodmanDiscovery,
+        scanner: { scanProcesses: vi.fn(() => new Promise(() => {})) },
+      });
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+
+      await vi.advanceTimersByTimeAsync(10000);
+
+      expect(deps.scanner.scanProcesses).toHaveBeenCalledTimes(1);
+      expect(refreshDockerDiscovery).toHaveBeenCalledTimes(1);
+      expect(refreshPodmanDiscovery).toHaveBeenCalledTimes(1);
+      expect(scanLoop.getScanCadence().skippedProcessTicks).toBe(1);
+    });
+  });
+
+  describe('reentrancy guard (doProcessScan)', () => {
+    it('does not start an overlapping process scan while a previous scan is in-flight', async () => {
+      // First scanProcesses call hangs forever (pending) so scan N stays in-flight
+      // across the next interval tick; any later call resolves normally.
+      const firstScan = new Promise(() => {});
+      let scanCalls = 0;
+      const scanProcesses = vi.fn().mockImplementation(() => {
+        scanCalls += 1;
+        return scanCalls === 1 ? firstScan : Promise.resolve({ agents: [], changed: false });
+      });
+      const mockDeps = {
+        scanner: { scanProcesses },
+        procUtil: {
+          enrichWithParentChains: vi.fn().mockResolvedValue(),
+          annotateHostApps: vi.fn(),
+          annotateWorkingDirs: vi.fn().mockResolvedValue(),
+        },
+        watcher: {
+          pruneKnownHandles: vi.fn(),
+          scanAllFileHandles: vi.fn().mockResolvedValue([]),
+        },
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn().mockResolvedValue([]),
+        },
+        baselines: { recordNetworkEndpoint: vi.fn() },
+        anomaly: {
+          checkDeviations: vi.fn().mockReturnValue([]),
+          calculateAnomalyScore: vi.fn().mockReturnValue({ score: 0 }),
+        },
+        audit: { log: vi.fn() },
+        tray: { updateTrayIcon: vi.fn(), notifySensitive: vi.fn() },
+        logger: { error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+        sendToRenderer: vi.fn(),
+        fileAccessBatcher: { push: vi.fn() },
+        statsUpdateBatcher: { push: vi.fn(), pushLazy: vi.fn() },
+        getStats: vi.fn().mockReturnValue({}),
+        getResourceUsage: vi.fn().mockReturnValue({}),
+        getLatestAgents: vi.fn().mockReturnValue([]),
+        setAgents: vi.fn(),
+        setLatestNetConnections: vi.fn(),
+      };
+      scanLoop.init(mockDeps);
+      scanLoop.startScanIntervals(5000);
+
+      await vi.advanceTimersByTimeAsync(5000); // tick 1 → scan starts, hangs on firstScan
+      await vi.advanceTimersByTimeAsync(5000); // tick 2 → fires while scan 1 is in-flight
+
+      // Assert inside the in-flight window (firstScan is never resolved). A guarded
+      // doProcessScan short-circuits the second tick → 1 call; the unguarded (buggy)
+      // version runs both overlapping bodies → 2 calls.
+      expect(scanProcesses).toHaveBeenCalledTimes(1);
+      expect(scanLoop.getScanCadence()).toEqual({
+        skippedProcessTicks: 1,
+        lastSkippedAt: Date.now(),
+        maxProcessGapMs: 5000,
+      });
+      expect(mockDeps.statsUpdateBatcher.pushLazy).toHaveBeenCalledWith(mockDeps.getStats);
+      await vi.advanceTimersByTimeAsync(5000); // a second skipped interval
+      expect(scanProcesses).toHaveBeenCalledTimes(1);
+      expect(scanLoop.getScanCadence().skippedProcessTicks).toBe(2);
+    });
+
+    it('starts a new monitoring run with no skipped process intervals', async () => {
+      const deps = makeDeps();
+      scanLoop.init(deps);
+      expect(scanLoop.getScanCadence()).toEqual({
+        skippedProcessTicks: 0,
+        lastSkippedAt: null,
+        maxProcessGapMs: null,
+      });
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(scanLoop.getScanCadence().skippedProcessTicks).toBe(0);
+    });
+  });
+
+  // ── timing instrumentation (logger.debug under module 'scan') ──
+
+  describe('timing instrumentation', () => {
+    it('emits scan/process debug timing with the batched agent count', async () => {
+      const deps = makeDeps({
+        scanner: {
+          scanProcesses: vi
+            .fn()
+            .mockResolvedValue({ agents: [{ agent: 'Cursor' }], changed: false }),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+
+      const call = deps.logger.debug.mock.calls.find((c) => c[0] === 'scan' && c[1] === 'process');
+      expect(call).toBeTruthy();
+      // Fake timers can freeze performance.now → assert shape + bounds, not an exact value
+      expect(call[2]).toEqual({ ms: expect.any(Number), agents: expect.any(Number) });
+      expect(call[2].ms).toBeGreaterThanOrEqual(0);
+      // agents = the enriched batch count (process + injected external + local-model agents)
+      expect(call[2].agents).toBeGreaterThanOrEqual(1);
+    });
+
+    it('emits scan/network debug timing with the connection count', async () => {
+      const deps = makeDeps({
+        getLatestAgents: vi.fn().mockReturnValue([{ agent: 'Cursor' }]),
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn().mockResolvedValue([
+            {
+              agent: 'Cursor',
+              remoteIp: '1.2.3.4',
+              remotePort: 443,
+              state: 'ESTABLISHED',
+              flagged: false,
+            },
+          ]),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      await vi.advanceTimersByTimeAsync(0); // flush the scanNetworkConnections promise chain
+
+      const call = deps.logger.debug.mock.calls.find((c) => c[0] === 'scan' && c[1] === 'network');
+      expect(call).toBeTruthy();
+      expect(call[2]).toEqual({ ms: expect.any(Number), connections: 1 });
+      expect(call[2].ms).toBeGreaterThanOrEqual(0);
+    });
+
+    it('discards a completed network batch after the same PID gains a different generation witness', async () => {
+      const oldAgent = {
+        agent: 'Claude Code',
+        pid: 100,
+        instanceId: '100:1700000000000',
+        generationWitness: '133000000000000001',
+        generationWitnessSource: 'createTime100ns',
+      };
+      const newAgent = { ...oldAgent, generationWitness: '133000000000000002' };
+      let current = [oldAgent];
+      let finishNetwork;
+      const deps = makeDeps({
+        getLatestAgents: () => current,
+        setAgents: (agents) => {
+          current = agents;
+        },
+        scanner: {
+          scanProcesses: vi
+            .fn()
+            .mockResolvedValue({ agents: [newAgent], reliable: true, changed: false }),
+        },
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finishNetwork = resolve;
+              }),
+          ),
+          noteNetworkSkip: vi.fn(),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      expect(deps.network.scanNetworkConnections.mock.calls[0][1].isScopeCurrent()).toBe(true);
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(deps.network.scanNetworkConnections.mock.calls[0][1].isScopeCurrent()).toBe(false);
+      finishNetwork([
+        {
+          agent: oldAgent.agent,
+          pid: oldAgent.pid,
+          instanceId: oldAgent.instanceId,
+          remoteIp: '8.8.8.8',
+          remotePort: 443,
+          state: 'ESTAB',
+        },
+      ]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deps.setLatestNetConnections).not.toHaveBeenCalled();
+      expect(deps.baselines.recordNetworkEndpoint).not.toHaveBeenCalled();
+      expect(deps.audit.log.mock.calls.some(([type]) => type === 'network-connection')).toBe(false);
+      expect(deps.sendToRenderer.mock.calls.some(([channel]) => channel === 'network-update')).toBe(
+        false,
+      );
+      expect(deps.network.noteNetworkSkip).toHaveBeenCalledWith('population-changed-during-scan');
+    });
+
+    it('rejects an empty TCP result when a new PID joined the queried scope', async () => {
+      const oldAgent = { agent: 'A', pid: 100, instanceId: '100:1' };
+      let current = [oldAgent];
+      let finishNetwork;
+      const deps = makeDeps({
+        getLatestAgents: () => current,
+        setAgents: (agents) => {
+          current = agents;
+        },
+        scanner: {
+          scanProcesses: vi.fn().mockResolvedValue({
+            agents: [oldAgent, { agent: 'B', pid: 200, instanceId: '200:2' }],
+            reliable: true,
+            changed: false,
+          }),
+        },
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finishNetwork = resolve;
+              }),
+          ),
+          noteNetworkSkip: vi.fn(),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      finishNetwork([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deps.setLatestNetConnections).not.toHaveBeenCalled();
+      expect(deps.sendToRenderer.mock.calls.some(([channel]) => channel === 'network-update')).toBe(
+        false,
+      );
+    });
+
+    it('retries once with the new PID scope after a busy stale poll settles', async () => {
+      const oldAgent = { agent: 'A', pid: 100, instanceId: '100:1' };
+      const newAgents = [oldAgent, { agent: 'B', pid: 200, instanceId: '200:2' }];
+      let current = [oldAgent];
+      let running = false;
+      let finishFirst;
+      const scanNetworkConnections = vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishFirst = resolve;
+            }),
+        )
+        .mockResolvedValue([]);
+      const deps = makeDeps({
+        getLatestAgents: () => current,
+        setAgents: (agents) => {
+          current = agents;
+        },
+        scanner: {
+          scanProcesses: vi.fn().mockResolvedValue({
+            agents: newAgents,
+            reliable: true,
+            changed: true,
+          }),
+        },
+        network: {
+          isNetworkScanRunning: () => running,
+          setNetworkScanRunning: (value) => {
+            running = value;
+          },
+          scanNetworkConnections,
+          noteNetworkSkip: vi.fn(),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(scanNetworkConnections).toHaveBeenCalledTimes(1);
+      finishFirst(null);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(scanNetworkConnections).toHaveBeenCalledTimes(2);
+      expect(scanNetworkConnections.mock.calls[1][0]).toBe(newAgents);
+      expect(deps.setLatestNetConnections).toHaveBeenCalledTimes(1);
+    });
+
+    it('waits for identity stamping before retrying a stale in-flight poll', async () => {
+      const oldAgent = { agent: 'A', pid: 100, instanceId: '100:1' };
+      const newAgents = [oldAgent, { agent: 'B', pid: 200, instanceId: '200:2' }];
+      let current = [oldAgent];
+      let running = false;
+      let finishFirst;
+      let finishStamp;
+      let finishWorkingDirs;
+      const scanNetworkConnections = vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishFirst = resolve;
+            }),
+        )
+        .mockResolvedValue([]);
+      const deps = makeDeps({
+        getLatestAgents: () => current,
+        setAgents: (agents) => {
+          current = agents;
+        },
+        scanner: {
+          scanProcesses: vi.fn().mockResolvedValue({
+            agents: newAgents,
+            reliable: true,
+            changed: true,
+          }),
+        },
+        procUtil: {
+          enrichWithParentChains: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finishStamp = resolve;
+              }),
+          ),
+          annotateHostApps: vi.fn(),
+          annotateWorkingDirs: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finishWorkingDirs = () => {
+                  newAgents[0].cwd = '/new/project';
+                  resolve();
+                };
+              }),
+          ),
+        },
+        network: {
+          isNetworkScanRunning: () => running,
+          setNetworkScanRunning: (value) => {
+            running = value;
+          },
+          scanNetworkConnections,
+          noteNetworkSkip: vi.fn(),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      finishFirst(null);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(scanNetworkConnections).toHaveBeenCalledTimes(1);
+      finishStamp();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(scanNetworkConnections).toHaveBeenCalledTimes(1);
+      finishWorkingDirs();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(scanNetworkConnections).toHaveBeenCalledTimes(2);
+      expect(scanNetworkConnections.mock.calls[1][0]).toBe(newAgents);
+    });
+
+    it('rejects a weak PID owner even when a process scan republishes the same array', async () => {
+      const agents = [{ agent: 'A', pid: 100, instanceId: '100:1' }];
+      let finishNetwork;
+      const deps = makeDeps({
+        getLatestAgents: () => agents,
+        scanner: {
+          scanProcesses: vi.fn().mockResolvedValue({ agents, reliable: true, changed: false }),
+        },
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finishNetwork = resolve;
+              }),
+          ),
+          noteNetworkSkip: vi.fn(),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      finishNetwork([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deps.setLatestNetConnections).not.toHaveBeenCalled();
+    });
+
+    it('keeps a strong unchanged owner valid across a refreshed process publication', async () => {
+      const oldAgent = {
+        agent: 'A',
+        pid: 100,
+        instanceId: '100:1',
+        generationWitness: '42',
+        generationWitnessSource: 'sequence',
+      };
+      let current = [oldAgent];
+      let finishNetwork;
+      const deps = makeDeps({
+        getLatestAgents: () => current,
+        setAgents: (agents) => {
+          current = agents;
+        },
+        scanner: {
+          scanProcesses: vi.fn().mockResolvedValue({
+            agents: [{ ...oldAgent }],
+            reliable: true,
+            changed: false,
+          }),
+        },
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finishNetwork = resolve;
+              }),
+          ),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      finishNetwork([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deps.setLatestNetConnections).toHaveBeenCalledWith([]);
+    });
+
+    it('does not retry a valid strong-owner poll after routine process refreshes', async () => {
+      const owner = {
+        agent: 'A',
+        pid: 100,
+        instanceId: '100:1',
+        generationWitness: '42',
+        generationWitnessSource: 'sequence',
+      };
+      let current = [owner];
+      let running = false;
+      let finishNetwork;
+      const scanNetworkConnections = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finishNetwork = resolve;
+          }),
+      );
+      const deps = makeDeps({
+        getLatestAgents: () => current,
+        setAgents: (agents) => {
+          current = agents;
+        },
+        scanner: {
+          scanProcesses: vi
+            .fn()
+            .mockImplementation(() =>
+              Promise.resolve({ agents: [{ ...owner }], reliable: true, changed: false }),
+            ),
+        },
+        network: {
+          isNetworkScanRunning: () => running,
+          setNetworkScanRunning: (value) => {
+            running = value;
+          },
+          scanNetworkConnections,
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(30000);
+      expect(scanNetworkConnections).toHaveBeenCalledTimes(1);
+      finishNetwork([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(scanNetworkConnections).toHaveBeenCalledTimes(1);
+      expect(deps.setLatestNetConnections).toHaveBeenCalledTimes(1);
+    });
+
+    it('gates new network scans while process identity stamping is pending', async () => {
+      const agents = [{ agent: 'A', pid: 100, instanceId: '100:1' }];
+      let finishStamp;
+      const deps = makeDeps({
+        getLatestAgents: () => agents,
+        scanner: {
+          scanProcesses: vi.fn().mockResolvedValue({ agents, reliable: true, changed: false }),
+        },
+        procUtil: {
+          enrichWithParentChains: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finishStamp = resolve;
+              }),
+          ),
+          annotateHostApps: vi.fn(),
+          annotateWorkingDirs: vi.fn().mockResolvedValue(),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      scanLoop.doNetworkScan();
+      expect(deps.network.scanNetworkConnections).not.toHaveBeenCalled();
+      finishStamp();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    it('discards an in-flight strong-owner scan while a new process observation is pending', async () => {
+      const agents = [
+        {
+          agent: 'A',
+          pid: 100,
+          instanceId: '100:1',
+          generationWitness: '42',
+          generationWitnessSource: 'sequence',
+        },
+      ];
+      let finishNetwork;
+      let finishProcess;
+      const deps = makeDeps({
+        getLatestAgents: () => agents,
+        scanner: {
+          scanProcesses: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finishProcess = resolve;
+              }),
+          ),
+        },
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finishNetwork = resolve;
+              }),
+          ),
+          noteNetworkSkip: vi.fn(),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(deps.network.scanNetworkConnections.mock.calls[0][1].isScopeCurrent()).toBe(false);
+      finishNetwork([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deps.setLatestNetConnections).not.toHaveBeenCalled();
+      finishProcess({ agents, reliable: true, changed: false });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    it('does not publish a monitor scope-unavailable result as an empty snapshot', async () => {
+      const deps = makeDeps({ getLatestAgents: () => [{ agent: 'A', pid: 100 }] });
+      deps.network.scanNetworkConnections.mockResolvedValue(null);
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deps.setLatestNetConnections).not.toHaveBeenCalled();
+      expect(deps.sendToRenderer.mock.calls.some(([channel]) => channel === 'network-update')).toBe(
+        false,
+      );
+    });
+
+    it('invalidates a strong-owner network scan across stop and reinitialization', async () => {
+      const agents = [
+        {
+          agent: 'A',
+          pid: 100,
+          instanceId: '100:1',
+          generationWitness: '42',
+          generationWitnessSource: 'sequence',
+        },
+      ];
+      let finishNetwork;
+      const deps = makeDeps({
+        getLatestAgents: () => agents,
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finishNetwork = resolve;
+              }),
+          ),
+          noteNetworkSkip: vi.fn(),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      scanLoop.stopScanIntervals();
+      const nextDeps = makeDeps({ getLatestAgents: () => [{ ...agents[0] }] });
+      scanLoop.init(nextDeps);
+      finishNetwork([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deps.setLatestNetConnections).not.toHaveBeenCalled();
+      expect(nextDeps.setLatestNetConnections).not.toHaveBeenCalled();
+    });
+
+    it('B-S08: empty agents + unreliable process population logs process-unavailable skip', () => {
+      const scanNet = vi.fn().mockResolvedValue([]);
+      const noteSkip = vi.fn();
+      const deps = makeDeps({
+        getLatestAgents: vi.fn().mockReturnValue([]),
+        scanner: {
+          scanProcesses: vi.fn(),
+          isProcessPopulationReliable: vi.fn().mockReturnValue(false),
+          getProcessSensorHealth: vi.fn().mockReturnValue({ state: 'FAILED' }),
+        },
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: scanNet,
+          noteNetworkSkip: noteSkip,
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      expect(scanNet).not.toHaveBeenCalled();
+      const skip = deps.logger.debug.mock.calls.find(
+        (c) => c[0] === 'scan' && c[1] === 'network-skip',
+      );
+      expect(skip).toBeTruthy();
+      expect(skip[2].reason).toBe('process-observation-unavailable');
+      expect(noteSkip).toHaveBeenCalledWith('process-observation-unavailable');
+    });
+
+    it('B-S08: empty agents + reliable process population logs confirmed-zero skip', () => {
+      const scanNet = vi.fn().mockResolvedValue([]);
+      const noteSkip = vi.fn();
+      const deps = makeDeps({
+        getLatestAgents: vi.fn().mockReturnValue([]),
+        scanner: {
+          scanProcesses: vi.fn(),
+          isProcessPopulationReliable: vi.fn().mockReturnValue(true),
+          getProcessSensorHealth: vi.fn().mockReturnValue({ state: 'HEALTHY' }),
+        },
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: scanNet,
+          noteNetworkSkip: noteSkip,
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      expect(scanNet).not.toHaveBeenCalled();
+      const skip = deps.logger.debug.mock.calls.find(
+        (c) => c[0] === 'scan' && c[1] === 'network-skip',
+      );
+      expect(skip[2].reason).toBe('confirmed-zero-agents');
+      expect(noteSkip).toHaveBeenCalledWith('confirmed-zero-agents');
+    });
+
+    it('B-S08: confirmed-zero and process-unavailable skip reasons stay distinct', () => {
+      const noteSkip = vi.fn();
+      const baseNet = {
+        isNetworkScanRunning: vi.fn().mockReturnValue(false),
+        setNetworkScanRunning: vi.fn(),
+        scanNetworkConnections: vi.fn(),
+        noteNetworkSkip: noteSkip,
+      };
+      const depsUnrel = makeDeps({
+        getLatestAgents: vi.fn().mockReturnValue([]),
+        scanner: {
+          scanProcesses: vi.fn(),
+          isProcessPopulationReliable: vi.fn().mockReturnValue(false),
+        },
+        network: baseNet,
+      });
+      scanLoop.init(depsUnrel);
+      scanLoop.doNetworkScan();
+      const depsRel = makeDeps({
+        getLatestAgents: vi.fn().mockReturnValue([]),
+        scanner: {
+          scanProcesses: vi.fn(),
+          isProcessPopulationReliable: vi.fn().mockReturnValue(true),
+        },
+        network: baseNet,
+      });
+      scanLoop.init(depsRel);
+      scanLoop.doNetworkScan();
+      expect(noteSkip.mock.calls.map((c) => c[0])).toEqual([
+        'process-observation-unavailable',
+        'confirmed-zero-agents',
+      ]);
+    });
+
+    it('B-S02: hard process scan failure notes process health FAILED', async () => {
+      const note = vi.fn();
+      const deps = makeDeps({
+        scanner: {
+          scanProcesses: vi.fn().mockRejectedValue(new Error('spawn ENOENT')),
+          noteProcessScanHardFailure: note,
+        },
+      });
+      scanLoop.init(deps);
+      // doProcessScan is not exported — drive via staggeredStartup first tick
+      scanLoop.staggeredStartup(5000, true);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(note).toHaveBeenCalled();
+      expect(note.mock.calls[0][0].message).toMatch(/ENOENT/);
+    });
+
+    it('emits scan/file debug timing after a file-handle scan', async () => {
+      const deps = makeDeps({ getLatestAgents: vi.fn().mockReturnValue([{ agent: 'Cursor' }]) });
+      scanLoop.init(deps);
+      // staggeredStartup(_, paused=true): doProcessScan @3s, doFileScan @8s, no warmup
+      scanLoop.staggeredStartup(5000, true);
+      await vi.advanceTimersByTimeAsync(8000);
+
+      const call = deps.logger.debug.mock.calls.find((c) => c[0] === 'scan' && c[1] === 'file');
+      expect(call).toBeTruthy();
+      expect(call[2]).toEqual({ ms: expect.any(Number) });
+      expect(call[2].ms).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe('file-handle owner scope', () => {
+    function setupWatcher(getFileHandles, getCurrentAgents) {
+      const watcher = require_('../../src/main/file-watcher.js');
+      const state = {
+        getCustomRules: () => [],
+        getLatestAgents: getCurrentAgents,
+        getLatestAiAgents: () => getCurrentAgents().filter((a) => a.category === 'ai'),
+        isMonitoringPaused: () => false,
+        isOtherPanelExpanded: () => false,
+        activityLog: [],
+        knownHandles: new Map(),
+        watchers: [],
+        recordFileAccess: vi.fn(),
+        onActivityPush: vi.fn(),
+        onActivityEvict: vi.fn(),
+        onFileEvent: vi.fn(),
+      };
+      watcher.init(state);
+      watcher._resetForTest();
+      watcher._setDepsForTest({
+        getFileHandles,
+        isReadDetectionAvailable: true,
+        getProcessCapabilities: () => ({ populationReliable: true }),
+      });
+      return { watcher, state };
+    }
+
+    it('does not attribute a late handle result to a replaced PID while retaining a witnessed peer', async () => {
+      vi.setSystemTime(1700000000000);
+      const old = {
+        pid: 100,
+        agent: 'Old Agent',
+        category: 'ai',
+        instanceId: '100:1700000000000',
+        generationWitness: '133000000000000001',
+        generationWitnessSource: 'createTime100ns',
+      };
+      const replacement = {
+        ...old,
+        agent: 'New Agent',
+        generationWitness: '133000000000000002',
+      };
+      const peer = {
+        pid: 200,
+        agent: 'Stable Agent',
+        category: 'ai',
+        instanceId: '200:1700000000000',
+        generationWitness: '42',
+        generationWitnessSource: 'sequence',
+      };
+      let current = [old, peer];
+      const pending = new Map();
+      let deferHandles = false;
+      const getFileHandles = vi.fn((pid) =>
+        deferHandles ? new Promise((resolve) => pending.set(pid, resolve)) : Promise.resolve([]),
+      );
+      const { watcher, state } = setupWatcher(getFileHandles, () => current);
+      try {
+        const deps = makeDeps({
+          watcher,
+          getLatestAgents: () => current,
+          setAgents: (agents) => {
+            current = agents;
+          },
+          scanner: {
+            scanProcesses: vi
+              .fn()
+              .mockResolvedValueOnce({ agents: [old, peer], reliable: true, changed: false })
+              .mockResolvedValueOnce({
+                agents: [replacement, { ...peer }],
+                reliable: true,
+                changed: false,
+              }),
+            getProcessCapabilities: () => ({ populationReliable: true }),
+          },
+        });
+        scanLoop.init(deps);
+        scanLoop.staggeredStartup(5000, true);
+        await vi.advanceTimersByTimeAsync(3000);
+        await watcher.scanAllFileHandles(current);
+        const lastSuccessAt = watcher.getFileSensorHealth()['fs-handle'].lastSuccessAt;
+
+        deferHandles = true;
+        await vi.advanceTimersByTimeAsync(5000);
+        expect([...pending.keys()].sort()).toEqual([100, 200]);
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(current[0].agent).toBe('New Agent');
+
+        pending.get(100)(['/home/user/.aws/credentials']);
+        pending.get(200)(['/home/user/project/stable.txt']);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(state.activityLog.map((event) => event.agent)).toEqual(['Stable Agent']);
+        expect(state.knownHandles.has(old.instanceId)).toBe(false);
+        expect(state.recordFileAccess).toHaveBeenCalledTimes(1);
+        expect(state.recordFileAccess.mock.calls[0][1]).toBe('Stable Agent');
+        expect(deps.fileAccessBatcher.push).toHaveBeenCalledTimes(1);
+        expect(deps.audit.log.mock.calls.filter(([type]) => type === 'file-access')).toEqual([
+          ['file-access', expect.objectContaining({ agent: 'Stable Agent' })],
+        ]);
+        const health = watcher.getFileSensorHealth()['fs-handle'];
+        expect(health.state).toBe('DEGRADED');
+        expect(health.lastError).toBe('population-changed-during-scan');
+        expect(health.lastSuccessAt).toBe(lastSuccessAt);
+      } finally {
+        watcher._resetForTest();
+        watcher._setDepsForTest({
+          getFileHandles: require_('../../src/main/platform').getFileHandles,
+        });
+      }
+    });
+
+    it('rejects an identical weak PID stamp after a new population pass', async () => {
+      const old = { pid: 100, agent: 'Claude Code', category: 'ai', instanceId: '100:u' };
+      const replacement = { ...old };
+      let current = [old];
+      let finishHandles;
+      let deferHandles = false;
+      const getFileHandles = vi.fn(() =>
+        deferHandles
+          ? new Promise((resolve) => {
+              finishHandles = resolve;
+            })
+          : Promise.resolve([]),
+      );
+      const { watcher, state } = setupWatcher(getFileHandles, () => current);
+      try {
+        const deps = makeDeps({
+          watcher,
+          getLatestAgents: () => current,
+          setAgents: (agents) => {
+            current = agents;
+          },
+          scanner: {
+            scanProcesses: vi
+              .fn()
+              .mockResolvedValueOnce({ agents: [old], reliable: true, changed: false })
+              .mockResolvedValueOnce({ agents: [replacement], reliable: true, changed: false }),
+            getProcessCapabilities: () => ({ populationReliable: true }),
+          },
+        });
+        scanLoop.init(deps);
+        scanLoop.staggeredStartup(5000, true);
+        await vi.advanceTimersByTimeAsync(3000);
+        deferHandles = true;
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(finishHandles).toBeTypeOf('function');
+        scanLoop.startScanIntervals(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(current[0]).toBe(replacement);
+        finishHandles(['/home/user/.aws/credentials']);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(state.activityLog).toEqual([]);
+        expect(state.recordFileAccess).not.toHaveBeenCalled();
+        expect(state.knownHandles.size).toBe(0);
+        expect(deps.fileAccessBatcher.push).not.toHaveBeenCalled();
+        expect(watcher.getFileSensorHealth()['fs-handle'].lastError).toBe(
+          'population-changed-during-scan',
+        );
+      } finally {
+        watcher._resetForTest();
+        watcher._setDepsForTest({
+          getFileHandles: require_('../../src/main/platform').getFileHandles,
+        });
+      }
+    });
+
+    it('does not claim confirmed-zero file coverage from an old empty list while a process scan waits', async () => {
+      let current = [];
+      let finishProcess;
+      const getFileHandles = vi.fn().mockResolvedValue([]);
+      const { watcher } = setupWatcher(getFileHandles, () => current);
+      try {
+        const deps = makeDeps({
+          watcher,
+          getLatestAgents: () => current,
+          setAgents: (agents) => {
+            current = agents;
+          },
+          scanner: {
+            scanProcesses: vi.fn(
+              () =>
+                new Promise((resolve) => {
+                  finishProcess = resolve;
+                }),
+            ),
+            getProcessCapabilities: () => ({ populationReliable: true }),
+          },
+        });
+        scanLoop.init(deps);
+        scanLoop.staggeredStartup(5000, true);
+        await vi.advanceTimersByTimeAsync(8000);
+        expect(getFileHandles).not.toHaveBeenCalled();
+        const health = watcher.getFileSensorHealth()['fs-handle'];
+        expect(health.state).toBe('DEGRADED');
+        expect(health.lastError).toBe('process-observation-unavailable');
+        expect(health.lastSuccessAt).toBeNull();
+        finishProcess({ agents: [], reliable: true, changed: false });
+        await vi.advanceTimersByTimeAsync(0);
+      } finally {
+        watcher._resetForTest();
+        watcher._setDepsForTest({
+          getFileHandles: require_('../../src/main/platform').getFileHandles,
+        });
+      }
+    });
+  });
+
+  // ── C2: anomaly scores leave the main process per instance ──
+
+  describe('anomaly scores in the scan batch', () => {
+    // Two instances of ONE agent name, plus a keyless pid-0 synthetic.
+    const A = '1000:1700000000000';
+    const B = '2000:1700000009999';
+    const PROTO_INSTANCE = '3000:1700000010000';
+    // The LOUD instance (B, score 45) is deliberately first: with it last, a
+    // last-writer-wins bug would also produce 45 and the max assertion below would pass
+    // for the wrong reason.
+    const AGENTS = [
+      { agent: 'Claude Code', pid: 2000, instanceId: B, category: 'ai' },
+      { agent: 'Claude Code', pid: 1000, instanceId: A, category: 'ai' },
+      { agent: 'Ollama', pid: 0, category: 'local-llm-runtime' },
+    ];
+
+    /** @returns {Promise<{batch: Object, deps: Object}>} */
+    async function runScan(agents = AGENTS) {
+      const deps = makeDeps({
+        scanner: {
+          scanProcesses: vi
+            .fn()
+            .mockResolvedValue({ agents: agents.map((a) => ({ ...a })), changed: false }),
+        },
+        anomaly: {
+          checkDeviations: vi.fn().mockReturnValue([]),
+          // Scores by INSTANCE key. A name reaching this stub would score 0, which is
+          // what makes the assertions below able to tell the two keyings apart.
+          calculateAnomalyScore: vi.fn((key) => ({
+            score: key === A ? 10 : key === B ? 45 : key === PROTO_INSTANCE ? 55 : 0,
+          })),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      const batchCall = deps.sendToRenderer.mock.calls.find((c) => c[0] === 'scan-batch');
+      expect(batchCall).toBeTruthy();
+      return { batch: batchCall[1], deps };
+    }
+
+    it('emits one anomaly score per instance, keyed on instanceId', async () => {
+      const { batch, deps } = await runScan();
+      expect(batch.anomalyScoresByInstance).toEqual({ [A]: 10, [B]: 45 });
+      // The scorer is asked by key only — never by display name.
+      const askedFor = deps.anomaly.calculateAnomalyScore.mock.calls.map((c) => c[0]);
+      expect(askedFor).not.toContain('Claude Code');
+      expect(askedFor).not.toContain('Ollama');
+    });
+
+    it('keeps the name-keyed map for the renderer, aggregated as max', async () => {
+      const { batch } = await runScan();
+      // 45, not 10 and not 55: the highest-risk instance represents the name on the
+      // rolled-up card, and the per-instance values stay available above.
+      expect(batch.anomalyScores['Claude Code']).toBe(45);
+      // A keyless agent still gets its name entry at 0 — the key set is unchanged.
+      expect(batch.anomalyScores['Ollama']).toBe(0);
+    });
+
+    it('retains a score for a custom agent named __proto__', async () => {
+      const agent = {
+        agent: '__proto__',
+        pid: 3000,
+        instanceId: PROTO_INSTANCE,
+        category: 'ai',
+      };
+      const { batch } = await runScan([...AGENTS, agent]);
+      expect(Object.hasOwn(batch.anomalyScores, '__proto__')).toBe(true);
+      expect(batch.anomalyScores['__proto__']).toBe(55);
+      expect(batch.anomalyScoresByInstance[PROTO_INSTANCE]).toBe(55);
+    });
+
+    it('a keyless agent gets no per-instance entry', async () => {
+      const { batch } = await runScan();
+      expect(Object.keys(batch.anomalyScoresByInstance).sort()).toEqual([A, B].sort());
+    });
+
+    /**
+     * The same two-instance scan with a sequence engine injected (roadmap §5 "Visibility").
+     * @param {Object} sequenceEngine
+     * @returns {Promise<{batch: Object, deps: Object}>}
+     */
+    async function runScanWithEngine(sequenceEngine) {
+      const deps = makeDeps({
+        scanner: {
+          scanProcesses: vi
+            .fn()
+            .mockResolvedValue({ agents: AGENTS.map((a) => ({ ...a })), changed: false }),
+        },
+        anomaly: {
+          checkDeviations: vi.fn().mockReturnValue([]),
+          calculateAnomalyScore: vi.fn((key) => ({
+            score: key === A ? 10 : key === B ? 45 : 0,
+          })),
+        },
+        sequenceEngine,
+      });
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+      const batchCall = deps.sendToRenderer.mock.calls.find((c) => c[0] === 'scan-batch');
+      expect(batchCall).toBeTruthy();
+      return { batch: batchCall[1], deps };
+    }
+
+    it('merges the sequence-engine score per instance as max, asked by key only', async () => {
+      const sequenceEngine = {
+        ingest: vi.fn(),
+        sweep: vi.fn(),
+        // A (anomaly 10) carries a high detection, B (anomaly 45) a low one — so each
+        // instance is won by a DIFFERENT side of the max, and a merge that took either
+        // side alone would fail on one of them.
+        scoreFor: vi.fn((key) => (key === A ? 70 : key === B ? 30 : 0)),
+      };
+      const { batch } = await runScanWithEngine(sequenceEngine);
+
+      expect(batch.anomalyScoresByInstance).toEqual({ [A]: 70, [B]: 45 });
+      // The name-keyed card follows: 70 is now the highest-risk instance of the name.
+      expect(batch.anomalyScores['Claude Code']).toBe(70);
+      expect(batch.anomalyScores['Ollama']).toBe(0);
+      // Asked by instance key only — never by a display name, never for a keyless agent.
+      expect(sequenceEngine.scoreFor.mock.calls.map((c) => c[0]).sort()).toEqual([A, B].sort());
+    });
+
+    it('an engine without scoreFor leaves the anomaly scores exactly as the detector gave them', async () => {
+      const { batch } = await runScanWithEngine({ ingest: vi.fn(), sweep: vi.fn() });
+      expect(batch.anomalyScoresByInstance).toEqual({ [A]: 10, [B]: 45 });
+    });
+
+    it('records a network endpoint under the connection instance key, name second', async () => {
+      const deps = makeDeps({
+        getLatestAgents: vi.fn().mockReturnValue([{ agent: 'Claude Code' }]),
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn().mockResolvedValue([
+            {
+              agent: 'Claude Code',
+              instanceId: A,
+              remoteIp: '1.2.3.4',
+              remotePort: 443,
+              state: 'ESTABLISHED',
+              flagged: false,
+            },
+            // Matched no agent: no name, no key. It is passed through as-is, and
+            // baselines.js drops it rather than filing it under the empty name.
+            {
+              agent: '',
+              instanceId: null,
+              remoteIp: '9.9.9.9',
+              remotePort: 80,
+              state: 'ESTABLISHED',
+              flagged: true,
+            },
+          ]),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(deps.baselines.recordNetworkEndpoint.mock.calls).toEqual([
+        [A, 'Claude Code', '1.2.3.4', 443],
+        [null, '', '9.9.9.9', 80],
+      ]);
+    });
+
+    it('stamps the deviation instance key on the anomaly-alert audit entry', async () => {
+      const deps = makeDeps({
+        scanner: {
+          scanProcesses: vi
+            .fn()
+            .mockResolvedValue({ agents: AGENTS.map((a) => ({ ...a })), changed: false }),
+        },
+        anomaly: {
+          checkDeviations: vi.fn().mockReturnValue([
+            {
+              agent: 'Claude Code',
+              instanceId: B,
+              type: 'files',
+              message: 'Claude Code normally accesses ~2 files, now 20',
+              anomalyScore: 45,
+            },
+          ]),
+          calculateAnomalyScore: vi.fn().mockReturnValue({ score: 0 }),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+
+      const alert = deps.audit.log.mock.calls.find((c) => c[0] === 'anomaly-alert');
+      expect(alert).toBeTruthy();
+      expect(alert[1].agent).toBe('Claude Code');
+      expect(alert[1].instanceId).toBe(B);
+      // Still no pid: the detector held a bucket, never a process object.
+      expect(alert[1].pid).toBeNull();
+    });
+  });
+
+  // ── per-agent resource push (`agent-resource-usage`) ──
+
+  describe('agent-resource-usage push', () => {
+    it('slow sampling never blocks process batches or spawns a second resource query', async () => {
+      const rm = require_('../../src/main/resource-monitor.js');
+      let finish;
+      const collect = vi
+        .spyOn(rm, 'getResourcesForPids')
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finish = resolve;
+            }),
+        )
+        .mockResolvedValue([]);
+      const deps = makeStampingDeps(vi.fn(), () => [
+        { agent: 'Cursor', pid: 100, startTime: 1717000000000 },
+      ]);
+      try {
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(1000);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(
+          deps.sendToRenderer.mock.calls.filter(([channel]) => channel === 'scan-batch'),
+        ).toHaveLength(5);
+        expect(collect).toHaveBeenCalledTimes(1);
+        expect(pushes(deps.sendToRenderer)).toHaveLength(0);
+        finish([]);
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(collect).toHaveBeenCalledTimes(2);
+      } finally {
+        finish?.([]);
+        await vi.advanceTimersByTimeAsync(0);
+        collect.mockRestore();
+      }
+    });
+
+    it('pause suppresses an unfinished resource result', async () => {
+      const rm = require_('../../src/main/resource-monitor.js');
+      let finish;
+      const collect = vi.spyOn(rm, 'getResourcesForPids').mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const deps = makeDeps();
+      try {
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(1000);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(collect).toHaveBeenCalledTimes(1);
+        scanLoop.stopScanIntervals();
+        finish([]);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(pushes(deps.sendToRenderer)).toHaveLength(0);
+      } finally {
+        finish?.([]);
+        await vi.advanceTimersByTimeAsync(0);
+        collect.mockRestore();
+      }
+    });
+
+    it('a process scan finishing after pause cannot launch resource sampling', async () => {
+      const rm = require_('../../src/main/resource-monitor.js');
+      const collect = vi.spyOn(rm, 'getResourcesForPids').mockResolvedValue([]);
+      let finish;
+      const deps = makeDeps({
+        scanner: {
+          scanProcesses: vi.fn(
+            () =>
+              new Promise((resolve) => {
+                finish = resolve;
+              }),
+          ),
+        },
+      });
+      try {
+        scanLoop.init(deps);
+        scanLoop.startScanIntervals(1000);
+        await vi.advanceTimersByTimeAsync(1000);
+        scanLoop.stopScanIntervals();
+        finish({ agents: [], changed: false });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(collect).not.toHaveBeenCalled();
+      } finally {
+        finish?.({ agents: [], changed: false });
+        await vi.advanceTimersByTimeAsync(0);
+        collect.mockRestore();
+      }
+    });
+
+    const MB = 1048576;
+
+    /**
+     * An exec whose CPU/RAM answer changes on every sampling call, so a figure in the
+     * payload proves WHICH sample produced it — the only way a cached record and a
+     * fresh one can be told apart. Sample n reports every pid at n MB. GPU absent.
+     * @returns {Function}
+     */
+    function makeVaryingExec() {
+      let sample = 0;
+      return vi.fn((cmd) => {
+        if (cmd === 'nvidia-smi') {
+          return Promise.reject(Object.assign(new Error('not found'), { code: 'ENOENT' }));
+        }
+        if (cmd === 'powershell.exe') {
+          sample++;
+          return Promise.resolve(
+            JSON.stringify(
+              [100, 200, 300, 400].map((pid) => ({
+                IDProcess: pid,
+                PercentProcessorTime: sample,
+                WorkingSet: sample * MB,
+              })),
+            ),
+          );
+        }
+        if (cmd === 'ps') {
+          sample++;
+          return Promise.resolve(
+            [100, 200, 300, 400].map((pid) => `${pid} ${sample}.0 ${sample * 1024}`).join('\n'),
+          );
+        }
+        return Promise.resolve('');
+      });
+    }
+
+    /**
+     * scan-loop requires resource-monitor at module scope, and the CJS cache hands both
+     * the same instance — so injecting here injects into the module under test. Returns
+     * the module so the test can reset it.
+     * @param {Function} exec
+     * @returns {Object}
+     */
+    function stubResourceMonitor(exec) {
+      const rm = require_('../../src/main/resource-monitor.js');
+      rm._resetForTest();
+      rm._setLoggerForTest({ warn: vi.fn() });
+      rm._setExecForTest(exec);
+      return rm;
+    }
+
+    /**
+     * Deps whose enrich stamps identity through the real `identify()`, over a fresh
+     * agent array per tick — `scanProcesses` is driven by the supplied factory so a
+     * test can change what the SECOND tick sees.
+     * @param {Function} sendToRenderer
+     * @param {Function} agentsForTick - () => Array, called once per scan
+     * @returns {Object}
+     */
+    function makeStampingDeps(sendToRenderer, agentsForTick) {
+      const { identify } = require_('../../src/main/process-identity.js');
+      return makeDeps({
+        scanner: {
+          scanProcesses: vi.fn().mockImplementation(async () => ({
+            agents: agentsForTick(),
+            changed: false,
+          })),
+        },
+        procUtil: {
+          enrichWithParentChains: vi.fn(async (agents) => {
+            for (const a of agents) {
+              const id = identify(a);
+              a.instanceId = id.instanceId;
+              a.instanceIdSource = id.instanceIdSource;
+            }
+          }),
+          annotateHostApps: vi.fn(),
+          annotateWorkingDirs: vi.fn().mockResolvedValue(),
+        },
+        sendToRenderer,
+      });
+    }
+
+    /** Every `agent-resource-usage` payload sent so far, oldest first. */
+    function pushes(sendToRenderer) {
+      return sendToRenderer.mock.calls
+        .filter((c) => c[0] === 'agent-resource-usage')
+        .map((c) => c[1]);
+    }
+
+    it('every emitted record carries the instanceId stamped on that same tick', async () => {
+      stubResourceMonitor(makeVaryingExec());
+      const sendToRenderer = vi.fn();
+      const deps = makeStampingDeps(sendToRenderer, () => [
+        { agent: 'Claude Code', process: 'claude.exe', pid: 100, startTime: 1717000000000 },
+        { agent: 'Cursor', process: 'cursor.exe', pid: 200, startTime: 1717000100000 },
+      ]);
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0); // let the fire-and-forget push settle
+
+      const batch = sendToRenderer.mock.calls.find((c) => c[0] === 'scan-batch')[1];
+      const [records] = pushes(sendToRenderer);
+      expect(records).toBeTruthy();
+
+      // The keys in the payload are the keys the very same batch carries — not
+      // re-resolved, not name-matched.
+      const batchKeys = new Map(
+        batch.agents.filter((a) => a.pid > 0).map((a) => [a.pid, a.instanceId]),
+      );
+      expect(records.length).toBe(batchKeys.size);
+      for (const r of records) {
+        expect(r.instanceId).toBe(batchKeys.get(r.pid));
+        expect(typeof r.instanceId).toBe('string');
+      }
+    });
+
+    it('a recycled pid does not inherit the previous instance’s cached sample', async () => {
+      stubResourceMonitor(makeVaryingExec());
+      const sendToRenderer = vi.fn();
+      let tick = 0;
+      const deps = makeStampingDeps(sendToRenderer, () => {
+        tick++;
+        // Same pid, two lives: tick 2 is a DIFFERENT process wearing pid 100.
+        return [
+          {
+            agent: 'Claude Code',
+            process: 'claude.exe',
+            pid: 100,
+            startTime: tick === 1 ? 1717000000000 : 1717000999000,
+          },
+        ];
+      });
+      scanLoop.init(deps);
+      // 1s apart, well inside the 5s resource TTL — so a pid-keyed cache WOULD hit.
+      scanLoop.startScanIntervals(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const [first, second] = pushes(sendToRenderer);
+      expect(first[0].instanceId).toBe('100:1717000000000');
+      expect(second[0].instanceId).toBe('100:1717000999000');
+      // Distinct measurements: the second life was sampled afresh (2 MB), not served
+      // the first life's cached 1 MB.
+      expect(first[0].memMb).toBe(1);
+      expect(second[0].memMb).toBe(2);
+    });
+
+    it('unstamped agents ride along as separate null-key records, not one bucket', async () => {
+      stubResourceMonitor(makeVaryingExec());
+      const sendToRenderer = vi.fn();
+      // Default deps: enrichWithParentChains is inert, so nothing is stamped — the
+      // defensive case the payload shape has to survive.
+      const deps = makeDeps({
+        scanner: {
+          scanProcesses: vi.fn().mockImplementation(async () => ({
+            agents: [
+              { agent: 'Claude Code', process: 'claude.exe', pid: 300 },
+              { agent: 'Cursor', process: 'cursor.exe', pid: 400 },
+            ],
+            changed: false,
+          })),
+        },
+        sendToRenderer,
+      });
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const [records] = pushes(sendToRenderer);
+      const unkeyed = records.filter((r) => r.instanceId === null);
+      expect(unkeyed.map((r) => r.pid).sort()).toEqual([300, 400]);
+      expect(unkeyed).toHaveLength(2); // two rows, each keeping its own pid
+    });
+
+    it('synthetic pid-0 agents are not sampled — the OS has nothing to answer for them', async () => {
+      stubResourceMonitor(makeVaryingExec());
+      const sendToRenderer = vi.fn();
+      const deps = makeStampingDeps(sendToRenderer, () => [
+        { agent: 'Claude Code', process: 'claude.exe', pid: 100, startTime: 1717000000000 },
+        { agent: 'Kilo Code', process: 'code.exe', pid: 0 },
+      ]);
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const [records] = pushes(sendToRenderer);
+      expect(records.every((r) => r.pid > 0)).toBe(true);
+      expect(records.some((r) => r.pid === 100)).toBe(true);
+    });
+  });
+
+  // ── sequence-engine taps (docs/roadmap/sequence-rules.md §5) ──
+
+  describe('sequence-engine taps', () => {
+    /** A fake engine: the two calls the taps make, nothing else. */
+    function makeEngine() {
+      return { ingest: vi.fn(), sweep: vi.fn() };
+    }
+
+    /**
+     * Two file events of one instance on ONE path: the first passes `dedupFileEvent`
+     * and the second is dropped by the 30 s window — so a tap fed the RAW list would
+     * call ingest twice and a tap fed the deduped list exactly once.
+     * @returns {Array<Object>}
+     */
+    function twoEventsOnePath() {
+      return [
+        {
+          agent: 'Claude Code',
+          pid: 100,
+          instanceId: '100:1717000000000',
+          file: 'C:\\Users\\me\\passwords.txt',
+          action: 'holding',
+          sensitive: true,
+          category: 'ai',
+          attribution: { status: 'confirmed', evidence: ['handle-scan-pid'] },
+        },
+        {
+          agent: 'Claude Code',
+          pid: 100,
+          instanceId: '100:1717000000000',
+          file: 'C:\\Users\\me\\passwords.txt',
+          action: 'holding',
+          sensitive: true,
+          category: 'ai',
+          attribution: { status: 'confirmed', evidence: ['handle-scan-pid'] },
+        },
+      ];
+    }
+
+    it('tap 2: doFileScan ingests each event that passed dedup and none that dedup dropped', async () => {
+      const sequenceEngine = makeEngine();
+      const raw = twoEventsOnePath();
+      const recordAcceptedFileEvent = vi.fn((ev) => {
+        ev.eventId = 'accepted-before-display';
+      });
+      const deps = makeDeps({
+        recordAcceptedFileEvent,
+        getLatestAgents: vi.fn().mockReturnValue([{ agent: 'Claude Code' }]),
+        watcher: {
+          pruneKnownHandles: vi.fn(),
+          scanAllFileHandles: vi.fn().mockResolvedValue(raw),
+        },
+        sequenceEngine,
+      });
+      scanLoop.init(deps);
+      // staggeredStartup(_, paused=true): doProcessScan @3s, doFileScan @8s, no warmup
+      scanLoop.staggeredStartup(5000, true);
+      await vi.advanceTimersByTimeAsync(8000);
+
+      expect(sequenceEngine.ingest).toHaveBeenCalledTimes(1);
+      expect(recordAcceptedFileEvent).toHaveBeenCalledExactlyOnceWith(raw[0]);
+      expect(deps.fileAccessBatcher.push.mock.calls[0][0].eventId).toBe('accepted-before-display');
+      // The SAME record the audit call received — dedup stamps `repeatCount` on it.
+      expect(sequenceEngine.ingest).toHaveBeenCalledWith(raw[0]);
+      expect(sequenceEngine.ingest).not.toHaveBeenCalledWith(raw[1]);
+      expect(deps.audit.log.mock.calls.filter((c) => c[0] === 'file-access')).toHaveLength(1);
+    });
+
+    it('tap 2 preserves a changed action and stronger evidence in both audit and sequence', async () => {
+      require_('../../src/main/session-tracker.js')._resetForTest();
+      const sequenceEngine = makeEngine();
+      const raw = twoEventsOnePath();
+      Object.assign(raw[0], {
+        action: 'modified',
+        sensitive: false,
+        attribution: { status: 'inferred', evidence: ['cwd-containment'] },
+      });
+      Object.assign(raw[1], {
+        action: 'accessed',
+        sensitive: true,
+        attribution: { status: 'confirmed', evidence: ['handle-scan-pid'] },
+      });
+      const deps = makeDeps({
+        getLatestAgents: vi.fn().mockReturnValue([{ agent: 'Claude Code' }]),
+        watcher: {
+          pruneKnownHandles: vi.fn(),
+          scanAllFileHandles: vi.fn().mockResolvedValue(raw),
+        },
+        sequenceEngine,
+      });
+      scanLoop.init(deps);
+      scanLoop.staggeredStartup(5000, true);
+      await vi.advanceTimersByTimeAsync(8000);
+      expect(sequenceEngine.ingest.mock.calls.map(([record]) => record)).toEqual(raw);
+      const audited = deps.audit.log.mock.calls.filter(([type]) => type === 'file-access');
+      expect(audited).toHaveLength(2);
+      expect(
+        audited.map(([, record]) => [record.action, record.severity, record.attribution.status]),
+      ).toEqual([
+        ['modified', 'normal', 'inferred'],
+        ['accessed', 'sensitive', 'confirmed'],
+      ]);
+    });
+
+    it('tap 2: doHotReadScan ingests the deduped hot-read events through the same tap', async () => {
+      const sequenceEngine = makeEngine();
+      const raw = twoEventsOnePath();
+      const recordAcceptedFileEvent = vi.fn((ev) => {
+        ev.eventId = 'accepted-before-display';
+      });
+      const deps = makeDeps({
+        recordAcceptedFileEvent,
+        getLatestAgents: vi.fn().mockReturnValue([{ agent: 'Claude Code' }]),
+        watcher: {
+          pruneKnownHandles: vi.fn(),
+          scanAllFileHandles: vi.fn().mockResolvedValue([]),
+          scanHotFileHolders: vi.fn().mockResolvedValue(raw),
+          isHotReadScanActive: vi.fn().mockReturnValue(true),
+        },
+        sequenceEngine,
+      });
+      scanLoop.init(deps);
+      // The hot-read interval is 10 s and only exists when the watcher reports it
+      // active; the process tick is pushed past it so the first hot read is the only
+      // scan that has run.
+      scanLoop.startScanIntervals(20000);
+      await vi.advanceTimersByTimeAsync(10000);
+
+      expect(deps.watcher.scanHotFileHolders).toHaveBeenCalledTimes(1);
+      expect(sequenceEngine.ingest).toHaveBeenCalledTimes(1);
+      expect(recordAcceptedFileEvent).toHaveBeenCalledExactlyOnceWith(raw[0]);
+      expect(deps.fileAccessBatcher.push.mock.calls[0][0].eventId).toBe('accepted-before-display');
+      expect(sequenceEngine.ingest).toHaveBeenCalledWith(raw[0]);
+      expect(sequenceEngine.ingest).not.toHaveBeenCalledWith(raw[1]);
+    });
+
+    it('tap 3: doNetworkScan ingests every connection it records, keyless ones included', async () => {
+      const sequenceEngine = makeEngine();
+      const connections = [
+        {
+          agent: 'Claude Code',
+          pid: 100,
+          instanceId: '100:1717000000000',
+          remoteIp: '1.2.3.4',
+          remotePort: 443,
+          localIp: '10.0.0.1',
+          localPort: 52001,
+          verdict: 'allowlisted',
+          verdictReason: 'ip-allowlist',
+          state: 'ESTABLISHED',
+          flagged: false,
+        },
+        // Matched no agent: the engine's own null policy skips and counts it — the
+        // tap does not pre-filter (roadmap §4).
+        {
+          agent: '',
+          pid: null,
+          instanceId: null,
+          remoteIp: '9.9.9.9',
+          remotePort: 80,
+          state: 'ESTABLISHED',
+          flagged: true,
+        },
+      ];
+      const deps = makeDeps({
+        getLatestAgents: vi.fn().mockReturnValue([{ agent: 'Claude Code' }]),
+        network: {
+          isNetworkScanRunning: vi.fn().mockReturnValue(false),
+          setNetworkScanRunning: vi.fn(),
+          scanNetworkConnections: vi.fn().mockResolvedValue(connections),
+        },
+        sequenceEngine,
+      });
+      scanLoop.init(deps);
+      scanLoop.doNetworkScan();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(sequenceEngine.ingest.mock.calls.map((c) => c[0])).toEqual(connections);
+      // Beside `recordNetworkEndpoint`: one ingest per endpoint recorded, same objects.
+      expect(deps.baselines.recordNetworkEndpoint).toHaveBeenCalledTimes(2);
+      expect(deps.audit.log).toHaveBeenCalledWith(
+        'network-connection',
+        expect.objectContaining({
+          extra: expect.objectContaining({
+            localIp: '10.0.0.1',
+            localPort: 52001,
+            remoteIp: '1.2.3.4',
+            remotePort: 443,
+            state: 'ESTABLISHED',
+            verdict: 'allowlisted',
+            verdictReason: 'ip-allowlist',
+          }),
+        }),
+      );
+      const legacyAudit = deps.audit.log.mock.calls.find(
+        ([type, record]) => type === 'network-connection' && record.pid === null,
+      )[1];
+      expect(legacyAudit.extra).not.toHaveProperty('verdict');
+      expect(legacyAudit.extra).not.toHaveProperty('verdictReason');
+      expect(legacyAudit.extra).not.toHaveProperty('localIp');
+    });
+
+    /**
+     * Deps whose scanner returns a stamped agent on the ticks `present` says so, so
+     * session-tracker reports an enter on the first tick and — after the exit grace —
+     * an exit once the agent is gone.
+     * @param {Object} sequenceEngine
+     * @param {(tick: number) => boolean} present
+     * @returns {Object}
+     */
+    function makeSessionDeps(sequenceEngine, present) {
+      let tick = 0;
+      return makeDeps({
+        scanner: {
+          scanProcesses: vi.fn().mockImplementation(async () => {
+            tick++;
+            return {
+              agents: present(tick)
+                ? [
+                    {
+                      agent: 'Claude Code',
+                      process: 'claude.exe',
+                      pid: 100,
+                      startTime: 1717000000000,
+                      instanceId: '100:1717000000000',
+                      instanceIdSource: 'os',
+                      category: 'ai',
+                    },
+                  ]
+                : [],
+              changed: false,
+              reliable: true,
+            };
+          }),
+        },
+        sequenceEngine,
+      });
+    }
+
+    it('tap 4: doProcessScan ingests the session record of an agent that entered', async () => {
+      require_('../../src/main/session-tracker.js')._resetForTest();
+      const sequenceEngine = makeEngine();
+      const deps = makeSessionDeps(sequenceEngine, () => true);
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+      await vi.advanceTimersByTimeAsync(5000);
+
+      const enter = deps.audit.log.mock.calls.find((c) => c[0] === 'agent-enter');
+      expect(enter).toBeTruthy();
+      expect(sequenceEngine.ingest).toHaveBeenCalledTimes(1);
+      // What session-tracker returned, unchanged: `firstSeen` and NO `lastSeen`, which
+      // is how the normalizer tells an enter from an exit.
+      const [record] = sequenceEngine.ingest.mock.calls[0];
+      expect(record).toEqual({
+        pid: 100,
+        instanceId: '100:1717000000000',
+        agent: 'Claude Code',
+        process: 'claude.exe',
+        firstSeen: expect.any(Number),
+      });
+      expect(record).not.toHaveProperty('lastSeen');
+      expect(record.firstSeen).toBe(enter[1].extra.startTime);
+    });
+
+    it('tap 4: doProcessScan ingests the session record of an agent that exited', async () => {
+      const sessionTracker = require_('../../src/main/session-tracker.js');
+      sessionTracker._resetForTest();
+      const sequenceEngine = makeEngine();
+      // Present on tick 1 only; the exit is reported after DEFAULT_EXIT_GRACE misses.
+      const deps = makeSessionDeps(sequenceEngine, (tick) => tick === 1);
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+      for (let i = 0; i < 1 + sessionTracker.DEFAULT_EXIT_GRACE; i++) {
+        await vi.advanceTimersByTimeAsync(5000);
+      }
+
+      const exit = deps.audit.log.mock.calls.find((c) => c[0] === 'agent-exit');
+      expect(exit).toBeTruthy();
+      // One enter, one exit — and the exit carrier carries `lastSeen`.
+      expect(sequenceEngine.ingest).toHaveBeenCalledTimes(2);
+      const [record] = sequenceEngine.ingest.mock.calls[1];
+      expect(record).toEqual({
+        pid: 100,
+        instanceId: '100:1717000000000',
+        agent: 'Claude Code',
+        process: 'claude.exe',
+        firstSeen: expect.any(Number),
+        lastSeen: expect.any(Number),
+      });
+      expect(record.instanceId).toBe(exit[1].instanceId);
+    });
+
+    it('tap 5: sweep runs exactly once per process tick, after the scans', async () => {
+      const sequenceEngine = makeEngine();
+      const deps = makeDeps({ sequenceEngine });
+      scanLoop.init(deps);
+      scanLoop.startScanIntervals(5000);
+
+      expect(sequenceEngine.sweep).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sequenceEngine.sweep).toHaveBeenCalledTimes(1);
+      // The sweep follows the tick's session reconcile: the enter/exit taps have
+      // already run when it fires.
+      const sweepOrder = sequenceEngine.sweep.mock.invocationCallOrder[0];
+      const scanOrder = deps.scanner.scanProcesses.mock.invocationCallOrder[0];
+      expect(sweepOrder).toBeGreaterThan(scanOrder);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sequenceEngine.sweep).toHaveBeenCalledTimes(2);
+    });
+
+    it('a scan without an injected engine still completes — the tap is a no-op', async () => {
+      const deps = makeDeps({
+        getLatestAgents: vi.fn().mockReturnValue([{ agent: 'Claude Code' }]),
+        watcher: {
+          pruneKnownHandles: vi.fn(),
+          scanAllFileHandles: vi.fn().mockResolvedValue(twoEventsOnePath()),
+        },
+      });
+      scanLoop.init(deps);
+      scanLoop.staggeredStartup(5000, true);
+      await vi.advanceTimersByTimeAsync(8000);
+
+      expect(deps.logger.error).not.toHaveBeenCalled();
+      expect(deps.audit.log.mock.calls.filter((c) => c[0] === 'file-access')).toHaveLength(1);
+      expect(deps.sendToRenderer).toHaveBeenCalledWith('scan-batch', expect.any(Object));
+    });
+  });
+});

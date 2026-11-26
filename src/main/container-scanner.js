@@ -1,0 +1,289 @@
+/**
+ * @file container-scanner.js
+ * @description Bounded running-container metadata discovery; an image match does
+ * not establish agent activity, isolation, host access, network activity or trust.
+ */
+'use strict';
+const { execFile: defaultExecFile } = require('node:child_process');
+const defaultFs = require('node:fs');
+const { resolveSystemExecutable } = require('./system-executable-admission');
+const { MAX_OUTPUT_BYTES, hasControl, parseContainerOutput } = require('./container-metadata');
+const {
+  MAX_CONFIGURATION_CANDIDATES,
+  CONFIGURATION_TIMEOUT_MS,
+  CONFIGURATION_OUTPUT_BYTES,
+  CONFIGURATION_FORMAT,
+  parseConfiguration,
+} = require('./container-configuration');
+
+const CADENCE_MS = 30000;
+const FRESH_MS = 90000;
+const FORMAT = '{"ID":{{json .ID}},"Image":{{json .Image}},"Names":{{json .Names}}}';
+const PS_ARGS = ['ps', '--no-trunc', '--filter', 'status=running', '--format'];
+const WINDOWS_ENDPOINTS = [
+  'npipe:////./pipe/dockerDesktopLinuxEngine',
+  'npipe:////./pipe/docker_engine',
+];
+// Docker CLI telemetry is opt-in through env; this observer must not inherit it.
+// https://docs.docker.com/engine/cli/otel/
+const SCRUB_ENV =
+  /^(?:DOCKER_(?:HOST|CONTEXT|TLS|TLS_VERIFY|CERT_PATH|API_VERSION)$|DOCKER_CLI_OTEL_|OTEL_|TRACEPARENT$|TRACESTATE$)/i;
+// Fixed system installation locations deliberately exclude PATH and the launch cwd.
+// Windows assumes the default Program Files ACLs; this is not signature/ACL attestation.
+const DOCKER_EXECUTABLES = {
+  win32: ['C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe'],
+  linux: ['/usr/bin/docker', '/usr/local/bin/docker'],
+  darwin: ['/Applications/Docker.app/Contents/Resources/bin/docker', '/usr/local/bin/docker'],
+};
+
+/** Admit Docker only at its fixed system installation paths.
+ * @param {string} platform Host platform.
+ * @param {object} [fs] Filesystem seam for focused tests.
+ * @returns {{file: string, cwd: string}|null} Admitted command or null.
+ * @since 0.19.2-beta
+ */
+function resolveDockerExecutable(platform, fs = defaultFs) {
+  return resolveSystemExecutable(platform, DOCKER_EXECUTABLES[platform] || [], fs);
+}
+
+/** Discard CLI error text. @param {unknown} error @returns {string} Fixed token. */
+function failureReason(error) {
+  if (error?.code === 'ENOENT') return 'cli-missing';
+  if (error?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return 'invalid-output';
+  if (error?.killed === true || error?.code === 'ETIMEDOUT') return 'timeout';
+  return 'daemon-unavailable';
+}
+
+/** Validate local endpoint syntax. @param {string} host @returns {boolean} */
+function isLocalHost(host) {
+  return (
+    (/^unix:\/\/\/(?!\/)\S+$/.test(host) && !hasControl(host)) ||
+    WINDOWS_ENDPOINTS.some((endpoint) => endpoint.toLowerCase() === host.toLowerCase())
+  );
+}
+
+/**
+ * Create a passive owner: Windows queries Desktop Linux then standard pipe on
+ * daemon failure (at most two 3s calls); others query the default local Unix socket.
+ * Scrub inherited overrides; custom/rootless/remote endpoints are outside this slice.
+ * @param {{execFile?: Function, now?: Function, platform?: string, fs?: object, onUpdate?: Function}} [options]
+ * @returns {{refresh: Function, snapshot: Function, cancelRefresh: Function, stop: Function}} Discovery lifecycle.
+ * @since 0.19.2-beta
+ */
+function createDockerDiscovery(options = {}) {
+  const execFile = options.execFile || defaultExecFile;
+  const now = options.now || Date.now;
+  const platform = options.platform || process.platform;
+  const endpoints = platform === 'win32' ? WINDOWS_ENDPOINTS : ['unix:///var/run/docker.sock'];
+  let state = {
+    status: 'pending',
+    reason: null,
+    observedAt: null,
+    attemptedAt: null,
+    candidates: [],
+  };
+  let inFlight = null;
+  let activeChild = null;
+  let cancel = null;
+  let generation = 0;
+  let stopped = false;
+
+  /** Return a dated copy; reads neither spawn nor refresh.
+   * @returns {object} The complete serializable discovery snapshot.
+   * @since 0.19.2-beta
+   */
+  function snapshot() {
+    const age = state.observedAt === null ? null : now() - state.observedAt;
+    return {
+      ...state,
+      stale: stopped || state.status !== 'ready' || age === null || age < 0 || age >= FRESH_MS,
+      candidates: state.candidates.map((candidate) => ({
+        ...candidate,
+        ...(candidate.configuration ? { configuration: { ...candidate.configuration } } : {}),
+      })),
+    };
+  }
+
+  /** Metadata-only query. @param {string} endpoint @param {object} env @returns {Promise<object>} */
+  function query(endpoint, env, id = null, timeout = 3000) {
+    const executable = resolveDockerExecutable(platform, options.fs);
+    if (!executable) return Promise.resolve({ reason: 'cli-missing' });
+    return new Promise((resolve) => {
+      let settled = false;
+      const watchdog = setTimeout(() => {
+        const child = activeChild;
+        finish({ reason: 'timeout' });
+        try {
+          child?.kill('SIGKILL');
+        } catch {
+          /* Settlement must not depend on process termination succeeding. */
+        }
+      }, timeout);
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(watchdog);
+        activeChild = null;
+        cancel = null;
+        resolve(result);
+      };
+      cancel = () => finish({ cancelled: true });
+      try {
+        const child = execFile(
+          executable.file,
+          [
+            '--host',
+            endpoint,
+            ...(id
+              ? ['container', 'inspect', '--format', CONFIGURATION_FORMAT, id]
+              : [...PS_ARGS, FORMAT]),
+          ],
+          {
+            timeout,
+            cwd: executable.cwd,
+            killSignal: 'SIGKILL',
+            maxBuffer: id ? CONFIGURATION_OUTPUT_BYTES : MAX_OUTPUT_BYTES,
+            windowsHide: true,
+            shell: false,
+            encoding: 'utf8',
+            env,
+          },
+          (error, stdout) => {
+            if (settled) return;
+            if (error) return finish({ reason: failureReason(error) });
+            if (id) return finish({ configuration: parseConfiguration(stdout, id, now()) });
+            const candidates = parseContainerOutput(stdout, 'docker');
+            finish(candidates === null ? { reason: 'invalid-output' } : { candidates });
+          },
+        );
+        if (!settled) activeChild = child;
+      } catch (error) {
+        finish({ reason: failureReason(error) });
+      }
+    });
+  }
+
+  /** Throttle/coalesce queries; failures retain dated candidates, empty success retires.
+   * @returns {Promise<object>} Copied snapshot after settling; this promise never rejects.
+   * @since 0.19.2-beta
+   */
+  function refresh() {
+    if (stopped) return Promise.resolve(snapshot());
+    if (inFlight) return inFlight;
+    const attemptedAt = now();
+    if (
+      state.attemptedAt !== null &&
+      attemptedAt >= state.attemptedAt &&
+      attemptedAt - state.attemptedAt < CADENCE_MS
+    )
+      return Promise.resolve(snapshot());
+    state = { ...state, attemptedAt };
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !SCRUB_ENV.test(key)),
+    );
+    const remote = Object.entries(process.env).some(
+      ([key, host]) => key.toUpperCase() === 'DOCKER_HOST' && host && !isLocalHost(host),
+    );
+    // Defer execution until the in-flight owner is installed, including sync test callbacks.
+    const owner = generation;
+    const work = Promise.resolve()
+      .then(async () => {
+        let outcome = remote ? { reason: 'remote-endpoint' } : null;
+        let selectedEndpoint = null;
+        let discoveryObservedAt = null;
+        for (const endpoint of endpoints) {
+          if (
+            stopped ||
+            owner !== generation ||
+            (outcome?.reason && outcome.reason !== 'daemon-unavailable')
+          )
+            break;
+          outcome = await query(endpoint, env);
+          if (outcome.candidates) {
+            selectedEndpoint = endpoint;
+            discoveryObservedAt = now();
+          }
+          if (outcome.cancelled || !outcome.reason) break;
+        }
+        if (!stopped && owner === generation && outcome?.candidates?.length) {
+          // One serial batch: at most eight calls and three seconds total, including stalled callbacks.
+          const deadline = performance.now() + CONFIGURATION_TIMEOUT_MS;
+          for (const [index, candidate] of outcome.candidates.entries()) {
+            candidate.configuration = { status: 'unavailable', observedAt: null };
+            const remaining = Math.floor(deadline - performance.now());
+            if (
+              stopped ||
+              owner !== generation ||
+              index >= MAX_CONFIGURATION_CANDIDATES ||
+              remaining <= 0
+            )
+              continue;
+            const inspection = await query(selectedEndpoint, env, candidate.containerId, remaining);
+            if (inspection.configuration) candidate.configuration = inspection.configuration;
+            if (inspection.cancelled || inspection.reason === 'timeout') break;
+          }
+          // Unqueried candidates have no observed configuration.
+          for (const candidate of outcome.candidates)
+            candidate.configuration ||= { status: 'unavailable', observedAt: null };
+        }
+        if (!stopped && owner === generation) {
+          state = outcome?.candidates
+            ? {
+                status: 'ready',
+                reason: null,
+                observedAt: discoveryObservedAt,
+                attemptedAt,
+                candidates: outcome.candidates,
+              }
+            : { ...state, status: 'unavailable', reason: outcome?.reason || 'daemon-unavailable' };
+          try {
+            options.onUpdate?.(snapshot());
+          } catch {
+            /* The discovery owns no caller logging. */
+          }
+        }
+        return snapshot();
+      })
+      .catch(() => {
+        if (!stopped && owner === generation)
+          state = { ...state, status: 'unavailable', reason: 'daemon-unavailable' };
+        return snapshot();
+      })
+      .finally(() => {
+        if (inFlight === work) inFlight = null;
+      });
+    inFlight = work;
+    return work;
+  }
+
+  /** Permanently stop this owner and suppress late results from its CLI.
+   * @returns {void}
+   * @since 0.19.2-beta
+   */
+  function stop() {
+    if (stopped) return;
+    stopped = true;
+    cancelRefresh();
+  }
+
+  /** Cancel the current observation and allow an immediate resumed refresh.
+   * @returns {void}
+   * @since 0.19.2-beta
+   */
+  function cancelRefresh() {
+    generation++;
+    const child = activeChild;
+    cancel?.();
+    inFlight = null;
+    state = { ...state, attemptedAt: null };
+    try {
+      child?.kill('SIGKILL');
+    } catch {
+      /* A completed process needs no further cleanup. */
+    }
+  }
+
+  return { refresh, snapshot, cancelRefresh, stop };
+}
+
+module.exports = { createDockerDiscovery, resolveDockerExecutable };

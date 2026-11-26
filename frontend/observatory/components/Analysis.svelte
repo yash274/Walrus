@@ -1,0 +1,672 @@
+<script lang="ts">
+  import { t } from '../runtime/i18n';
+
+  import { onMount, tick } from 'svelte';
+  import {
+    confirmed,
+    invoke,
+    record,
+    type Host,
+    type RecordData,
+    type Telemetry,
+  } from '../runtime/host';
+  import Action from './Action.svelte';
+  import Icon from './Icon.svelte';
+  import AssessmentContext from './AssessmentContext.svelte';
+  import AgentLogo from './AgentLogo.svelte';
+  import Metadata from './Metadata.svelte';
+  import EditorDialog from './EditorDialog.svelte';
+  let {
+    host,
+    telemetry,
+    visible = true,
+    preview = false,
+  }: { host: Host | null; telemetry: Telemetry; visible?: boolean; preview?: boolean } = $props();
+  let mode = $state('session');
+  let agent = $state('');
+  let key = $state('');
+  let keyPending = $state(false);
+  let providerVisit = 0;
+  let keyRevision = 0;
+  $effect(() => {
+    if (!visible) {
+      providerVisit++;
+      key = '';
+      showProvider = false;
+    }
+  });
+  let configured = $state(false);
+  let legacyKeyMigrationPending = $state(false);
+  let report = $state<RecordData | null>(null);
+  let history = $state<RecordData[]>([]);
+  let error = $state('');
+  let alive = true;
+  let generation = 0;
+  let showProvider = $state(false);
+  let providerSection = $state('connection');
+  let reportTitle = $state('Activity assessment');
+  let roster = $derived.by(() => {
+    if (telemetry.stale) return [];
+    const candidates = telemetry.agents.flatMap((row) => {
+      const id = row.instanceId;
+      return row.instanceIdSource === 'os' &&
+        typeof id === 'string' &&
+        /^[1-9]\d*:[1-9]\d*(?:\.\d+)?$/.test(id)
+        ? [{ ...row, instanceId: id }]
+        : [];
+    });
+    const counts: Record<string, number> = {};
+    for (const row of candidates) counts[row.instanceId] = (counts[row.instanceId] ?? 0) + 1;
+    return candidates.filter((row) => counts[row.instanceId] === 1);
+  });
+  const contextId = $props.id();
+  let reportHeading = $state<HTMLHeadingElement>();
+  let evidenceHeading = $state<HTMLHeadingElement>();
+  let historyHeading = $state<HTMLHeadingElement>();
+  $effect(() => {
+    if (!visible) return;
+    const ticket = keyRevision;
+    let current = true;
+    invoke(host, 'getSettings')
+      .then((value) => {
+        if (alive && current && ticket === keyRevision) {
+          configured = record(value).anthropicApiKeyConfigured === true;
+          legacyKeyMigrationPending = record(value).anthropicApiKeyMigrationPending === true;
+        }
+      })
+      .catch((e) => {
+        if (alive && current && ticket === keyRevision) error = String(e);
+      });
+    return () => {
+      current = false;
+    };
+  });
+  onMount(() => {
+    return () => {
+      alive = false;
+      generation++;
+      key = '';
+    };
+  });
+  async function saveKey(remove = false) {
+    if (preview || keyPending) throw new Error('Provider settings cannot be changed now');
+    const submittedDraft = key;
+    const value = remove ? '' : submittedDraft.trim();
+    if (!remove && !value) throw new Error('Enter an API key');
+    const visit = providerVisit;
+    keyPending = true;
+    try {
+      confirmed(
+        await invoke(
+          host,
+          'saveSettings',
+          { anthropicApiKey: value },
+          { patch: true, ...(remove ? { clearAnthropicApiKey: true } : {}) },
+        ),
+      );
+      if (alive) {
+        keyRevision++;
+        configured = !remove;
+        legacyKeyMigrationPending = false;
+        if (providerVisit === visit && key === submittedDraft) key = '';
+      }
+    } finally {
+      if (alive) keyPending = false;
+    }
+  }
+  async function analyze() {
+    const ticket = ++generation;
+    const selectedRow = mode === 'agent' ? roster.find((row) => row.instanceId === agent) : null;
+    const selected = selectedRow ? { ...selectedRow } : null;
+    const selectedBirth = record(selected).createTime100ns;
+    const selectedWitness = record(selected).generationWitness;
+    const selectedWitnessSource = record(selected).generationWitnessSource;
+    if (mode === 'agent' && !selected) throw new Error('Selected process instance is unavailable');
+    const scope = selected
+      ? `${selected.agent} · PID ${selected.pid} · ${selected.instanceId}`
+      : 'Session';
+    const sameScope = (item: unknown) => {
+      const row = record(item);
+      return (
+        !selected ||
+        (row.instanceId === selected.instanceId &&
+          (!row.createTime100ns || !selectedBirth || row.createTime100ns === selectedBirth) &&
+          (!row.generationWitness ||
+            !selectedWitness ||
+            (row.generationWitness === selectedWitness &&
+              row.generationWitnessSource === selectedWitnessSource)))
+      );
+    };
+    const events = telemetry.events.filter(sameScope);
+    const population = telemetry.agents.filter(sameScope);
+    const fallbackCounts = {
+      totalFiles: events.length,
+      totalSensitive: events.filter((event) => event.sensitive).length,
+      totalAgents: new Set(population.map((item) => item.agent).filter(Boolean)).size,
+      totalNet: telemetry.network.filter(sameScope).length,
+    };
+    const title = reportTitle.trim() || 'Activity assessment';
+    const result = confirmed(
+      await invoke(
+        host,
+        mode === 'agent' ? 'analyzeAgent' : 'analyzeSession',
+        ...(selected
+          ? [
+              {
+                instanceId: selected.instanceId,
+                ...Object.fromEntries(
+                  ['createTime100ns', 'generationWitness', 'generationWitnessSource']
+                    .filter((key) => typeof record(selected)[key] === 'string')
+                    .map((key) => [key, record(selected)[key]]),
+                ),
+              },
+            ]
+          : []),
+      ),
+    );
+    if (!alive || ticket !== generation) return;
+    let structured = record(result.structured);
+    if (!Object.keys(structured).length && typeof result.analysis === 'string') {
+      try {
+        structured = record(
+          JSON.parse(result.analysis.replace(/^```(?:json)?\s*|\s*```$/g, '').trim()),
+        );
+      } catch {
+        structured = { summary: result.analysis };
+      }
+    }
+    if (!Object.keys(structured).length) structured = result;
+    const requestCounts = record(result.counts);
+    const captured = ['totalFiles', 'totalSensitive', 'totalAgents', 'totalNet'].every(
+      (key) =>
+        typeof requestCounts[key] === 'number' &&
+        Number.isFinite(requestCounts[key]) &&
+        Number(requestCounts[key]) >= 0,
+    );
+    const counts = captured
+      ? Object.fromEntries(Object.keys(fallbackCounts).map((key) => [key, requestCounts[key]]))
+      : fallbackCounts;
+    report = {
+      ...structured,
+      title,
+      scope,
+      instanceId: selected?.instanceId ?? null,
+      pid: selected?.pid ?? null,
+      counts,
+      countsSource: captured ? 'Captured analysis request' : 'Retained displayed observations',
+      createdAt: new Date().toISOString(),
+    };
+    history = [report, ...history].slice(0, 20);
+  }
+  function strings(value: unknown) {
+    return Array.isArray(value) ? value.map(String) : [];
+  }
+  async function focusHeading(heading: HTMLHeadingElement | undefined) {
+    await tick();
+    if (!visible || !heading?.isConnected || heading.closest('[hidden], [inert]')) return;
+    heading.focus();
+  }
+  async function viewRecordedEvidence() {
+    await focusHeading(evidenceHeading);
+  }
+</script>
+
+<div class="analysis-workspace">
+  <section class="panel analysis-provider">
+    <div class="analysis-provider-name">
+      <AgentLogo name="Claude Code" size={32} />
+      <div>
+        <strong>{$t('Anthropic')}</strong><span
+          >{preview
+            ? $t('Preview · provider calls disabled')
+            : configured
+              ? $t('API key saved · verified on first analysis')
+              : legacyKeyMigrationPending
+                ? $t('Legacy key inactive · migration required')
+                : $t('Not connected')}</span
+        >
+      </div>
+    </div>
+    <div class="toolbar">
+      <button
+        class="button"
+        onclick={() => {
+          providerVisit++;
+          providerSection = 'connection';
+          showProvider = true;
+        }}
+        ><Icon name="settings" />{configured
+          ? $t('Connection settings')
+          : $t('Connect AI analysis')}</button
+      >
+    </div>
+  </section>
+  {#if showProvider}
+    <EditorDialog
+      title={$t('Anthropic connection')}
+      caption={$t('AI analysis')}
+      sectionLabel="AI analysis sections"
+      tabs={[
+        { id: 'connection', label: 'Connection', icon: 'network' },
+        { id: 'usage', label: 'Usage', icon: 'chart' },
+      ]}
+      bind:selected={providerSection}
+      close={() => {
+        providerVisit++;
+        showProvider = false;
+        key = '';
+      }}
+    >
+      {#snippet children(section)}
+        <section class="detail-section">
+          {#if section === 'connection'}
+            <h3>{$t('Provider connection')}</h3>
+            <div class="form-grid">
+              <label class="full"
+                >{$t('New API key')}<input
+                  disabled={preview}
+                  type="password"
+                  autocomplete="off"
+                  bind:value={key}
+                  placeholder={$t('Anthropic API key')}
+                /></label
+              >
+            </div>
+            <p class="dialog-copy">
+              {$t(
+                'Connection is verified when analysis runs. Saved keys are never displayed in this form.',
+              )}
+            </p>
+            {#if !preview && legacyKeyMigrationPending}<p class="dialog-copy" role="status">
+                {$t(
+                  'A legacy API key remains in saved settings but is inactive. Restore secure storage and settings access, then restart WALRUS to migrate it, or remove or replace the saved key here.',
+                )}
+              </p>{/if}
+            {#if !preview && !configured}<p class="dialog-copy">
+                {$t(
+                  'A saved key may remain when the OS keychain is locked. Remove saved key clears it.',
+                )}
+              </p>{/if}
+          {:else}
+            <h3>{$t('Analysis scope')}</h3>
+            <Metadata
+              value={{
+                Provider: 'Anthropic',
+                'Data sent': 'Recorded agent activity and observations',
+                'File contents': 'Excluded',
+                Billing: 'Provider charges may apply',
+                'Connection check': 'When analysis runs',
+              }}
+            />
+          {/if}
+        </section>
+      {/snippet}
+      {#snippet actions()}
+        {#if !preview}<Action disabled={keyPending} action={() => saveKey(true)}
+            ><Icon name="trash" />{$t('Remove saved key')}</Action
+          >{/if}
+        <button
+          class="button"
+          onclick={() => {
+            providerVisit++;
+            showProvider = false;
+            key = '';
+          }}>{$t('Close settings')}</button
+        >
+        <Action disabled={preview || keyPending || !key.trim()} action={() => saveKey()}
+          ><Icon name="key" />{$t('Save key')}</Action
+        >
+      {/snippet}
+    </EditorDialog>
+  {/if}
+  {#if error}<p role="alert">{error}</p>{/if}
+  <nav class="analysis-jumps" aria-label={$t('Report sections')}>
+    <button class="button" onclick={() => focusHeading(reportHeading)}
+      ><Icon name="report" />{$t('Report')}</button
+    >
+    <button class="button" onclick={viewRecordedEvidence}
+      ><Icon name="file" />{$t('Evidence')}</button
+    >
+    <button class="button" onclick={() => focusHeading(historyHeading)}
+      ><Icon name="history" />{$t('History')}</button
+    >
+  </nav>
+  <div class="analysis-layout">
+    <section class="panel analysis-config">
+      <div class="panel-head"><h2><Icon name="settings" />{$t('New assessment')}</h2></div>
+      <div class="analysis-config-body">
+        <label class="analysis-field"
+          >{$t('Scope')}<select bind:value={mode}
+            ><option value="session">{$t('Entire session')}</option><option value="agent"
+              >{$t('Process')}</option
+            ></select
+          ></label
+        >
+        {#if mode === 'agent'}<label class="analysis-field"
+            >{$t('Process')}<select bind:value={agent}
+              ><option value="">{$t('Select an agent')}</option
+              >{#each roster as instance (instance.instanceId)}<option value={instance.instanceId}
+                  >{instance.agent} · PID {instance.pid} · {instance.instanceId}</option
+                >{/each}</select
+            ></label
+          >{/if}
+        <label class="analysis-field"
+          >{$t('Report title')}<input bind:value={reportTitle} maxlength="160" /></label
+        >
+        <div class="scope-details analysis-field">
+          <small>{$t('Evidence scope')}</small>
+          <p>{$t('Recorded session metadata')}</p>
+          <small>{$t('File observations, connections and agent activity supplied by WALRUS.')}</small
+          >
+        </div>
+        <div class="provider-note">
+          <Icon name="shield" />
+          <p>
+            {$t(
+              'Run analysis asks for confirmation before sending recorded activity metadata to Anthropic; API charges may apply.',
+            )}
+          </p>
+        </div>
+      </div>
+      <div class="assessment-actions">
+        <Action
+          disabled={preview ||
+            keyPending ||
+            !configured ||
+            (mode === 'agent' && !roster.some((row) => row.instanceId === agent))}
+          action={analyze}><Icon name="play" />{$t('Run analysis')}</Action
+        >
+      </div>
+    </section>
+    <div class="analysis-output">
+      <section
+        class="panel analysis-report report-section"
+        aria-labelledby={contextId + '-report-heading'}
+      >
+        <div class="panel-head">
+          <h2 id={contextId + '-report-heading'} bind:this={reportHeading} tabindex="-1">
+            <Icon name="report" />{$t('Report')}
+          </h2>
+        </div>
+        <div class="analysis-body">
+          {#if !report}<div class="analysis-empty">
+              <Icon name="report" />
+              <h2>{$t('Review agent activity')}</h2>
+              <p>
+                {$t(
+                  'Choose a scope and run an assessment. Review findings alongside their recorded evidence.',
+                )}
+              </p>
+              <ol>
+                <li><span>1</span>{$t('Choose a session or an agent')}</li>
+                <li><span>2</span>{$t('Review the selected metadata')}</li>
+                <li><span>3</span>{$t('Assess findings and export the report')}</li>
+              </ol>
+              <small
+                >{preview
+                  ? $t('Provider calls are disabled in this preview.')
+                  : configured
+                    ? $t('Ready for a new assessment.')
+                    : $t('Connect Anthropic to create your first assessment.')}</small
+              >
+            </div>
+          {:else}<article class="analysis-document">
+              <div class="analysis-document-meta">
+                <small>{$t('ANTHROPIC ASSESSMENT')}</small><span class="badge"
+                  >{String(report.riskRating || report.riskLevel || 'Not assessed')}</span
+                >
+              </div>
+              <h2>{String(report.title)}</h2>
+              <small>{String(report.scope)} · {String(report.createdAt)}</small>
+              <p class="report-text">{String(report.summary ?? 'No summary returned')}</p>
+              <p>{String(report.riskJustification ?? '')}</p>
+              <AssessmentContext {report} {contextId} openEvidence={viewRecordedEvidence} />
+              <h3><Icon name="shield" />{$t('Findings')}</h3>
+              <ol>
+                {#each strings(report.findings) as item, i (i)}<li>{item}</li>{:else}<li>
+                    {$t('No findings returned.')}
+                  </li>{/each}
+              </ol>
+              <h3><Icon name="check" />{$t('Recommended checks')}</h3>
+              <ol>
+                {#each strings(report.recommendations) as item, i (i)}<li>{item}</li>{:else}<li>
+                    {$t('No recommendations returned.')}
+                  </li>{/each}
+              </ol>
+              <Action action={async () => confirmed(await invoke(host, 'openThreatReport', report))}
+                ><Icon name="report" />{$t('Open report')}</Action
+              >
+            </article>{/if}
+        </div>
+      </section>
+      <section
+        class="panel analysis-evidence report-section"
+        id={contextId + '-evidence'}
+        aria-labelledby={contextId + '-evidence-heading'}
+      >
+        <div class="panel-head">
+          <h2 id={contextId + '-evidence-heading'} bind:this={evidenceHeading} tabindex="-1">
+            <Icon name="file" />{$t('Recorded scope')}
+          </h2>
+        </div>
+        <div class="analysis-body">
+          {#if report}
+            <p class="muted">
+              {String(report.countsSource)} · {String(report.scope)}{$t(
+                '. Agents counts distinct products.',
+              )}
+            </p>
+            <Metadata value={record(report.counts)} />{:else}<div class="analysis-empty">
+              <Icon name="file" />
+              <h2>{$t('No assessment yet')}</h2>
+              <p>{$t('Evidence information appears after an analysis completes.')}</p>
+            </div>{/if}
+        </div>
+      </section>
+      <section
+        class="panel analysis-history report-section"
+        aria-labelledby={contextId + '-history-heading'}
+      >
+        <div class="panel-head">
+          <h2 id={contextId + '-history-heading'} bind:this={historyHeading} tabindex="-1">
+            <Icon name="history" />{$t('History')}
+          </h2>
+        </div>
+        <div class="analysis-history-body">
+          {#each history as previous (previous)}<button
+              class="analysis-history-row"
+              onclick={() => {
+                report = previous;
+                void focusHeading(reportHeading);
+              }}
+              ><Icon name="report" /><span
+                ><strong>{String(previous.title)}</strong><small
+                  >{String(previous.scope)} · {String(previous.createdAt)}</small
+                ></span
+              ><Icon name="chevron" /></button
+            >{:else}<div class="analysis-empty">
+              <Icon name="history" />
+              <h2>{$t('No assessments yet')}</h2>
+              <p>{$t('Your completed assessments will appear here.')}</p>
+            </div>{/each}
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<style>
+  .analysis-workspace {
+    display: grid;
+    gap: var(--space-4);
+    flex: none;
+    min-width: 0;
+    min-height: auto;
+  }
+  .analysis-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(250px, 280px);
+    gap: var(--space-4);
+    align-items: start;
+    flex: none;
+    min-height: auto;
+  }
+  .analysis-config {
+    display: block;
+    grid-column: 2;
+    grid-row: 1;
+    min-height: auto;
+    overflow: visible;
+  }
+  .analysis-output {
+    display: grid;
+    grid-column: 1;
+    grid-row: 1;
+    gap: var(--space-4);
+    min-height: auto;
+    overflow: visible;
+  }
+  .analysis-config-body,
+  .analysis-body {
+    display: grid;
+    gap: var(--space-3);
+    padding: var(--panel-inset);
+    flex: none;
+    min-height: auto;
+    overflow: visible;
+    overscroll-behavior: auto;
+    scrollbar-gutter: auto;
+  }
+  .analysis-field {
+    margin: 0;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .analysis-jumps {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .analysis-jumps button {
+    width: auto;
+    flex: none;
+    min-height: var(--control-height);
+    white-space: normal;
+  }
+  .panel-head {
+    flex-wrap: wrap;
+  }
+  .panel-head h2 {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin: 0;
+    font-size: var(--text-section);
+    font-weight: 700;
+    scroll-margin-block: var(--space-4);
+  }
+  .panel-head :global(.icon) {
+    flex-shrink: 0;
+  }
+  .assessment-actions {
+    flex: 0 0 auto;
+    padding: var(--panel-inset);
+    border-top: 1px solid var(--border);
+  }
+  .assessment-actions :global(.action-control) {
+    width: 100%;
+  }
+  .assessment-actions :global(button) {
+    width: 100%;
+    justify-content: center;
+  }
+  .analysis-provider {
+    padding: var(--panel-inset);
+    margin: 0;
+    flex-wrap: wrap;
+  }
+  .analysis-provider-name {
+    gap: var(--space-3);
+  }
+  .analysis-config .panel-head h2 {
+    font-size: calc(14px * var(--ui-scale));
+  }
+  .scope-details {
+    border-top: 1px solid var(--border);
+    padding-top: var(--space-3);
+  }
+  .scope-details p {
+    margin: 0;
+  }
+  .scope-details small,
+  .provider-note {
+    color: var(--muted);
+    font-size: var(--text-caption);
+  }
+  .provider-note {
+    display: flex;
+    gap: var(--space-2);
+    margin: 0;
+    line-height: 1.6;
+  }
+  .provider-note p {
+    margin: 0;
+  }
+  .provider-note :global(.icon) {
+    flex-shrink: 0;
+  }
+  .analysis-history-row {
+    display: flex;
+    width: 100%;
+    padding: var(--panel-inset);
+    gap: var(--space-3);
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .analysis-history-row > span {
+    flex: 1;
+    min-width: 0;
+  }
+  .analysis-history-row strong,
+  .analysis-history-row small {
+    display: block;
+    overflow-wrap: anywhere;
+  }
+  .analysis-document,
+  .analysis-empty {
+    padding: 0;
+    min-width: 0;
+  }
+  .analysis-empty {
+    gap: var(--space-3);
+  }
+  .analysis-empty > :global(.icon) {
+    margin-bottom: 0;
+  }
+  .analysis-empty h2,
+  .analysis-empty p,
+  .analysis-empty ol {
+    margin: 0;
+  }
+  .analysis-document > p {
+    margin: var(--space-3) 0;
+  }
+  .analysis-document li {
+    margin: var(--space-2) 0;
+    color: var(--muted);
+  }
+  .analysis-history-body > .analysis-empty {
+    padding: var(--panel-inset);
+  }
+  @media (max-width: 799px) {
+    .analysis-layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .analysis-config,
+    .analysis-output {
+      grid-column: 1;
+      grid-row: auto;
+    }
+  }
+</style>

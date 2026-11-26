@@ -1,0 +1,11 @@
+; English-only installer; the application language setting is independent.
+LangString ObservatoryWelcome ${LANG_ENGLISH} "Install WALRUS"
+LangString ObservatoryWelcomeDetail ${LANG_ENGLISH} "Independent AI Agent Security, Intelligence and Engineering Control Platform.$\r$\n$\r$\nFollow processes, audit file and network activity, and detect prompt injections in one workspace.$\r$\n$\r$\nChoose who can use WALRUS and where to install it. Your existing settings are kept when you update."
+LangString ObservatoryDirectory ${LANG_ENGLISH} "Choose where WALRUS will be installed. Your settings are stored separately and are kept when you update."
+LangString ObservatoryReady ${LANG_ENGLISH} "WALRUS is ready"
+LangString ObservatoryReadyDetail ${LANG_ENGLISH} "Installation is complete.$\r$\n$\r$\nOpen WALRUS to inspect agent security, code reviews and intelligence."
+LangString ObservatoryRun ${LANG_ENGLISH} "Open WALRUS"
+LangString ObservatoryRemove ${LANG_ENGLISH} "Uninstall WALRUS"
+LangString ObservatoryRemoveDetail ${LANG_ENGLISH} "WALRUS will be removed from this computer.$\r$\n$\r$\nYour settings and audit logs in %APPDATA%\aegis will be kept, so you can use them again if you reinstall."
+LangString ObservatoryRemoved ${LANG_ENGLISH} "WALRUS was uninstalled"
+LangString ObservatoryRemovedDetail ${LANG_ENGLISH} "The application has been removed.$\r$\n$\r$\nYour settings and audit logs are still on this computer. They will be available when you reinstall WALRUS."

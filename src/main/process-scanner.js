@@ -1,0 +1,493 @@
+/**
+ * @file process-scanner.js
+ * @module main/process-scanner
+ * @description AI-agent process detection via tasklist and process-set change
+ *   detection. Parent-chain and editor annotation are in process-utils.js.
+ * @requires fs
+ * @requires path
+ * @requires child_process
+ * @requires ../shared/constants
+ * @author AEGIS Contributors
+ * @license MIT
+ * @version 0.2.0
+ */
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { IGNORE_PROCESS_PATTERNS, EDITOR_HOSTS } = require('../shared/constants');
+const sensorHealth = require('./sensor-health');
+const config = require('./config-manager');
+const { validateCustomAgent } = require('./settings-validation');
+const _platform = require('./platform');
+let _listProcesses = _platform.listProcesses;
+let _getParentProcessMap = _platform.getParentProcessMap;
+// Identity-quality inputs, mirrored as overridable locals the same way process-utils.js
+// holds `providesStartTime` — so a test can state a platform's identity story without
+// pretending to be that platform.
+let _providesStartTime = _platform.providesStartTime === true;
+/** @type {(() => {state: string}) | null} Test override for the proc-snapshot leaf. */
+let _getSnapshotHealth = null;
+
+/** Authoritative process-enumeration sensor id (Block B3). One observation source. */
+const PROCESS_SENSOR_ID = 'process';
+
+/**
+ * Persistent health for scanProcesses. Survives poll ticks; reset only at module
+ * reinit / test reset. The existing scan-loop hard-failure path also marks a
+ * catalog/tracking callback rejection FAILED; only direct provider errors carry
+ * provenance for the new process-population outage audit record.
+ * @type {import('./sensor-health').SensorHealth}
+ */
+let _processHealth = sensorHealth.createSensorHealth(PROCESS_SENSOR_ID);
+// Only the direct provider-call wrapper may add an error here. A rejection from
+// catalog matching, response parsing or a caller callback can escape scanProcesses
+// too, but it does not prove enumeration failed. Weak references retain no errors.
+let _populationProviderErrors = new WeakSet();
+
+/**
+ * Call one platform process-table provider and tag only its own rejection.
+ * @template T
+ * @param {() => Promise<T> | T} provider
+ * @returns {Promise<T>}
+ * @since v0.16.0-alpha
+ */
+async function callPopulationProvider(provider) {
+  try {
+    return await provider();
+  } catch (err) {
+    if (err !== null && (typeof err === 'object' || typeof err === 'function')) {
+      _populationProviderErrors.add(err);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Whether this exact error object escaped the process-population provider boundary.
+ * Primitive rejections have no stable identity and are left unclassified.
+ * @param {unknown} err
+ * @returns {boolean}
+ * @since v0.16.0-alpha
+ */
+function isPopulationProviderFailure(err) {
+  return err !== null && (typeof err === 'object' || typeof err === 'function')
+    ? _populationProviderErrors.has(err)
+    : false;
+}
+
+/**
+ * Plain serializable snapshot for future B6 — callers must not mutate.
+ * @returns {object}
+ * @since 0.11.0
+ */
+function getProcessSensorHealth() {
+  return sensorHealth.toPlain(_processHealth);
+}
+
+/**
+ * Whether the latest process enumeration produced a trustworthy agent population.
+ * Compatibility: when false, `agents: []` means unknown, not confirmed empty fleet.
+ * @returns {boolean}
+ * @since 0.11.0
+ */
+function isProcessPopulationReliable() {
+  return _processHealth.state === sensorHealth.SENSOR_HEALTH_STATE.HEALTHY;
+}
+
+/**
+ * Read the `proc-snapshot` leaf's state through the platform façade.
+ *
+ * Gap F is closed: `platform/win32.js` now re-exports `getSnapshotHealth`, so the
+ * façade is the ONLY path and the former lazy `require('./platform/process-snapshot')`
+ * fallback is gone. That fallback reached around the abstraction to read a leaf the
+ * façade would not name; with the export in place, keeping it would leave a second
+ * path that can disagree with the first.
+ *
+ * `null` is returned where no façade publishes the leaf — currently darwin, which
+ * owns no snapshot. That branch answers nothing in practice: it sets
+ * `providesStartTime: false`, and {@link getIdentityQuality} returns on that flag
+ * before it ever reaches here. It is the honest value for "this platform carries no
+ * witness", not a fallback.
+ * @returns {string|null} The leaf state, or null when no façade publishes one.
+ */
+function readSnapshotState() {
+  if (_getSnapshotHealth) return _getSnapshotHealth().state;
+  if (typeof _platform.getSnapshotHealth === 'function') {
+    return _platform.getSnapshotHealth().state;
+  }
+  return null;
+}
+
+/**
+ * Identity strength for the keys `identify()` is currently able to form.
+ *
+ * Annotation only: §3 of the design is explicit that nothing gates on this value.
+ * The socket→agent and holder→agent matches are by PID, and a birth witness plays
+ * no part in a PID match — so a degraded witness must never be allowed to suppress
+ * an observation.
+ *
+ * STARTING (no snapshot taken yet) maps to `unknown` with the same reasoning as
+ * FAILED: no witness has been read, so `identify()` has none to key on.
+ * @returns {'witnessed'|'birth-time'|'unknown'}
+ * @since 0.12.0
+ */
+function getIdentityQuality() {
+  // Platforms without birth times (currently darwin) retain "<pid>:u".
+  if (_providesStartTime !== true) return 'unknown';
+  const state = readSnapshotState();
+  if (state === sensorHealth.SENSOR_HEALTH_STATE.HEALTHY) return 'witnessed';
+  // cim-fallback: _witnessOf drops to startTimeMs, so keys still form.
+  if (state === sensorHealth.SENSOR_HEALTH_STATE.DEGRADED) return 'birth-time';
+  return 'unknown';
+}
+
+/**
+ * Whether the identity keys this tick can form are degraded RELATIVE TO WHAT THIS
+ * PLATFORM PROVIDES.
+ *
+ * Deliberately not a bare `getIdentityQuality() === 'unknown'`. That value is
+ * `unknown` PERMANENTLY on darwin — that adapter publishes no birth time
+ * at all — so acting on it there would freeze session tracking forever on platforms
+ * where `<pid>:u` is the normal, documented steady state (process-identity.js space
+ * 3), not a fault. Degradation is a RELATIVE notion: it exists only where the
+ * platform declares a birth time and the observation that carries it failed.
+ *
+ * On such a platform `unknown` means the provider fell over between one tick and the
+ * next, so every live agent's key silently changes from `<pid>:<birthMs>` to
+ * `<pid>:u`. A nonempty observation can also omit one agent's birth time; the stamped
+ * agents argument detects that narrower loss without reading a prior birth from cache.
+ *
+ * `birth-time` (the CIM fallback) is NOT degradation here: the keys still form in
+ * the same space with the same values, so nothing splits. A missing birth for any
+ * real process does count, whether the provider lost all births or just one.
+ *
+ * SCOPE OF THE GATE: this is acted on by session reconciliation and app health. It
+ * never suppresses a file or network observation: the scan batch still carries the
+ * honest `<pid>:u` it observed. A partial loss freezes only affected PIDs in the
+ * session tracker; a complete provider loss still freezes the whole pass.
+ * @param {Array<{pid?:number,instanceIdSource?:string}>} [agents] Already stamped agents from this pass.
+ * @returns {boolean}
+ * @since 0.12.0
+ */
+function isIdentityDegraded(agents) {
+  return (
+    _providesStartTime === true &&
+    (getIdentityQuality() === 'unknown' || getUnwitnessedPids(agents).size > 0)
+  );
+}
+
+/**
+ * PIDs whose current stamp lacks the birth time this platform normally supplies.
+ * An absent stamp is also uncertain. Synthetic PID-zero identities do not need one.
+ * @param {Array<{pid?:number,instanceIdSource?:string}>} [agents] Current stamped agents.
+ * @returns {Set<number>} Unwitnessed real process IDs.
+ * @since 0.17.0
+ */
+function getUnwitnessedPids(agents) {
+  const pids = new Set();
+  if (_providesStartTime !== true || !Array.isArray(agents)) return pids;
+  for (const agent of agents) {
+    if (agent && Number.isInteger(agent.pid) && agent.pid > 0 && agent.instanceIdSource !== 'os')
+      pids.add(agent.pid);
+  }
+  return pids;
+}
+
+/**
+ * @typedef {Object} ProcessCapabilities
+ * @property {'STARTING'|'HEALTHY'|'DEGRADED'|'FAILED'} populationState - the `process`
+ *   LEAF's state, never a plane roll-up
+ * @property {boolean} populationReliable - true iff populationState === 'HEALTHY'
+ * @property {number|null} populationAsOf - the leaf's lastSuccessAt: how old the list is
+ * @property {'witnessed'|'birth-time'|'unknown'} identityQuality - annotation, gates nothing
+ */
+
+/**
+ * The capability contract dependants consume — and the ONLY thing they may consume
+ * to decide whether an agent-scoped observation is allowed to run.
+ *
+ * Deliberately not the process PLANE enum: that value is a display roll-up, safe by
+ * accident for today's single cause of plane-DEGRADED and silently wrong the moment
+ * the `process` leaf itself can degrade. Dependent correctness must not be
+ * reverse-engineered out of a display value (design §3).
+ * @returns {ProcessCapabilities}
+ * @since 0.12.0
+ */
+function getProcessCapabilities() {
+  return {
+    populationState: /** @type {'STARTING'|'HEALTHY'|'DEGRADED'|'FAILED'} */ (_processHealth.state),
+    populationReliable: _processHealth.state === sensorHealth.SENSOR_HEALTH_STATE.HEALTHY,
+    populationAsOf: _processHealth.lastSuccessAt,
+    identityQuality: getIdentityQuality(),
+  };
+}
+
+/**
+ * Record a hard process-scan failure that escaped scanProcesses (e.g. non-EPERM
+ * throw caught by scan-loop). Does not fabricate agents.
+ * @param {unknown} _err
+ * @returns {void}
+ * @since 0.11.0
+ */
+function noteProcessScanHardFailure(_err) {
+  const now = Date.now();
+  _processHealth = sensorHealth.markFailed(_processHealth, now, {
+    error: 'hard-scan-failure',
+    detail: 'hard-scan-failure',
+  });
+}
+
+/** @internal Override platform functions (for tests). */
+function _setPlatformForTest(overrides) {
+  if (overrides.listProcesses) _listProcesses = overrides.listProcesses;
+  if (overrides.getParentProcessMap) _getParentProcessMap = overrides.getParentProcessMap;
+  if (typeof overrides.providesStartTime === 'boolean') {
+    _providesStartTime = overrides.providesStartTime;
+  }
+  if (overrides.getSnapshotHealth) _getSnapshotHealth = overrides.getSnapshotHealth;
+}
+/** @internal Reset state (for tests). */
+function _resetForTest() {
+  lastProcessPidSet = '';
+  permissionDeniedScans = 0;
+  _processHealth = sensorHealth.createSensorHealth(PROCESS_SENSOR_ID);
+  _providesStartTime = _platform.providesStartTime === true;
+  _getSnapshotHealth = null;
+  _getParentProcessMap = _platform.getParentProcessMap;
+  _getCustomAgents = () => config.getCustomAgents();
+  _populationProviderErrors = new WeakSet();
+}
+
+let _agentDb = null;
+let _aiAgents = null;
+
+/** @returns {void} Lazily parse agent-database.json on first use. */
+function _ensureAgentDb() {
+  if (_agentDb) return;
+  _agentDb = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', 'shared', 'agent-database.json'), 'utf-8'),
+  );
+  _aiAgents = _agentDb.agents.map((a) => ({ name: a.displayName, patterns: a.names }));
+}
+
+/**
+ * Index this scan's validated catalog by lowercase process name. First ownership
+ * wins, including bundled patterns and duplicate custom IDs. Rebuild per scan so
+ * catalog edits take effect immediately; no process observation is cached here.
+ * @returns {Map<string, string>} Process name to agent display name
+ * @since 0.14.1
+ */
+function detectionIndex() {
+  const signatures = [..._aiAgents];
+  const ids = new Set(_agentDb.agents.map((agent) => agent.id));
+  const custom = _getCustomAgents();
+  for (const agent of Array.isArray(custom) ? custom : []) {
+    if (!validateCustomAgent(agent).valid || ids.has(agent.id)) continue;
+    ids.add(agent.id);
+    signatures.push({ name: agent.displayName, patterns: [...agent.names] });
+  }
+  const index = new Map();
+  for (const agent of signatures) {
+    for (const pattern of agent.patterns) {
+      const name = pattern.toLowerCase();
+      if (!index.has(name)) index.set(name, agent.name);
+    }
+  }
+  return index;
+}
+
+/** Set of editor host process names (lowercased) for fast lookup */
+const EDITOR_HOST_SET = new Set(EDITOR_HOSTS.map((h) => h.toLowerCase()));
+
+let lastProcessPidSet = '';
+let permissionDeniedScans = 0;
+
+const knownHandles = new Map();
+const activityLog = [];
+const monitoringStarted = Date.now();
+let peakAgents = 0;
+const uniqueAgentNames = new Set();
+
+let _trackSeenAgent = null;
+let _getCustomAgents = () => config.getCustomAgents();
+
+/**
+ * Initialise with external dependencies.
+ * @param {{ trackSeenAgent: Function, getCustomAgents?: Function }} deps
+ * @returns {void}
+ * @since v0.1.0
+ */
+function init(deps) {
+  _trackSeenAgent = deps.trackSeenAgent;
+  _getCustomAgents = deps.getCustomAgents || (() => config.getCustomAgents());
+}
+
+/**
+ * Scan running processes via tasklist and match against AI_AGENTS.
+ * Editor hosts (VS Code etc.) are skipped themselves, but their child
+ * processes are scanned — matched children get parentEditor set.
+ * @param {{sharedObservation?: boolean}} [opts] - request one fresh Windows map
+ *   for both population and identity; the returned map belongs to this pass only.
+ * @returns {Promise<{agents: Array, changed: boolean, reliable: boolean, processMap?: Map}>}
+ * @since v0.2.0
+ */
+async function scanProcesses(opts = {}) {
+  _ensureAgentDb();
+  let processes;
+  let processMap;
+  // A scan is "reliable" only when the process list was actually enumerated.
+  // A permission-denied scan returns an empty list that must NOT be read as
+  // "all agents exited" — the session tracker uses this flag to ignore it.
+  // Health is authoritative; `reliable` remains compatibility metadata and is true
+  // exactly when health is HEALTHY — never false while HEALTHY, never true while
+  // FAILED or DEGRADED.
+  let reliable = true;
+  const now = Date.now();
+  try {
+    if (_providesStartTime && opts.sharedObservation === true) {
+      processMap = await callPopulationProvider(_getParentProcessMap);
+      const rows = [...processMap].map(([pid, info]) => ({ pid, name: info.name }));
+      // An empty or nameless map cannot establish the population. Keep tasklist
+      // as the reserve population source, but carry even the empty observation to
+      // enrichment so it cannot silently retry and change this pass's evidence.
+      processes =
+        rows.length > 0 && rows.every((row) => typeof row.name === 'string' && row.name.length > 0)
+          ? rows
+          : await callPopulationProvider(_listProcesses);
+    } else processes = await callPopulationProvider(_listProcesses);
+    permissionDeniedScans = 0;
+  } catch (err) {
+    const code = err.code || '';
+    const msg = (err.message || '').toLowerCase();
+    if (code === 'EPERM' || code === 'EACCES' || msg.includes('access is denied')) {
+      // B-S01: full permission denial → no trustworthy population. Compatibility
+      // shape stays { agents: [], reliable: false }; health = FAILED (not empty fleet).
+      permissionDeniedScans++;
+      processes = [];
+      reliable = false;
+      _processHealth = sensorHealth.markFailed(_processHealth, now, {
+        error: 'permission-denied',
+        detail: 'permission-denied',
+      });
+      // Still run the empty path below for pid-set / peakAgents bookkeeping so
+      // callers keep a stable return shape. Do not markHealthy on this path.
+    } else {
+      // Leave the health write to noteProcessScanHardFailure in scan-loop. The
+      // provider-call wrapper tagged only actual platform-call rejections, so the
+      // caller can distinguish them from response parsing or later callbacks.
+      throw err;
+    }
+  }
+  // An enumeration that returned WITHOUT an error and still carries no process is not
+  // a usable observation of the process table. A live OS always lists at least the
+  // process doing the asking, so an empty (or non-array) result means the provider
+  // answered and its answer cannot be trusted for completeness — `tasklist` writing an
+  // unparsable page, a redirected stdout, a `ps` whose header alone came back.
+  //
+  // DEGRADED, not FAILED: nothing refused the observation, so `consecutiveFailures`
+  // must not move (§7.1 — "running but incomplete"). Never HEALTHY: a zero-agent fleet
+  // derived from a process table nobody could read is the B-S01 false-clean by another
+  // route, and `lastSuccessAt` must not advance over it.
+  //
+  // `reliable` guards the branch. The permission-denied path above already marked
+  // FAILED and set `processes = []`; without the guard it would be re-marked here and
+  // demoted from FAILED to DEGRADED by its own empty list.
+  if (reliable && (!Array.isArray(processes) || processes.length === 0)) {
+    processes = [];
+    reliable = false;
+    _processHealth = sensorHealth.markDegraded(_processHealth, now, {
+      error: 'empty-process-table',
+      detail: 'empty-process-table',
+    });
+    // Falls through to the empty path below for the same reason the EPERM branch does:
+    // pid-set and peakAgents bookkeeping run, and the return shape stays stable.
+  }
+  const detected = [];
+  const signatures = detectionIndex();
+  for (const proc of processes) {
+    const procName = proc.name.toLowerCase();
+    if (IGNORE_PROCESS_PATTERNS.some((p) => procName.includes(p))) continue;
+    if (EDITOR_HOST_SET.has(procName)) continue;
+    const agent = signatures.get(procName);
+    if (agent !== undefined) {
+      detected.push({
+        agent,
+        process: proc.name,
+        pid: proc.pid,
+        status: 'running',
+        category: 'ai',
+      });
+    }
+  }
+  const seen = new Set();
+  const unique = detected.filter((d) => {
+    if (seen.has(d.pid)) return false;
+    seen.add(d.pid);
+    return true;
+  });
+  if (unique.length > peakAgents) peakAgents = unique.length;
+  unique.forEach((a) => {
+    uniqueAgentNames.add(a.agent);
+    if (_trackSeenAgent) _trackSeenAgent(a.agent);
+  });
+  const pidSetKey = unique
+    .map((u) => u.pid)
+    .sort()
+    .join(',');
+  const changed = pidSetKey !== lastProcessPidSet;
+  lastProcessPidSet = pidSetKey;
+  // Valid enumeration (including an empty AGENT fleet) → HEALTHY. Agent cardinality is
+  // not health: zero agents out of a process table that WAS read is a confirmed clean
+  // fleet. Zero PROCESSES is the different question the DEGRADED rung above answers.
+  // Permission-denied (FAILED) and empty-table (DEGRADED) both wrote the record already
+  // and left `reliable` false.
+  if (reliable) {
+    _processHealth = sensorHealth.markHealthy(_processHealth, now);
+  }
+  return {
+    agents: unique,
+    changed,
+    reliable,
+    ...(processMap instanceof Map ? { processMap } : {}),
+  };
+}
+
+module.exports = {
+  get AI_AGENTS() {
+    _ensureAgentDb();
+    return _aiAgents;
+  },
+  get agentDb() {
+    _ensureAgentDb();
+    return _agentDb;
+  },
+  init,
+  scanProcesses,
+  getProcessSensorHealth,
+  isProcessPopulationReliable,
+  getProcessCapabilities,
+  isPopulationProviderFailure,
+  // Published as its own function rather than as a fifth ProcessCapabilities field:
+  // that struct is the POPULATION contract every agent-scoped sensor gates on, and
+  // this answers a different question for exactly one consumer.
+  isIdentityDegraded,
+  getUnwitnessedPids,
+  noteProcessScanHardFailure,
+  PROCESS_SENSOR_ID,
+  _setPlatformForTest,
+  _resetForTest,
+  knownHandles,
+  activityLog,
+  monitoringStarted,
+  get peakAgents() {
+    return peakAgents;
+  },
+  set peakAgents(v) {
+    peakAgents = v;
+  },
+  uniqueAgentNames,
+  get permissionDeniedScans() {
+    return permissionDeniedScans;
+  },
+};

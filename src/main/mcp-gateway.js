@@ -1,0 +1,457 @@
+'use strict';
+const { createHash, timingSafeEqual } = require('node:crypto');
+const { types } = require('node:util');
+const {
+  readActionFile,
+  parseActionJson,
+  equalActionValue: equal,
+  LIMITS,
+} = require('./action-policy');
+const { captureGatewayGrantStore } = require('./mcp-gateway-grants');
+const { captureSecretPolicy } = require('./mcp-gateway-secrets');
+const { captureGatewayRoute } = require('./mcp-gateway-route');
+const { isExecutionRuntimeSupported } = require('./execution-runtime');
+const { validManifest, matchesSchema, validResult } = require('./mcp-gateway-schema');
+const { createGatewayEvidence } = require('./mcp-gateway-evidence');
+const VERSION = '2025-11-25';
+const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const only = (v, names) => object(v) && Object.keys(v).every((k) => names.includes(k));
+const idValid = (id) =>
+  (Number.isSafeInteger(id) && id >= 0) ||
+  (typeof id === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(id));
+const result = (id, value) => ({ jsonrpc: '2.0', id, result: value });
+const error = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
+
+// Capture JSON data without invoking getters, toJSON, or proxy traps. The parser's
+// existing byte/node/depth limits also bound in-process callers before any await.
+function captureParams(message) {
+  const descriptor = Object.getOwnPropertyDescriptor(message, 'params');
+  if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw Error('invalid');
+  let nodes = 0,
+    bytes = 0;
+  const append = (text) => {
+    bytes += Buffer.byteLength(text);
+    if (bytes > LIMITS.bytes) throw Error('invalid');
+    return text;
+  };
+  const visit = (value, depth) => {
+    if (++nodes > LIMITS.nodes || depth > LIMITS.depth) throw Error('invalid');
+    if (value === null || typeof value === 'boolean' || typeof value === 'number') {
+      if (typeof value === 'number' && !Number.isFinite(value)) throw Error('invalid');
+      return append(JSON.stringify(value));
+    }
+    if (typeof value === 'string') {
+      if (value.length > LIMITS.bytes) throw Error('invalid');
+      return append(JSON.stringify(value));
+    }
+    if (typeof value !== 'object' || types.isProxy(value)) throw Error('invalid');
+    const array = Array.isArray(value);
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== (array ? Array.prototype : Object.prototype) && prototype !== null)
+      throw Error('invalid');
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > LIMITS.nodes || (array && keys.length !== value.length + 1))
+      throw Error('invalid');
+    const parts = [append(array ? '[' : '{')];
+    let count = 0;
+    for (const key of keys) {
+      if (array && key === 'length') continue;
+      if (typeof key !== 'string' || key.length > LIMITS.bytes) throw Error('invalid');
+      if (array && (!/^(0|[1-9]\d*)$/.test(key) || Number(key) >= value.length))
+        throw Error('invalid');
+      const property = Object.getOwnPropertyDescriptor(value, key);
+      if (!property.enumerable || !Object.hasOwn(property, 'value')) throw Error('invalid');
+      if (count++) parts.push(append(','));
+      if (!array) parts.push(append(JSON.stringify(key) + ':'));
+      parts.push(visit(property.value, depth + 1));
+    }
+    parts.push(append(array ? ']' : '}'));
+    return parts.join('');
+  };
+  const buffer = Buffer.from(visit(descriptor.value, 0));
+  try {
+    return parseActionJson(buffer);
+  } finally {
+    buffer.fill(0);
+  }
+}
+
+/** Gate an explicitly selected upstream server; grants bind exact tool/arguments for one attempt.
+ * @param {object} options Exclusive stdio pair or HTTP endpoint, accepted manifest and failure hook.
+ * @returns {object} Finite receive/close and owned child or session cleanup. @since v0.15.1 */
+function createMcpGateway({
+  policyPath,
+  requestPath,
+  endpointPath,
+  manifestPath,
+  grantStorePath,
+  secretPolicyPath,
+  disclosurePolicyPath,
+  reviewCall,
+  onFailure,
+  onEvidence,
+}) {
+  const evidence = createGatewayEvidence(onEvidence);
+  let phase = 'new',
+    closed = false,
+    busy = false,
+    route,
+    peer,
+    secretGuard,
+    grantStore,
+    manifest,
+    digest,
+    activeId,
+    disclosureDigest;
+  const ids = new Set(),
+    used = new Set();
+  const reviewed = reviewCall !== undefined || disclosurePolicyPath !== undefined;
+  const approved = new Map();
+  const controller = new AbortController();
+  const close = (failed = false) => {
+    if (closed) return;
+    closed = true;
+    phase = 'closed';
+    approved.clear();
+    controller.abort();
+    route?.close();
+    secretGuard?.close();
+    peer?.close();
+    if (failed) onFailure();
+  };
+  const step = async (promise) => {
+    let timer, abort;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          abort = () => reject(Error('gateway-closed'));
+          controller.signal.addEventListener('abort', abort, { once: true });
+          timer = setTimeout(() => {
+            close(true);
+            abort();
+          }, 3000);
+          if (closed) abort();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      controller.signal.removeEventListener('abort', abort);
+    }
+  };
+  const readManifest = async () => {
+    const bytes = await readActionFile(manifestPath);
+    try {
+      const hash = createHash('sha256').update(bytes).digest('hex');
+      if (digest && digest !== hash) throw Error('manifest-changed');
+      const value = parseActionJson(bytes);
+      if (!validManifest(value, { allowDistinctReviewedGrants: reviewed }))
+        throw Error('manifest-unsupported');
+      digest = hash;
+      return value;
+    } finally {
+      bytes.fill(0);
+    }
+  };
+  const readDisclosure = async () => {
+    const bytes = await readActionFile(disclosurePolicyPath);
+    try {
+      const hash = createHash('sha256').update(bytes).digest('hex');
+      if (disclosureDigest && disclosureDigest !== hash) throw Error('disclosure-changed');
+      const policy = parseActionJson(bytes);
+      if (!require('./mcp-gateway-review-display').validReviewPolicy(policy))
+        throw Error('disclosure-unsupported');
+      disclosureDigest = hash;
+      return policy;
+    } finally {
+      bytes.fill(0);
+    }
+  };
+  const askOwner = async (preview) => {
+    let timer, abort;
+    const start = performance.now();
+    try {
+      const result = await Promise.race([
+        Promise.resolve().then(() => reviewCall(preview, { signal: controller.signal })),
+        new Promise((_, reject) => {
+          abort = () => reject(Error('gateway-closed'));
+          controller.signal.addEventListener('abort', abort, { once: true });
+          timer = setTimeout(() => {
+            close(true);
+            abort();
+          }, 65000);
+          if (closed) abort();
+        }),
+      ]);
+      if (closed || performance.now() - start >= 65000) throw Error('review-expired');
+      return result === true;
+    } finally {
+      clearTimeout(timer);
+      controller.signal.removeEventListener('abort', abort);
+    }
+  };
+  const verifyCredential = async () => {
+    if (manifest.schemaVersion !== 4) return;
+    const key = await step(grantStore.readCredentialKey(controller.signal));
+    try {
+      const actual = Buffer.from(route.credentialTag(key), 'hex');
+      const expected = Buffer.from(manifest.credentialTag, 'hex');
+      if (!timingSafeEqual(actual, expected)) throw Error('gateway-credential-mismatch');
+    } finally {
+      key.fill(0);
+    }
+  };
+  const verifyStdioRoute = async (launch) => {
+    if (manifest.schemaVersion !== 5) return;
+    if (typeof route.stdioRouteTag !== 'function') throw Error('gateway-stdio-route-unavailable');
+    const key = await step(grantStore.readCredentialKey(controller.signal));
+    try {
+      const actual = Buffer.from(route.stdioRouteTag(key, launch), 'hex');
+      const expected = Buffer.from(manifest.stdioRouteTag, 'hex');
+      if (!timingSafeEqual(actual, expected)) throw Error('gateway-stdio-route-mismatch');
+    } finally {
+      key.fill(0);
+    }
+  };
+  const recheck = async () => {
+    await step(secretGuard.recheck());
+    await step(readManifest());
+    const selected = await step(route.recheck());
+    if (closed) throw Error('server-authorization');
+    return selected;
+  };
+  const checkCatalog = async () => {
+    const listed = await step(peer.request('tools/list', {}));
+    if (closed || !only(listed, ['tools']) || !equal(listed.tools, manifest.tools))
+      throw Error('catalog-changed');
+  };
+  async function receive(message) {
+    if (closed) return null;
+    if (
+      !only(message, ['jsonrpc', 'id', 'method', 'params']) ||
+      message.jsonrpc !== '2.0' ||
+      typeof message.method !== 'string'
+    ) {
+      close(true);
+      return null;
+    }
+    if (!Object.hasOwn(message, 'id')) {
+      if (
+        message.method === 'notifications/cancelled' &&
+        only(message.params, ['requestId', 'reason'])
+      ) {
+        if (busy && activeId !== undefined && message.params.requestId === activeId) close(true);
+      } else if (
+        message.method === 'notifications/initialized' &&
+        phase === 'awaiting-client' &&
+        (message.params === undefined ||
+          (object(message.params) && !Object.keys(message.params).length))
+      )
+        phase = 'ready';
+      else close(true);
+      return null;
+    }
+    const id = message.id;
+    if (!idValid(id) || ids.has(id) || ids.size >= 64)
+      return error(idValid(id) ? id : null, -32600, 'gateway-request-invalid');
+    ids.add(id);
+    if (busy) return error(id, -32000, 'gateway-busy');
+    if (message.method === 'initialize') {
+      if (
+        phase !== 'new' ||
+        !only(message.params, ['protocolVersion', 'capabilities', 'clientInfo']) ||
+        message.params.protocolVersion !== VERSION ||
+        !object(message.params.capabilities) ||
+        !object(message.params.clientInfo)
+      )
+        return error(id, -32602, 'gateway-initialize-invalid');
+      busy = true;
+      activeId = id;
+      phase = 'initializing';
+      try {
+        if (!isExecutionRuntimeSupported()) throw Error('runtime');
+        if (
+          reviewed &&
+          (typeof reviewCall !== 'function' ||
+            typeof disclosurePolicyPath !== 'string' ||
+            !disclosurePolicyPath ||
+            typeof secretPolicyPath !== 'string' ||
+            !secretPolicyPath ||
+            typeof grantStorePath !== 'string' ||
+            !grantStorePath ||
+            endpointPath !== undefined)
+        )
+          throw Error('review-route-unsupported');
+        secretGuard = await step(captureSecretPolicy(secretPolicyPath, controller.signal));
+        if (reviewed) await step(readDisclosure());
+        manifest = await step(readManifest());
+        if (reviewed && manifest.schemaVersion < 2) throw Error('review-store-required');
+        secretGuard.assertSafe(manifest.tools);
+        if (
+          manifest.schemaVersion >= 2 !==
+          (typeof grantStorePath === 'string' && !!grantStorePath)
+        )
+          throw Error('grant-store-required');
+        if (manifest.schemaVersion >= 2)
+          grantStore = await step(captureGatewayGrantStore(grantStorePath));
+        route = await step(
+          captureGatewayRoute({ policyPath, requestPath, endpointPath }, controller.signal),
+        );
+        if ([3, 4].includes(manifest.schemaVersion) && !equal(route.identity, manifest.route))
+          throw Error('gateway-route-mismatch');
+        await verifyCredential();
+        const launch = await recheck();
+        await verifyStdioRoute(launch);
+        if (closed) throw Error('closed');
+        peer = route.open(launch, () => close(true));
+        const initialized = await step(
+          peer.request('initialize', {
+            protocolVersion: VERSION,
+            capabilities: {},
+            clientInfo: { name: 'aegis-gateway', version: '1.0.0' },
+          }),
+        );
+        if (
+          closed ||
+          !object(initialized) ||
+          initialized.protocolVersion !== VERSION ||
+          !object(initialized.capabilities?.tools)
+        )
+          throw Error('upstream-initialize');
+        await step(Promise.resolve(peer.notify('notifications/initialized')));
+        await checkCatalog();
+        phase = 'awaiting-client';
+        return result(id, {
+          protocolVersion: VERSION,
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: 'aegis-gateway', version: '1.0.0' },
+        });
+      } catch {
+        close(true);
+        return error(id, -32000, 'gateway-unavailable');
+      } finally {
+        busy = false;
+        activeId = undefined;
+      }
+    }
+    if (phase !== 'ready') return error(id, -32000, 'gateway-not-initialized');
+    if (
+      message.method === 'ping' &&
+      (message.params === undefined ||
+        (object(message.params) && !Object.keys(message.params).length))
+    )
+      return result(id, {});
+    if (
+      message.method === 'tools/list' &&
+      (message.params === undefined ||
+        (object(message.params) && !Object.keys(message.params).length))
+    ) {
+      busy = true;
+      activeId = id;
+      try {
+        await step(secretGuard.recheck());
+        secretGuard.assertSafe(manifest.tools);
+        if (closed) throw Error('closed');
+        return result(id, { tools: manifest.tools });
+      } catch {
+        close(true);
+        return error(id, -32000, 'gateway-unavailable');
+      } finally {
+        busy = false;
+        activeId = undefined;
+      }
+    }
+    if (message.method !== 'tools/call') return error(id, -32601, 'gateway-method-unsupported');
+    let params;
+    try {
+      params = captureParams(message);
+    } catch {
+      return error(id, -32602, 'gateway-arguments-invalid');
+    }
+    if (!only(params, ['name', 'arguments'])) return error(id, -32602, 'gateway-arguments-invalid');
+    const tool = manifest.tools.find((item) => item.name === params.name);
+    if (!tool || !matchesSchema(tool.inputSchema, params.arguments))
+      return error(id, -32602, 'gateway-arguments-invalid');
+    const grant = manifest.grants.findIndex(
+      (item, index) =>
+        !used.has(index) && item.tool === params.name && equal(item.arguments, params.arguments),
+    );
+    if (grant < 0 || used.has(grant)) return error(id, -32000, 'gateway-grant-unavailable');
+    // Consume before asynchronous work, even if upstream fails or the caller cancels.
+    used.add(grant);
+    const operationId = evidence.operationId();
+    busy = true;
+    activeId = id;
+    try {
+      const permission = manifest.grants[grant];
+      let consumption;
+      await verifyCredential();
+      if (manifest.schemaVersion === 5) await verifyStdioRoute(await recheck());
+      if (grantStore) consumption = await step(grantStore.consume(permission));
+      if (manifest.schemaVersion >= 2) evidence.emit('consumed', operationId);
+      await recheck();
+      await checkCatalog();
+      await recheck();
+      if (grantStore) await step(grantStore.recheck(consumption));
+      if (closed) throw Error('closed');
+      if (
+        manifest.schemaVersion >= 2 &&
+        (Date.now() < permission.notBefore || Date.now() >= permission.expiresAt)
+      )
+        throw Error('grant-expired');
+      secretGuard.assertSafe(params);
+      if (reviewed) {
+        const disclosure = await step(readDisclosure());
+        const previous = approved.get(params.name);
+        if (previous !== undefined) secretGuard.assertSafe(previous);
+        const rendered = require('./mcp-gateway-review-display').renderReview({
+          policy: disclosure,
+          tool: params.name,
+          current: params.arguments,
+          previous,
+        });
+        if (!rendered.ok) throw Error('review-display-unavailable');
+        secretGuard.assertSafe(rendered.preview);
+        if (!(await askOwner(rendered.preview))) {
+          evidence.emit('failed', operationId);
+          return error(id, -32000, 'gateway-review-declined');
+        }
+        await step(readDisclosure());
+        await verifyCredential();
+        const launch = await recheck();
+        if (manifest.schemaVersion === 5) await verifyStdioRoute(launch);
+        await checkCatalog();
+        await recheck();
+        if (grantStore) await step(grantStore.recheck(consumption));
+        if (closed || Date.now() < permission.notBefore || Date.now() >= permission.expiresAt)
+          throw Error('review-invalidated');
+        secretGuard.assertSafe(params);
+      }
+      evidence.emit('dispatch', operationId);
+      const request = peer.request('tools/call', params);
+      if (reviewed) approved.set(params.name, params.arguments);
+      const returned = await step(request);
+      if (closed || !validResult(tool, returned)) throw Error('upstream-result');
+      await step(secretGuard.recheck());
+      secretGuard.assertSafe(returned);
+      if (closed) throw Error('closed');
+      evidence.emit('completed', operationId);
+      return result(id, returned);
+    } catch {
+      close(true);
+      evidence.emit('failed', operationId);
+      return error(id, -32000, 'gateway-call-failed');
+    } finally {
+      busy = false;
+      activeId = undefined;
+    }
+  }
+  return {
+    receive,
+    close: () => close(),
+    finish: () => peer?.done || Promise.resolve(true),
+    getEvidenceStatus: evidence.status,
+    finishEvidence: evidence.finish,
+  };
+}
+module.exports = { createMcpGateway };

@@ -1,0 +1,71 @@
+# Sequence rules — temporal_ordered correlations keyed on process.entity_id.
+# Format: docs/roadmap/sequence-rules.md §1. Loader: src/main/sequence-rule-loader.js
+# (loadDir) — a multi-document file of base detection documents plus the correlation
+# documents that order them. Rejection is per FILE: one bad document drops every rule here.
+#
+# The opted-in policy records temporal evidence and limits severity. Existing TCP
+# tuples remain informational; handle holds never establish a read. All observed
+# TCP ports and allowlisted destinations remain eligible. No payload is inspected.
+title: Credential file observation
+name: cred_file_read
+logsource:
+  product: aegis
+  category: file
+detection:
+  selection:
+    event.action:
+      - file-accessed
+      - file-handle-held
+    file.path|re|i: '[\\/](?:\.env(?:\.[^\\/]*)?|id_(?:rsa|dsa|ecdsa|ed25519)|(?:[^\\/]*[._\d-])?(?:passwords?|credentials?)[^\\/]*)$'
+  condition: selection
+---
+title: TCP connection observation
+name: outbound_conn
+logsource:
+  product: aegis
+  category: network
+detection:
+  selection:
+    network.transport: tcp
+  condition: selection
+---
+title: Credential file observation followed by TCP observation
+id: SEQ001
+level: medium
+evidence-policy: credential-egress-v1
+correlation:
+  type: temporal_ordered
+  rules:
+    - cred_file_read
+    - outbound_conn
+  group-by:
+    - process.entity_id
+  timespan: 5m
+---
+title: Credential and TCP observations across related processes
+id: SEQ002
+level: low
+evidence-policy: credential-egress-v1
+relationship: direct-parent-child
+correlation:
+  type: temporal_ordered
+  rules:
+    - cred_file_read
+    - outbound_conn
+  group-by:
+    - process.entity_id
+  timespan: 5m
+---
+title: Credential and TCP observations across an ancestor path
+id: SEQ003
+level: low
+evidence-policy: credential-egress-v1
+relationship: ancestor-descendant
+correlation:
+  type: temporal_ordered
+  rules:
+    - cred_file_read
+    - outbound_conn
+  group-by:
+    - process.entity_id
+  timespan: 5m

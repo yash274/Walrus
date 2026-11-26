@@ -1,0 +1,421 @@
+<script lang="ts">
+  import { tick, untrack, onDestroy, onMount } from 'svelte';
+  import { t } from '../runtime/i18n';
+  import {
+    addToast,
+    toasts,
+    removeToast,
+    clearAllToasts,
+  } from '../../../src/renderer/lib/stores/toast';
+  import { createAnomalyToastTracker } from '../../../src/renderer/lib/utils/anomaly-toast-tracker';
+  import {
+    alertBasename,
+    alertControlTarget,
+    createSensitiveAlertTracker,
+    parseJournalAlerts,
+    type SensitiveAlert,
+  } from '../runtime/sensitive-alerts';
+  import { confirmed, invoke, type Host, type RecordData, type Telemetry } from '../runtime/host';
+  import SensitiveAlertCenter from './SensitiveAlertCenter.svelte';
+  import { matchesFalsePositive } from '../../../src/shared/false-positive-match.js';
+  import { createSensitivePresentation } from '../runtime/sensitive-presentation';
+  import { isScopedProcess } from '../runtime/agent-scope';
+
+  let {
+    telemetry,
+    host = null,
+    onInspect,
+  }: {
+    telemetry: Telemetry;
+    host?: Host | null;
+    onInspect?: (_title: string, _row: RecordData) => void;
+  } = $props();
+  const anomalyTracker = createAnomalyToastTracker();
+  const sensitiveTracker = createSensitiveAlertTracker();
+  const sensitivePresentation = createSensitivePresentation();
+  let alerts = $state.raw<SensitiveAlert[]>([]);
+  let evicted = $state(0);
+  let recent = $state.raw<SensitiveAlert[]>([]);
+  let sensitiveFocused = $state(false);
+  let sensitiveBanner = $state<HTMLDivElement>();
+  let centerOpen = $state(false);
+  let journalStatus = $state('ready');
+  let journalLoadError = $state(false);
+  let journalLoading = $state(false);
+  let journalMounted = false;
+  let reviewSaveError = $state(false);
+  let reviewRevision = 0;
+  let reviewPending = $state(false);
+  let centerTrigger: HTMLButtonElement;
+  let toastStack: HTMLDivElement;
+  $effect.pre(() => {
+    $toasts;
+    const focused = document.activeElement;
+    if (!focused || !toastStack?.contains(focused)) return;
+    // Sensitive banners manage their own focus and expiry.
+    if (!focused.closest('.notification:not(.sensitive)')) return;
+    void tick().then(() => {
+      if (
+        !focused.isConnected &&
+        document.activeElement === document.body &&
+        centerTrigger?.isConnected
+      )
+        centerTrigger.focus({ preventScroll: true });
+    });
+  });
+  let measureTrigger: (() => void) | undefined;
+  const needsReview = $derived(alerts.filter((item) => !item.reviewed).length);
+
+  $effect(() => {
+    // Update the reserved footer lane in the same DOM update as the badge or label.
+    needsReview;
+    $t;
+    measureTrigger?.();
+  });
+
+  $effect(() => {
+    if (telemetry.stale) return;
+    const scores: Record<string, number | undefined> = Object.create(null);
+    const agents: Record<string, (typeof telemetry.agents)[number]> = Object.create(null);
+    const duplicates: Record<string, boolean> = Object.create(null);
+    for (const agent of telemetry.agents) {
+      const id = agent.instanceId;
+      if (!id) continue;
+      if (Object.hasOwn(agents, id)) duplicates[id] = true;
+      else agents[id] = agent;
+    }
+    for (const [id, agent] of Object.entries(agents)) {
+      if (
+        Object.hasOwn(duplicates, id) ||
+        !isScopedProcess(agent) ||
+        agent.instanceIdSource !== 'os'
+      ) {
+        scores[id] = undefined;
+        continue;
+      }
+      scores[id] = Object.hasOwn(telemetry.anomalies, id) ? telemetry.anomalies[id] : undefined;
+    }
+    for (const id of anomalyTracker.ingest(scores)) {
+      const agent = agents[id];
+      addToast(
+        $t('Anomaly: {value0} (PID {value1}) score {value2}', {
+          value0: agent.agent,
+          value1: agent.pid,
+          value2: scores[id],
+        }),
+        'warning',
+      );
+    }
+  });
+  $effect(() => {
+    const delivery = sensitiveTracker.ingest(telemetry.events);
+    alerts = delivery.items;
+    evicted = delivery.evicted;
+    const fresh = sensitivePresentation.ingest(
+      delivery.fresh,
+      delivery.items,
+      telemetry.falsePositiveReadState,
+      telemetry.falsePositives,
+    );
+    untrack(() => {
+      if (fresh.length) recent = fresh;
+      else if (telemetry.falsePositiveReadState !== 'pending') removeMatchedBanner();
+    });
+  });
+  function removeMatchedBanner(): void {
+    if (sensitiveFocused || sensitiveBanner?.contains(document.activeElement)) return;
+    const remaining = recent.filter(
+      (item) => !matchesFalsePositive(item.event, telemetry.falsePositives),
+    );
+    if (remaining.length !== recent.length) recent = remaining;
+  }
+  $effect(() => {
+    if (!recent.length || sensitiveFocused) return;
+    const shown = recent;
+    const timer = setTimeout(() => {
+      if (recent === shown && !sensitiveBanner?.contains(document.activeElement)) recent = [];
+    }, 8000);
+    return () => clearTimeout(timer);
+  });
+  onDestroy(clearAllToasts);
+  onMount(() => {
+    const style = document.documentElement.style;
+    const properties = ['--observatory-alert-trigger-width', '--observatory-alert-trigger-height'];
+    const previous = properties.map((property) => [
+      property,
+      style.getPropertyValue(property),
+      style.getPropertyPriority(property),
+    ]);
+    let alive = true;
+    const measure = () => {
+      if (!alive) return;
+      const box = centerTrigger.getBoundingClientRect();
+      const width = box.width + 'px';
+      const height = box.height + 'px';
+      if (
+        style.getPropertyValue(properties[0]) === width &&
+        style.getPropertyValue(properties[1]) === height
+      )
+        return;
+      window.dispatchEvent(new Event('observatory-alert-lane-before-resize'));
+      style.setProperty(properties[0], width);
+      style.setProperty(properties[1], height);
+      window.dispatchEvent(new Event('observatory-alert-lane-resize'));
+    };
+    measureTrigger = measure;
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    observer?.observe(centerTrigger);
+    window.addEventListener('resize', measure);
+    measure();
+    return () => {
+      alive = false;
+      measureTrigger = undefined;
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+      for (const [property, value, priority] of previous)
+        if (value) style.setProperty(property, value, priority);
+        else style.removeProperty(property);
+    };
+  });
+  async function loadJournal(): Promise<void> {
+    if (!host?.listSensitiveAlerts || journalLoading) return;
+    journalLoading = true;
+    const seedReviewRevision = reviewRevision;
+    try {
+      const reply = confirmed(await invoke(host, 'listSensitiveAlerts'));
+      if (!journalMounted) return;
+      if (reviewRevision === seedReviewRevision)
+        journalStatus = typeof reply.status === 'string' ? reply.status : 'ready';
+      alerts = sensitiveTracker.mergeJournal(parseJournalAlerts(reply.items));
+      journalLoadError = false;
+    } catch {
+      if (journalMounted) journalLoadError = true;
+    } finally {
+      if (journalMounted) journalLoading = false;
+    }
+  }
+  onMount(() => {
+    journalMounted = true;
+    void loadJournal();
+    return () => {
+      journalMounted = false;
+    };
+  });
+
+  async function reviewAlert(id: string, reviewed: boolean): Promise<boolean> {
+    if (reviewPending) return false;
+    reviewPending = true;
+    reviewRevision++;
+    try {
+      if (!host || id.startsWith('session-')) {
+        alerts = sensitiveTracker.setReviewed(id, reviewed, false);
+        return true;
+      }
+      const reply = confirmed(await invoke(host, 'setSensitiveAlertReviewed', id, reviewed));
+      journalStatus = typeof reply.status === 'string' ? reply.status : 'ready';
+      reviewSaveError = false;
+      alerts = sensitiveTracker.setReviewed(id, reviewed, true);
+      return true;
+    } catch {
+      reviewSaveError = true;
+      return false;
+    } finally {
+      reviewPending = false;
+    }
+  }
+
+  async function openCenter() {
+    centerOpen = true;
+    recent = [];
+    sensitiveFocused = false;
+    await tick();
+  }
+  async function dismissSensitive() {
+    const ownedFocus = sensitiveBanner?.contains(document.activeElement) === true;
+    recent = [];
+    sensitiveFocused = false;
+    if (ownedFocus) {
+      await tick();
+      centerTrigger?.focus({ preventScroll: true });
+    }
+  }
+  async function closeCenter() {
+    centerOpen = false;
+    await tick();
+    centerTrigger?.focus({ preventScroll: true });
+  }
+  async function openEvidence(item: SensitiveAlert) {
+    await closeCenter();
+    onInspect?.(alertBasename(item.event.file), item.event as unknown as RecordData);
+  }
+  async function openProcessControls(item: SensitiveAlert) {
+    const target = alertControlTarget(item.event, telemetry);
+    if (!target || !onInspect) return;
+    await closeCenter();
+    onInspect(target.agent, { ...target, detailSection: 'process-controls' });
+  }
+</script>
+
+<button
+  class="alert-trigger"
+  bind:this={centerTrigger}
+  aria-expanded={centerOpen}
+  aria-label={$t('Sensitive activity review · {value0} need review', { value0: needsReview })}
+  onclick={() => (centerOpen ? closeCenter() : openCenter())}
+>
+  {$t('Alerts')}
+  {#if needsReview > 0}<span>{needsReview}</span>{/if}
+</button>
+{#if centerOpen}
+  <SensitiveAlertCenter
+    items={alerts}
+    {evicted}
+    {journalStatus}
+    {journalLoadError}
+    {journalLoading}
+    {reviewSaveError}
+    onRetryJournal={loadJournal}
+    {reviewPending}
+    onReview={reviewAlert}
+    onInspect={onInspect ? openEvidence : undefined}
+    canOpenProcess={(item) =>
+      Boolean(item.live && onInspect && alertControlTarget(item.event, telemetry))}
+    onOpenProcess={openProcessControls}
+    onClose={closeCenter}
+  />
+{/if}
+<div bind:this={toastStack} class="notifications" aria-live="polite" aria-atomic="false">
+  {#if !centerOpen && recent.length}
+    <div
+      class="notification sensitive"
+      role="status"
+      bind:this={sensitiveBanner}
+      onfocusin={() => (sensitiveFocused = true)}
+      onfocusout={(event) => {
+        sensitiveFocused =
+          event.relatedTarget instanceof Node &&
+          sensitiveBanner?.contains(event.relatedTarget) === true;
+        if (telemetry.falsePositiveReadState !== 'pending') removeMatchedBanner();
+      }}
+    >
+      <div>
+        <strong>
+          {recent.length === 1
+            ? $t('Sensitive file observed: {value0}', {
+                value0: alertBasename(recent[0].event.file),
+              })
+            : $t('{value0} sensitive file observations', { value0: recent.length })}
+        </strong>
+        <p>
+          {recent.length === 1 &&
+          recent[0].event.agent &&
+          recent[0].event.attribution?.status === 'confirmed'
+            ? $t('Observed owner: {value0}', { value0: recent[0].event.agent })
+            : recent.length === 1 &&
+                recent[0].event.agent &&
+                recent[0].event.attribution?.status === 'inferred'
+              ? $t('Possible source: {value0}', { value0: recent[0].event.agent })
+              : $t('Source may be unverified; review the evidence.')}
+        </p>
+        {#if telemetry.falsePositiveReadState === 'unavailable'}<p>
+            {$t('Saved exceptions could not be checked. Review the evidence.')}
+          </p>{/if}
+      </div>
+      <button onclick={openCenter}>{$t('Review')}</button>
+      <button aria-label={$t('Dismiss notification')} onclick={dismissSensitive}>×</button>
+    </div>
+  {/if}
+  {#each $toasts as toast (toast.id)}
+    <div class="notification">
+      <p>{toast.message}</p>
+      <button aria-label={$t('Dismiss notification')} onclick={() => removeToast(toast.id)}
+        >×</button
+      >
+    </div>
+  {/each}
+</div>
+
+<style>
+  .alert-trigger {
+    position: fixed;
+    z-index: 91;
+    right: 20px;
+    bottom: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    border: 1px solid var(--strong-border);
+    border-radius: var(--control-radius);
+    background: var(--panel);
+    color: var(--ink);
+    box-shadow: var(--shadow);
+    cursor: pointer;
+  }
+  .alert-trigger span {
+    min-width: 1.5em;
+    border-radius: 999px;
+    background: var(--amber);
+    color: var(--panel);
+    text-align: center;
+    font-size: var(--text-caption);
+  }
+  .notifications {
+    position: fixed;
+    z-index: 80;
+    right: 20px;
+    bottom: calc(var(--observatory-footer-height, 0px) + 58px);
+    display: grid;
+    gap: 8px;
+    max-width: min(420px, 90vw);
+  }
+  .notification {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 12px 16px;
+    border: 1px solid var(--amber);
+    border-radius: var(--control-radius);
+    background: var(--panel);
+    box-shadow: var(--shadow);
+  }
+  .notification.sensitive {
+    border-color: var(--red);
+  }
+  .notification p {
+    margin: var(--space-1) 0 0;
+  }
+  .notification button {
+    color: var(--ink);
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+  }
+  .notification button:focus-visible,
+  .alert-trigger:focus-visible {
+    outline: 2px solid var(--selection-border);
+  }
+  @media (min-width: 800px) {
+    .alert-trigger {
+      bottom: max(
+        6px,
+        calc(
+          (
+              var(
+                  --observatory-footer-height,
+                  calc(var(--observatory-alert-trigger-height, 30px) + 24px)
+                ) -
+                var(--observatory-alert-trigger-height, 30px)
+            ) /
+            2
+        )
+      );
+    }
+  }
+  @media (max-width: 600px) {
+    .alert-trigger,
+    .notifications {
+      right: 10px;
+    }
+  }
+</style>

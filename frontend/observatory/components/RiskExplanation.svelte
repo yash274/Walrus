@@ -1,0 +1,202 @@
+<script lang="ts">
+  import { t } from '../runtime/i18n';
+
+  import { riskContext } from '../runtime/risk-context';
+  import { riskBand } from '../runtime/radar';
+  import type { RecordData, Telemetry } from '../runtime/host';
+  import Icon from './Icon.svelte';
+  let {
+    row,
+    telemetry,
+    navigate,
+    showAssessment = true,
+  }: {
+    row: RecordData;
+    telemetry: Telemetry;
+    navigate: (_title: string, _row: RecordData) => void;
+    showAssessment?: boolean;
+  } = $props();
+  let context = $derived(riskContext(row, telemetry));
+  const points = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 1 });
+</script>
+
+<section class="detail-section risk-explanation">
+  <div class="section-heading">
+    <h3>{$t('Why this score')}</h3>
+    <span class="badge"
+      >{telemetry.stale
+        ? $t('Last reliable snapshot')
+        : context.captured
+          ? $t('Assessment when opened')
+          : $t('Latest assessment')}</span
+    >
+  </div>
+  {#if context.subject}
+    {#if showAssessment}
+      <div class="assessment-head">
+        <strong
+          class="risk-value"
+          class:low={context.score !== null && riskBand(context.score) === 'low'}
+          class:medium={context.score !== null && riskBand(context.score) === 'medium'}
+          class:high={context.score !== null && riskBand(context.score) === 'high'}
+        >
+          {context.score ?? '—'}<small>/100</small>
+        </strong>
+        <div>
+          <strong
+            >{context.score === null
+              ? $t('Unavailable')
+              : riskBand(context.score) + ' observed risk'}</strong
+          >
+          <p class="primary-reason">
+            {!context.subject.instanceId
+              ? $t('Activity cannot be linked')
+              : (context.contributions[0]?.label ?? $t('No scored activity'))}
+          </p>
+        </div>
+      </div>
+    {/if}
+    {#if row.agentGroupKey}
+      <p class="scope">
+        {context.processCount}
+        {$t('worker')}
+        {context.processCount === 1 ? $t('process') : $t('processes')}
+        {$t('· Highest score: PID')}
+        {String(context.subject.pid)}.
+        {#if context.tied > 1}{context.tied} {$t('processes share this score.')}{/if}
+      </p>
+      <button
+        class="button"
+        onclick={() => navigate(String(context.subject?.name || 'Process'), context.subject!)}
+      >
+        {$t('View process PID')}
+        {String(context.subject.pid)}<Icon name="chevron" />
+      </button>
+    {:else}
+      <p class="scope">
+        {$t('Assessment for PID')}
+        {String(context.subject.pid)} · {String(context.subject.process || 'Process')}
+      </p>
+    {/if}
+    {#if context.unlinked}
+      <p class="notice">
+        {context.unlinked}
+        {context.unlinked === 1 ? $t('process has') : $t('processes have')}
+        {$t(
+          'no recorded identity. Their activity cannot be linked, so the assessment has limited coverage.',
+        )}
+      </p>
+    {/if}
+    {#if context.available}
+      {#if context.contributions.length}
+        <ul class="factor-list">
+          {#each context.contributions as factor (factor.id)}
+            <li>
+              <div><strong>{$t(factor.label)}</strong><span>+{points(factor.points)}</span></div>
+              <p>{$t(factor.detail)}</p>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="notice">
+          {$t(
+            'No file or network activity contributes to this score in the available observations. Coverage determines what WALRUS can assess.',
+          )}
+        </p>
+      {/if}
+      {#if context.adjustment < 0 && context.baseScore !== null}
+        <div class="adjustment">
+          <strong>{$t('Score with all observed files')}</strong><span
+            >{points(context.baseScore)} / 100</span
+          >
+        </div>
+        <p class="entity-note">
+          {$t(
+            'Matching saved file exceptions account for the {points}-point difference from the displayed score.',
+            { points: points(-context.adjustment) },
+          )}
+        </p>
+      {/if}
+      <p class="entity-note">
+        {$t(
+          'Shown factors exclude matching saved file exceptions. The score from remaining activity is rounded and capped at 100. Older file activity carries less weight. Behaviour anomaly is assessed separately.',
+        )}
+      </p>
+    {:else}
+      <p class="notice">{$t('A factor breakdown is unavailable for this assessment.')}</p>
+    {/if}
+  {:else}
+    <p class="notice">
+      {$t(
+        'This agent is no longer in the available snapshot. A current risk explanation is unavailable.',
+      )}
+    </p>
+  {/if}
+</section>
+
+<style>
+  .risk-explanation {
+    display: grid;
+    gap: var(--space-3);
+  }
+  .risk-explanation > .section-heading {
+    margin-bottom: 0;
+  }
+  .risk-explanation > p {
+    margin-top: 0;
+  }
+  .assessment-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+  }
+  .assessment-head > div {
+    min-width: 0;
+  }
+  .assessment-head > div > strong {
+    text-transform: capitalize;
+  }
+  p {
+    margin: var(--space-1) 0 0;
+    line-height: 1.5;
+    color: var(--muted);
+  }
+  .scope {
+    color: var(--text);
+  }
+  .button {
+    justify-self: start;
+  }
+  .factor-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    overflow: hidden;
+  }
+  .factor-list li {
+    padding: var(--space-3) var(--panel-inset);
+  }
+  .factor-list li + li {
+    border-top: 1px solid var(--border);
+  }
+  .factor-list li > div,
+  .adjustment {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: var(--space-3);
+  }
+  .factor-list span,
+  .adjustment span {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .factor-list p {
+    font-size: calc(12px * var(--ui-scale));
+  }
+  .notice {
+    margin: 0;
+  }
+</style>

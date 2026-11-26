@@ -1,0 +1,96 @@
+import { it, expect, vi } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
+import Details from '../../../frontend/observatory/components/Details.svelte';
+import { emptyTelemetry } from '../../../frontend/observatory/runtime/host';
+const live = {
+  agent: 'Claude Code',
+  process: 'claude.exe',
+  pid: 42,
+  instanceId: '42:old',
+  instanceIdSource: 'os',
+  generationWitness: 'observed-generation',
+  generationWitnessSource: 'createTime100ns',
+  cwd: 'X:/test',
+};
+const state = () => ({ ...emptyTelemetry(), ready: true, stale: false, agents: [live] });
+it('enables controls for enriched rows and dispatches the canonical live identity', async () => {
+  const host = { suspendProcess: vi.fn(async () => ({ success: true })) };
+  const props = {
+    host,
+    telemetry: state(),
+    request: {
+      title: 'Claude Code',
+      row: { name: 'Claude Code', process: 'claude.exe', instanceId: '42:old', pid: 42 },
+    },
+    close: vi.fn(),
+    refreshFalsePositives: vi.fn(),
+  };
+  render(Details, props);
+  await fireEvent.click(await screen.findByRole('tab', { name: 'Controls' }));
+  const suspend = await screen.findByRole('button', { name: 'Suspend', exact: true });
+  expect(suspend).toBeEnabled();
+  await fireEvent.click(suspend);
+  await waitFor(() =>
+    expect(host.suspendProcess).toHaveBeenCalledWith({
+      pid: 42,
+      instanceId: '42:old',
+      generationWitness: 'observed-generation',
+      generationWitnessSource: 'createTime100ns',
+    }),
+  );
+});
+it.each([
+  ['missing', { ...live, generationWitness: null }],
+  ['birth-time-only', { ...live, generationWitnessSource: 'startTimeMs' }],
+])('disables controls with %s generation evidence', async (_case, agent) => {
+  render(Details, {
+    host: { suspendProcess: vi.fn(async () => ({ success: true })) },
+    telemetry: { ...state(), agents: [agent] },
+    request: { title: 'Claude Code', row: live },
+    close: vi.fn(),
+    refreshFalsePositives: vi.fn(),
+  });
+  await fireEvent.click(await screen.findByRole('tab', { name: 'Controls' }));
+  expect(await screen.findByRole('button', { name: 'Suspend', exact: true })).toBeDisabled();
+});
+it('refuses a stop confirmation after that PID has been reused', async () => {
+  const host = { killProcess: vi.fn(async () => ({ success: true })) };
+  const props = {
+    host,
+    telemetry: state(),
+    request: { title: 'Claude Code', row: live },
+    close: vi.fn(),
+    refreshFalsePositives: vi.fn(),
+  };
+  const mounted = render(Details, props);
+  await fireEvent.click(await screen.findByRole('tab', { name: 'Controls' }));
+  await fireEvent.click(await screen.findByRole('button', { name: 'Stop…' }));
+  expect(screen.getByRole('button', { name: 'Confirm stop' })).toBeInTheDocument();
+  await mounted.rerender({
+    telemetry: { ...state(), agents: [{ ...live, instanceId: '42:new' }] },
+  });
+  await fireEvent.click(screen.getByRole('button', { name: 'Confirm stop' }));
+  expect(await screen.findByText(/no longer reliably observed/)).toBeInTheDocument();
+  expect(host.killProcess).not.toHaveBeenCalled();
+});
+it('refuses a stop confirmation when PID reuse shares the same instanceId millisecond', async () => {
+  const host = { killProcess: vi.fn(async () => ({ success: true })) };
+  const mounted = render(Details, {
+    host,
+    telemetry: state(),
+    request: { title: 'Claude Code', row: live },
+    close: vi.fn(),
+    refreshFalsePositives: vi.fn(),
+  });
+  await fireEvent.click(await screen.findByRole('tab', { name: 'Controls' }));
+  await fireEvent.click(await screen.findByRole('button', { name: 'Stop…' }));
+  await mounted.rerender({
+    telemetry: {
+      ...state(),
+      agents: [{ ...live, generationWitness: 'new-generation-in-same-millisecond' }],
+    },
+  });
+  await fireEvent.click(screen.getByRole('button', { name: 'Confirm stop' }));
+  expect(await screen.findByText(/no longer reliably observed/)).toBeInTheDocument();
+  expect(host.killProcess).not.toHaveBeenCalled();
+});

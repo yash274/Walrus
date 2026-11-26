@@ -1,0 +1,638 @@
+<script lang="ts">
+  import { t } from '../runtime/i18n';
+
+  import { onMount, tick } from 'svelte';
+  import { SvelteMap } from 'svelte/reactivity';
+  import { confirmed, invoke, record, type Host, type RecordData } from '../runtime/host';
+  import { catalogRecognition, validateCatalog, type CatalogRecognition } from '../runtime/catalog';
+  import { catalogReadPopulations } from '../runtime/catalog-read-state';
+  import {
+    createEmptyForm,
+    formFromAgent,
+    buildCustomAgent,
+    applyFormToAgent,
+    CATEGORIES,
+  } from '../../../src/renderer/lib/utils/agent-crud-utils';
+  import Action from './Action.svelte';
+  import AgentLogo from './AgentLogo.svelte';
+  import Icon from './Icon.svelte';
+  import EditorDialog from './EditorDialog.svelte';
+  import CatalogDeleteDialog from './CatalogDeleteDialog.svelte';
+  const prefix = $props.id();
+  let category = $state('');
+  let nameInput = $state<HTMLInputElement>();
+  let processInput = $state<HTMLInputElement>();
+  let searchInput = $state<HTMLInputElement>();
+  let deletion = $state<RecordData | null>(null);
+  let deletedName = $state<string | null>(null);
+  let {
+    host,
+    inspect,
+  }: { host: Host | null; inspect: (_title: string, _row: RecordData) => void } = $props();
+  let base = $state<RecordData[]>([]);
+  let custom = $state<RecordData[]>([]);
+  let form = $state(createEmptyForm());
+  let editing = $state<string | null>(null);
+  let showForm = $state(false);
+  let editorSection = $state('general');
+  let query = $state('');
+  let error = $state('');
+  let writeNotice = $state('');
+  let alive = true;
+  let loaded = $state(false);
+  let loading = $state(false);
+  let mutating = $state(false);
+  type CatalogRow = {
+    key: string;
+    value: RecordData & { custom: boolean; recognition: CatalogRecognition };
+  };
+  let recognition = $derived(catalogRecognition(base, custom));
+  let rows = $derived(
+    [
+      ...base.map((row, index) => ({
+        key: 'bundled:' + index + ':' + String(row.id),
+        value: { ...row, custom: false, recognition: recognition[index] },
+      })),
+      ...custom.map((row, index) => ({
+        key: 'custom:' + index + ':' + String(row.id),
+        value: { ...row, custom: true, recognition: recognition[base.length + index] },
+      })),
+    ].filter(
+      (row) =>
+        (!category || record(row.value).category === category) &&
+        JSON.stringify(row.value).toLowerCase().includes(query.toLowerCase()),
+    ) as CatalogRow[],
+  );
+  let draftRecognition = $derived.by(() => {
+    const editIndex = custom.findIndex((row) => row.id === editing);
+    const draftCustom =
+      editIndex < 0
+        ? [
+            ...custom,
+            {
+              id: '\0catalog-draft',
+              displayName: form.displayName,
+              names: form.processName.trim() ? [form.processName.trim()] : [],
+            },
+          ]
+        : custom.map((row, index) => (index === editIndex ? applyFormToAgent(row, form) : row));
+    return catalogRecognition(base, draftCustom)[
+      base.length + (editIndex < 0 ? custom.length : editIndex)
+    ];
+  });
+  async function load() {
+    loading = true;
+    try {
+      const [database, user] = await Promise.all([
+        invoke(host, 'getAgentDatabase'),
+        invoke(host, 'getCustomAgents'),
+      ]);
+      if (alive) {
+        const next = catalogReadPopulations(database, user);
+        base = next.base;
+        custom = next.custom;
+        loaded = true;
+        error = '';
+        writeNotice = '';
+      }
+    } catch (cause) {
+      if (alive) error = cause instanceof Error ? cause.message : String(cause);
+      throw cause;
+    } finally {
+      if (alive) loading = false;
+    }
+  }
+  onMount(() => {
+    void load().catch(() => {});
+    return () => {
+      alive = false;
+    };
+  });
+  async function mutate(action: () => Promise<void>) {
+    if (mutating || !loaded || loading) throw new Error('Catalog is not ready for another change');
+    mutating = true;
+    deletedName = null;
+    writeNotice = '';
+    try {
+      await action();
+    } finally {
+      if (alive) mutating = false;
+    }
+  }
+  async function persist(next: RecordData[]) {
+    const validated = validateCatalog(next);
+    if (
+      validated.some(
+        (a) => base.some((b) => a.id === b.id) && !custom.some((existing) => existing.id === a.id),
+      )
+    )
+      throw new Error('Custom IDs must differ from bundled agent IDs');
+    confirmed(await invoke(host, 'saveCustomAgents', validated));
+    if (!alive) return;
+    custom = validated;
+    writeNotice = 'Catalog changes saved. Refreshing the current catalog.';
+    await load().catch(() => {
+      if (alive)
+        writeNotice =
+          'Catalog changes saved. Could not refresh the current catalog. Retry loading.';
+    });
+  }
+  async function save() {
+    if (!form.displayName.trim()) {
+      editorSection = 'general';
+      await tick();
+      nameInput?.focus();
+      throw new Error($t('Name is required'));
+    }
+    if (!form.processName.trim()) {
+      editorSection = 'recognition';
+      await tick();
+      processInput?.focus();
+      throw new Error($t('Process signature is required'));
+    }
+    await mutate(async () => {
+      const next = editing
+        ? custom.map((row) => (row.id === editing ? applyFormToAgent(row, form) : row))
+        : [...custom, buildCustomAgent(form)];
+      await persist(next);
+    });
+    if (alive) showForm = false;
+  }
+  async function deleteAgent() {
+    const target = deletion;
+    if (!target || mutating) return;
+    await mutate(async () => {
+      const next = validateCatalog(custom.filter((agent) => agent.id !== target.id));
+      confirmed(await invoke(host, 'saveCustomAgents', next));
+      if (!alive) return;
+      custom = next;
+      deletedName = String(target.displayName);
+      // A failed readback cannot turn a confirmed removal into a retryable write.
+      await load().catch(() => {});
+      if (!alive) return;
+      deletion = null;
+      await tick();
+      searchInput?.focus({ preventScroll: true });
+    });
+  }
+  async function importAgents() {
+    const imported = confirmed(await invoke(host, 'importAgentDatabase'));
+    const incoming = validateCatalog(imported.agents);
+    const unique = incoming.filter((a) => !base.some((b) => b.id === a.id));
+    if (!unique.length) throw new Error('Import contains no custom agents');
+    const merged = new SvelteMap(custom.map((a) => [a.id, a]));
+    for (const agent of unique) merged.set(agent.id, agent);
+    await persist([...merged.values()]);
+  }
+</script>
+
+<div class="catalog-toolbar">
+  <div class="catalog-filters">
+    <label class="search-field"
+      ><Icon name="search" /><input
+        bind:this={searchInput}
+        type="search"
+        aria-label={$t('Search catalog')}
+        bind:value={query}
+        placeholder={$t('Name, signature or vendor…')}
+      /></label
+    ><label
+      >{$t('Category')}
+      <select aria-label={$t('Catalog category')} bind:value={category}
+        ><option value="">{$t('All categories')}</option
+        >{#each CATEGORIES as [id, title] (id)}<option value={id}>{$t(title)}</option
+          >{/each}</select
+      ></label
+    >
+  </div>
+  <div class="catalog-actions" role="group" aria-label={$t('Catalog actions')}>
+    <button
+      class="button primary"
+      disabled={mutating || !loaded || loading}
+      onclick={() => {
+        form = createEmptyForm();
+        editing = null;
+        editorSection = 'general';
+        showForm = true;
+      }}><Icon name="plus" />{$t('Add agent')}</button
+    ><Action disabled={mutating || !loaded || loading} action={() => mutate(importAgents)}
+      ><Icon name="upload" />{$t('Import')}</Action
+    ><Action action={async () => confirmed(await invoke(host, 'exportAgentDatabase'))}
+      ><Icon name="download" />{$t('Export')}</Action
+    >
+  </div>
+</div>
+
+<p role="status" aria-live="polite" aria-atomic="true" class="catalog-feedback">
+  {deletedName !== null
+    ? $t('Custom agent {name} removed.', { name: deletedName })
+    : $t(writeNotice)}
+</p>
+{#if deletion}
+  <CatalogDeleteDialog
+    name={String(deletion.displayName)}
+    pending={mutating || loading}
+    confirm={deleteAgent}
+    cancel={() => (deletion = null)}
+  />
+{/if}
+
+<section class="panel">
+  {#if error}<div class="inset">
+      <p role="alert">{$t(error)}</p>
+      <Action action={load} disabled={loading || mutating}
+        ><Icon name="refresh" />{$t('Retry loading')}</Action
+      >
+    </div>{/if}
+  <p class="catalog-scope muted" id={prefix + '-catalog-scope'}>
+    {$t('Catalog risk profile is saved metadata. It does not describe current behavior or safety.')}
+    {$t('Process signatures use the first catalog match, ignoring case.')}
+  </p>
+  <div class="table-wrap">
+    <table aria-describedby={prefix + '-catalog-scope'}>
+      <thead
+        ><tr
+          ><th>{$t('Agent')}</th><th>{$t('Process signatures')}</th><th
+            >{$t('Catalog risk profile')}</th
+          ><th>{$t('Actions')}</th></tr
+        ></thead
+      ><tbody
+        >{#each rows as entry (entry.key)}{@const row = entry.value}{@const signatures = [
+            ...new Set(Array.isArray(row.names) ? row.names : []),
+          ]}<tr
+            ><td
+              ><button
+                class="catalog-identity"
+                onclick={() => inspect(String(row.displayName), row)}
+                ><AgentLogo id={String(row.id)} /><span
+                  ><strong>{String(row.displayName)}</strong><small
+                    >{String(row.vendor ?? (row.custom ? 'Custom' : 'Bundled'))}</small
+                  ><small class="catalog-category"
+                    >{$t('Category')}: {String(row.category ?? '')}</small
+                  >{#if row.custom && base.some((bundled) => bundled.id === row.id)}<small
+                      >{$t('Bundled ID conflict · not used for detection')}</small
+                    >{/if}</span
+                ></button
+              ></td
+            ><td
+              ><div class="signature-links">
+                {#each signatures.slice(0, 3) as name (name)}<button
+                    class="text-link"
+                    onclick={() =>
+                      inspect(String(row.displayName), { ...row, detailSection: 'signatures' })}
+                    >{String(name)}</button
+                  >{/each}{#if signatures.length > 3}<button
+                    class="text-link"
+                    onclick={() => inspect(String(row.displayName), row)}
+                    >+{signatures.length - 3} {$t('more')}</button
+                  >{/if}
+              </div>
+              {#if !row.recognition.skippedById && row.recognition.shadowed.length}
+                <div class="catalog-conflicts">
+                  {#each row.recognition.shadowed.slice(0, 2) as conflict (conflict.signature.toLowerCase())}
+                    <small
+                      >{$t('{signature} is first owned by {owner}', {
+                        signature: conflict.signature,
+                        owner: conflict.firstOwner,
+                      })}</small
+                    >
+                  {/each}
+                  {#if row.recognition.shadowed.length > 2}<button
+                      class="text-link"
+                      onclick={() =>
+                        inspect(String(row.displayName), { ...row, detailSection: 'signatures' })}
+                      >{$t('{count} more signature conflicts', {
+                        count: row.recognition.shadowed.length - 2,
+                      })}</button
+                    >{/if}
+                </div>
+              {/if}</td
+            ><td><span class="badge">{$t(String(row.riskProfile || 'Not specified'))}</span></td><td
+              ><div class="toolbar">
+                <button class="button" onclick={() => inspect(String(row.displayName), row)}
+                  >{$t('Details')}</button
+                >
+                {#if row.custom}<button
+                    class="button"
+                    disabled={mutating || loading}
+                    onclick={() => {
+                      editing = String(row.id);
+                      form = formFromAgent(row);
+                      editorSection = 'general';
+                      showForm = true;
+                    }}>{$t('Edit')}</button
+                  ><button
+                    class="button"
+                    disabled={mutating || loading}
+                    onclick={() => (deletion = row)}>{$t('Delete')}</button
+                  >{/if}
+              </div></td
+            ></tr
+          >{:else}<tr
+            ><td colspan="4" class="catalog-empty"
+              ><strong
+                >{!loaded
+                  ? loading
+                    ? $t('Loading catalog…')
+                    : $t('Catalog unavailable')
+                  : query || category
+                    ? $t('No matching agents')
+                    : $t('No agents in the catalog')}</strong
+              >
+              <p>
+                {!loaded
+                  ? $t('Catalog entries will appear after a successful load.')
+                  : query || category
+                    ? $t('Try another name or category.')
+                    : $t('Add a custom agent to recognize its processes.')}
+              </p>
+              {#if query || category}<button
+                  class="button"
+                  onclick={() => {
+                    query = '';
+                    category = '';
+                  }}>{$t('Clear filters')}</button
+                >{/if}</td
+            ></tr
+          >{/each}</tbody
+      >
+    </table>
+  </div>
+</section>
+
+{#if showForm}
+  <EditorDialog
+    title={editing ? $t('Edit custom agent') : $t('Add custom agent')}
+    caption={$t('Agent catalog')}
+    sectionLabel="Agent catalog sections"
+    pending={mutating || loading}
+    tabs={[
+      { id: 'general', label: 'General', icon: 'agents' },
+      { id: 'recognition', label: 'Recognition', icon: 'search' },
+    ]}
+    bind:selected={editorSection}
+    close={() => (showForm = false)}
+    focusFallback={() => searchInput}
+  >
+    {#snippet children(section)}
+      <fieldset class="detail-section" disabled={mutating || loading}>
+        {#if section === 'general'}
+          <h3>{$t('Agent profile')}</h3>
+          <div class="form-grid">
+            <label
+              >{$t('Name')}<input
+                bind:this={nameInput}
+                bind:value={form.displayName}
+                required
+              /></label
+            >
+            <label
+              >{$t('Category')}<select bind:value={form.category}
+                >{#each CATEGORIES as [id, label] (id)}<option value={id}>{$t(label)}</option
+                  >{/each}</select
+              ></label
+            >
+            <div class="catalog-profile-field">
+              <label for={prefix + '-risk-profile'}>{$t('Catalog risk profile')}</label>
+              <select id={prefix + '-risk-profile'} bind:value={form.riskProfile}
+                ><option value="low">{$t('low')}</option><option value="medium"
+                  >{$t('medium')}</option
+                ><option value="high">{$t('high')}</option></select
+              >
+            </div>
+            <p class="catalog-field-help muted full">
+              {$t(
+                'Catalog risk profile is saved metadata. It does not describe current behavior or safety.',
+              )}
+            </p>
+            <label class="full"
+              >{$t('Description')}<textarea bind:value={form.description}></textarea></label
+            >
+          </div>
+        {:else}
+          <h3>{$t('Process recognition')}</h3>
+          <div class="form-grid">
+            <label class="full"
+              >{$t('Process name')}<input
+                bind:this={processInput}
+                bind:value={form.processName}
+                required
+                placeholder={$t('agent.exe')}
+              /></label
+            >
+          </div>
+          {#if draftRecognition?.skippedById}<p class="catalog-editor-conflicts">
+              {$t(
+                'This custom ID is already used by an earlier catalog entry, so its signatures are not used for detection.',
+              )}
+            </p>{:else if !draftRecognition?.shadowed.length}<p class="dialog-copy">
+              {$t('The process signature identifies this agent in observed processes.')}
+            </p>{/if}
+          {#if draftRecognition?.shadowed.length}
+            <div class="catalog-editor-conflicts">
+              <p>{$t('These signatures are already owned by earlier catalog entries:')}</p>
+              <ul>
+                {#each draftRecognition.shadowed as conflict (conflict.signature.toLowerCase())}
+                  <li>
+                    {$t('{signature} is first owned by {owner}', {
+                      signature: conflict.signature,
+                      owner: conflict.firstOwner,
+                    })}
+                  </li>
+                {/each}
+              </ul>
+              <p class="muted">
+                {draftRecognition.eligible.length
+                  ? $t('Saving is allowed. Other unique signatures can still identify this agent.')
+                  : $t('Saving is allowed. No signature is usable now.')}
+              </p>
+            </div>
+          {/if}
+        {/if}
+      </fieldset>
+    {/snippet}
+    {#snippet actions()}{#if mutating || loading}<span role="status" class="muted"
+          >{$t('Saving catalog changes…')}</span
+        >{/if}<button
+        class="button"
+        aria-disabled={mutating || loading}
+        onclick={() => {
+          if (!mutating && !loading) showForm = false;
+        }}>{$t('Cancel')}</button
+      ><Action disabled={mutating || !loaded || loading} action={save}>{$t('Save agent')}</Action
+      >{/snippet}
+  </EditorDialog>
+{/if}
+{#if loaded}<p class="catalog-count muted">
+    {base.length}
+    {$t('bundled ·')}
+    {custom.length}
+    {$t('custom')}
+  </p>{/if}
+
+<style>
+  fieldset {
+    min-width: 0;
+    margin-inline: 0;
+  }
+  .catalog-empty {
+    padding: 28px;
+    text-align: center;
+    color: var(--muted);
+  }
+  .catalog-empty p {
+    margin: 8px 0 14px;
+  }
+  td:last-child {
+    min-width: 88px;
+    white-space: nowrap;
+  }
+  td:last-child .button {
+    white-space: nowrap;
+  }
+  .catalog-count {
+    font-size: var(--text-caption);
+    margin-top: 12px;
+  }
+  .catalog-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    justify-content: space-between;
+    gap: var(--space-3) var(--space-5);
+    margin-bottom: var(--space-4);
+  }
+  .catalog-filters,
+  .catalog-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .catalog-filters {
+    flex: 1 1 400px;
+    min-width: 0;
+  }
+  .catalog-actions {
+    align-items: start;
+    justify-content: flex-end;
+  }
+  .catalog-filters :global(label) {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .catalog-filters :global(.search-field) {
+    min-width: min(100%, 260px);
+  }
+  .catalog-filters :global(.search-field input) {
+    min-width: 0;
+  }
+  .catalog-scope {
+    font-size: var(--text-caption);
+    line-height: 1.5;
+    margin: 0;
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border);
+  }
+  table {
+    width: 100%;
+    min-width: 600px;
+    table-layout: fixed;
+  }
+  th:first-child {
+    width: 28%;
+  }
+  th:nth-child(2) {
+    width: 38%;
+  }
+  th:nth-child(3) {
+    width: 16%;
+  }
+  th:last-child {
+    width: 18%;
+  }
+  td:last-child .toolbar {
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .catalog-identity {
+    max-width: 100%;
+  }
+  .catalog-identity > span {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .catalog-identity .catalog-category {
+    margin-top: var(--space-1);
+    color: var(--muted);
+  }
+  @media (max-width: 760px) {
+    .catalog-actions {
+      justify-content: flex-start;
+      width: 100%;
+    }
+    .catalog-filters :global(.search-field) {
+      flex: 1 1 100%;
+    }
+    .catalog-filters :global(.search-field input) {
+      width: 100%;
+    }
+  }
+  .catalog-field-help {
+    font-size: var(--text-caption);
+    margin: calc(-1 * var(--space-2)) 0 0;
+  }
+  .catalog-profile-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .catalog-identity {
+    text-align: left;
+  }
+  .catalog-identity small {
+    display: block;
+    color: var(--faint);
+  }
+  .signature-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2) 10px;
+    font-size: var(--text-caption);
+  }
+  .signature-links .text-link {
+    min-height: calc(24px * var(--ui-scale));
+  }
+  .catalog-feedback {
+    margin: 0;
+    color: var(--muted);
+    font-size: var(--text-body);
+  }
+  .catalog-feedback:not(:empty) {
+    margin: var(--space-3) 0;
+  }
+  .catalog-conflicts {
+    display: grid;
+    gap: 2px;
+    margin-top: var(--space-2);
+    font-size: var(--text-caption);
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+  .catalog-conflicts small {
+    font-size: inherit;
+  }
+  .catalog-editor-conflicts {
+    margin-top: var(--space-3);
+    overflow-wrap: anywhere;
+  }
+  .catalog-editor-conflicts p {
+    margin: var(--space-2) 0;
+  }
+  .catalog-editor-conflicts ul {
+    margin: var(--space-2) 0;
+    padding-inline-start: var(--space-5);
+  }
+</style>

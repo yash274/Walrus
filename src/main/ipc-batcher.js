@@ -1,0 +1,484 @@
+// @ts-check
+/**
+ * @file ipc-batcher.js
+ * @module main/ipc-batcher
+ * @description Batches high-frequency IPC events to prevent renderer freezes.
+ *   Collects events over a configurable interval then sends a single IPC message.
+ * @since v0.5.0
+ */
+'use strict';
+
+/**
+ * @typedef {Object} BufferedEntry
+ * @property {unknown} value
+ * @property {string | null} key
+ * @property {boolean} keep
+ * @property {number} bytes
+ * @property {BufferedEntry | null} previous
+ * @property {BufferedEntry | null} next
+ * @property {BufferedEntry | null} previousPlain
+ * @property {BufferedEntry | null} nextPlain
+ */
+
+/**
+ * @typedef {Object} BatcherOptions
+ * @property {number} [intervalMs] - Flush interval in milliseconds (default 150)
+ * @property {'append' | 'latest'} [mode] - Batching strategy (default 'append')
+ * @property {number} [capacity] - 'append' only. Largest number of entries the buffer
+ *   may hold between two flushes; a push beyond it evicts the oldest entry. Absent =
+ *   unbounded, which is exactly the behaviour every caller had before v0.13.0.
+ * @property {number} [byteCapacity] - Maximum serialized bytes retained in append mode.
+ * @property {(value: unknown) => string | null} [coalesceKey] - 'append' only. Merge key
+ *   for a pushed value, or null when the value must never merge.
+ * @property {(value: unknown) => boolean} [retain] - 'append' only. Under `capacity`
+ *   pressure the oldest entry it does NOT retain is evicted first; a retained entry goes
+ *   only when every buffered entry is retained. It picks the victim — one always goes.
+ */
+
+/**
+ * @typedef {Object} BatcherStats
+ * @property {number} pushed - Accepted `push` calls, lifetime.
+ * @property {number} coalesced - Pushes that replaced a same-key entry, lifetime.
+ * @property {number} evicted - Entries dropped to honour `capacity`, lifetime.
+ * @property {number} evictedSinceFlush - Evictions since the last flush that SENT.
+ * @property {number} retainedEvicted - Evictions that took a RETAINED entry because the
+ *   buffer held nothing else, lifetime. A subset of `evicted`; stays 0 without `retain`.
+ * @property {number} highWater - Largest buffered length ever observed.
+ * @property {number} buffered - Entries the next flush would send, right now.
+ * @property {number} [bufferedBytes] - Serialized bytes when a byte budget is configured.
+ * @property {number} [highWaterBytes] - Maximum retained serialized bytes.
+ */
+
+/**
+ * @typedef {Object} Batcher
+ * @property {(value: unknown) => void} push - Add event to buffer
+ * @property {(producer: () => unknown) => void} pushLazy - Queue a producer, resolved once at flush ('latest' only)
+ * @property {() => void} flush - Send buffered data immediately
+ * @property {() => void} destroy - Flush and prevent further pushes
+ * @property {() => BatcherStats} getStats - Snapshot of this batcher's own accounting
+ */
+
+/**
+ * Create a batched IPC sender.
+ *
+ * - **append** mode: accumulates events in an array, flushes as flat array.
+ * - **latest** mode: keeps only the most recent value, flushes that.
+ *
+ * ## What an eviction here is, and what it is not
+ *
+ * This batcher is the DISPLAY lane. Everything it drops is a frame the renderer never
+ * paints, and nothing else: an eviction is not a sensor `lossCount`, and it is not an
+ * audit drop. The durable record — the activityLog ring and the audit-logger JSONL with
+ * its hash chain and buffer-overflow-drop markers — is a separate lane that accounts for
+ * its own loss. A number from {@link BatcherStats} answers "what did the UI not see",
+ * never "what was not observed" or "what was not recorded". `retain` narrows WHAT the lane
+ * drops, not what the lane is: capacity pressure spares retained entries while it can, and
+ * the residual is `retainedEvicted`, never silence.
+ *
+ * @param {string} channel - IPC channel name (e.g. 'file-access').
+ * @param {(channel: string, data: unknown) => void} sendFn - Function that sends data to renderer.
+ * @param {BatcherOptions} [options]
+ * @returns {Batcher}
+ * @throws {Error} when `capacity` is not a positive integer, when `coalesceKey` or `retain`
+ *   is not a function, or when any of the three is passed in 'latest' mode.
+ * @since v0.5.0
+ */
+function createBatcher(channel, sendFn, options = {}) {
+  const intervalMs = options.intervalMs || 150;
+  const mode = options.mode || 'append';
+  const capacity = options.capacity;
+  const byteCapacity = options.byteCapacity;
+  const coalesceKey = options.coalesceKey;
+  const retain = options.retain;
+  // The bounded policy lane needs fast key lookup and middle eviction. Unbounded and
+  // simple append batchers keep their compact array representation.
+  const useEntries =
+    mode === 'append' && capacity !== undefined && !!(coalesceKey || retain || byteCapacity);
+
+  if (
+    byteCapacity !== undefined &&
+    (mode !== 'append' ||
+      capacity === undefined ||
+      !Number.isSafeInteger(byteCapacity) ||
+      byteCapacity < 1)
+  ) {
+    throw new Error('ipc-batcher: byteCapacity requires append capacity and a positive integer');
+  }
+
+  if (capacity !== undefined) {
+    if (mode !== 'append') throw new Error("ipc-batcher: capacity requires mode 'append'");
+    if (!Number.isInteger(capacity) || capacity < 1) {
+      throw new Error('ipc-batcher: capacity must be a positive integer');
+    }
+  }
+  for (const name of /** @type {const} */ (['coalesceKey', 'retain'])) {
+    const fn = options[name];
+    if (fn === undefined) continue;
+    if (mode !== 'append') throw new Error(`ipc-batcher: ${name} requires mode 'append'`);
+    if (typeof fn !== 'function') throw new Error(`ipc-batcher: ${name} must be a function`);
+  }
+
+  /** @type {unknown} */
+  let buffer = mode === 'append' ? [] : undefined;
+  /**
+   * Parallel to the append buffer: `keys[i]` is entry i's merge key (null = never merges),
+   * `retained[i]` whether entry i is retained. Each stays null while its option is off, so
+   * a batcher without it allocates and walks nothing extra.
+   * @type {(string | null)[] | null}
+   */
+  let keys = coalesceKey ? [] : null;
+  /** @type {boolean[] | null} */
+  let retained = retain ? [] : null;
+  /** @type {BufferedEntry | null} */
+  let first = null;
+  /** @type {BufferedEntry | null} */
+  let last = null;
+  /** @type {BufferedEntry | null} */
+  let firstPlain = null;
+  /** @type {BufferedEntry | null} */
+  let lastPlain = null;
+  /** @type {Map<string, BufferedEntry> | null} */
+  let byKey = coalesceKey && useEntries ? new Map() : null;
+  let entryCount = 0;
+  let bufferedBytes = 0;
+  let highWaterBytes = 0;
+  /**
+   * A pending {@link pushLazy} producer, or null. Held in its own slot rather than in
+   * `buffer` so a payload that happens to be a function is still a payload.
+   * @type {(() => unknown) | null}
+   */
+  let producer = null;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timer = null;
+  let destroyed = false;
+
+  let pushed = 0;
+  let coalesced = 0;
+  let evicted = 0;
+  let evictedSinceFlush = 0;
+  let retainedEvicted = 0;
+  let highWater = 0;
+
+  /** Schedule a flush if one isn't already pending. */
+  function scheduleFlush() {
+    if (timer === null && !destroyed) {
+      timer = setTimeout(flush, intervalMs);
+    }
+  }
+
+  /**
+   * How many entries the next flush would send. One flat array in 'append' mode, one
+   * value or nothing in 'latest'.
+   * @returns {number}
+   */
+  function bufferedCount() {
+    if (mode === 'append')
+      return useEntries ? entryCount : /** @type {unknown[]} */ (buffer).length;
+    return buffer === undefined ? 0 : 1;
+  }
+
+  /** @param {BufferedEntry} entry */
+  function addPlain(entry) {
+    entry.previousPlain = lastPlain;
+    if (lastPlain !== null) lastPlain.nextPlain = entry;
+    else firstPlain = entry;
+    lastPlain = entry;
+  }
+
+  /** A replaced entry keeps its original age when it becomes evictable. @param {BufferedEntry} entry */
+  function insertPlainAtAge(entry) {
+    let before = entry.previous;
+    while (before !== null && before.keep) before = before.previous;
+    if (before === null) {
+      entry.nextPlain = firstPlain;
+      if (firstPlain !== null) firstPlain.previousPlain = entry;
+      else lastPlain = entry;
+      firstPlain = entry;
+    } else {
+      entry.previousPlain = before;
+      entry.nextPlain = before.nextPlain;
+      if (before.nextPlain !== null) before.nextPlain.previousPlain = entry;
+      else lastPlain = entry;
+      before.nextPlain = entry;
+    }
+  }
+
+  /** @param {BufferedEntry} entry */
+  function removePlain(entry) {
+    if (entry.previousPlain !== null) entry.previousPlain.nextPlain = entry.nextPlain;
+    else firstPlain = entry.nextPlain;
+    if (entry.nextPlain !== null) entry.nextPlain.previousPlain = entry.previousPlain;
+    else lastPlain = entry.previousPlain;
+    entry.previousPlain = null;
+    entry.nextPlain = null;
+  }
+
+  /** @param {BufferedEntry} entry */
+  function removeEntry(entry) {
+    if (entry.previous !== null) entry.previous.next = entry.next;
+    else first = entry.next;
+    if (entry.next !== null) entry.next.previous = entry.previous;
+    else last = entry.previous;
+    if (!entry.keep) removePlain(entry);
+    if (entry.key !== null && byKey !== null) byKey.delete(entry.key);
+    entryCount--;
+    bufferedBytes -= entry.bytes;
+  }
+
+  /** @param {unknown} value @param {string | null} key @param {boolean} keep @param {number} bytes */
+  function appendEntry(value, key, keep, bytes) {
+    /** @type {BufferedEntry} */
+    const entry = {
+      value,
+      key,
+      keep,
+      bytes,
+      previous: last,
+      next: null,
+      previousPlain: null,
+      nextPlain: null,
+    };
+    if (last !== null) last.next = entry;
+    else first = entry;
+    last = entry;
+    if (!keep) addPlain(entry);
+    if (key !== null && byKey !== null) byKey.set(key, entry);
+    entryCount++;
+    bufferedBytes += bytes;
+  }
+
+  /**
+   * Add an event to the batch buffer.
+   *
+   * In 'append' mode with `coalesceKey`, a value whose key already sits in the buffer
+   * REPLACES that entry where it stands — position preserved, last value wins — instead
+   * of extending the buffer. A merge adds no entry, so it can never trigger an eviction.
+   *
+   * With `capacity` set, a push that would exceed it evicts ONE entry and always enters.
+   * Without `retain` the oldest goes; with it, the oldest entry the predicate does not
+   * retain — a retained entry goes only from a buffer that is all retained, and that is
+   * what `retainedEvicted` counts. The durable lane still owns completeness.
+   * @param {unknown} value - Event object (append) or full replacement value (latest).
+   */
+  function push(value) {
+    if (destroyed) return;
+    if (mode === 'append') {
+      const buf = /** @type {unknown[]} */ (buffer);
+      // Resolved before any counter moves: a throw here leaves the batcher as it was.
+      const key = coalesceKey ? coalesceKey(value) : null;
+      const keep = retain ? retain(value) === true : false;
+      pushed++;
+      if (useEntries) {
+        let bytes = 0;
+        if (byteCapacity !== undefined) {
+          try {
+            bytes = Buffer.byteLength(JSON.stringify(value) ?? 'null');
+          } catch {
+            bytes = byteCapacity + 1;
+          }
+          if (bytes > byteCapacity) {
+            evicted++;
+            evictedSinceFlush++;
+            if (keep) retainedEvicted++;
+            return;
+          }
+          // Snapshot mutable caller payloads so retained bytes cannot grow later.
+          value = JSON.parse(JSON.stringify(value) ?? 'null');
+        }
+        const mergeKey = typeof key === 'string' ? key : null;
+        const existing = mergeKey !== null && byKey !== null ? byKey.get(mergeKey) : undefined;
+        if (existing !== undefined) {
+          existing.value = value;
+          bufferedBytes += bytes - existing.bytes;
+          existing.bytes = bytes;
+          if (existing.keep !== keep) {
+            if (keep) removePlain(existing);
+            else insertPlainAtAge(existing);
+            existing.keep = keep;
+          }
+          coalesced++;
+        } else {
+          if (entryCount >= capacity) {
+            const victim = firstPlain || first;
+            if (victim === null) throw new Error('ipc-batcher: empty capacity buffer');
+            if (victim.keep) retainedEvicted++;
+            removeEntry(victim);
+            evicted++;
+            evictedSinceFlush++;
+          }
+          appendEntry(value, mergeKey, keep, bytes);
+        }
+        while (byteCapacity !== undefined && bufferedBytes > byteCapacity) {
+          const victim = firstPlain || first;
+          if (victim === null) break;
+          if (victim.keep) retainedEvicted++;
+          removeEntry(victim);
+          evicted++;
+          evictedSinceFlush++;
+        }
+        highWaterBytes = Math.max(highWaterBytes, bufferedBytes);
+        if (entryCount > highWater) highWater = entryCount;
+        scheduleFlush();
+        return;
+      }
+      // Only a string merges. null, undefined, or anything else means this value must
+      // never merge, and two such values both occupy their own slot.
+      const at = typeof key === 'string' && keys !== null ? keys.indexOf(key) : -1;
+      if (at !== -1) {
+        buf[at] = value;
+        // The flag describes the value buffered NOW, not the one it replaced.
+        if (retained !== null) retained[at] = keep;
+        coalesced++;
+      } else {
+        if (capacity !== undefined && buf.length >= capacity) {
+          // Victim: oldest non-retained entry, else slot 0 — a retained one, counted below.
+          const victim = retained === null ? 0 : Math.max(0, retained.indexOf(false));
+          if (retained !== null && retained[victim]) retainedEvicted++;
+          buf.splice(victim, 1);
+          if (keys !== null) keys.splice(victim, 1);
+          if (retained !== null) retained.splice(victim, 1);
+          evicted++;
+          evictedSinceFlush++;
+        }
+        buf.push(value);
+        if (keys !== null) keys.push(typeof key === 'string' ? key : null);
+        if (retained !== null) retained.push(keep);
+      }
+    } else {
+      buffer = value;
+      producer = null;
+      pushed++;
+    }
+    const now = bufferedCount();
+    if (now > highWater) highWater = now;
+    scheduleFlush();
+  }
+
+  /**
+   * Queue a PRODUCER of the next 'latest' payload instead of the payload itself.
+   *
+   * Same batching semantics as {@link push} — last one wins, one send per interval —
+   * but the payload is built ONCE, when the batch actually flushes. In 'latest' mode
+   * every value but the last is discarded anyway, so N eager pushes inside one window
+   * compute N payloads to throw N-1 of them away; a producer computes exactly one.
+   *
+   * NOT a cache. Nothing is retained across flushes: each producer is dropped the
+   * moment it is resolved, and the next window starts empty. There is no revision key
+   * that could tell a stale payload from a fresh one, so none is kept.
+   *
+   * The producer runs on the flush timer, and a throw from it escapes there — a
+   * producer must therefore be total. `push` and `pushLazy` overwrite each other:
+   * whichever came last is what flushes.
+   * @param {() => unknown} fn - Builds the payload. Called at most once per flush.
+   * @returns {void}
+   * @throws {Error} when the batcher is in 'append' mode, where "last one wins" — the
+   *   property that makes deferral free — does not hold.
+   * @since v0.12.0
+   */
+  function pushLazy(fn) {
+    if (mode !== 'latest') {
+      throw new Error("ipc-batcher: pushLazy requires mode 'latest'");
+    }
+    if (typeof fn !== 'function') {
+      throw new Error('ipc-batcher: pushLazy requires a producer function');
+    }
+    if (destroyed) return;
+    producer = fn;
+    buffer = undefined;
+    scheduleFlush();
+  }
+
+  /**
+   * Immediately send all buffered data and reset the buffer.
+   * Skips the IPC call if the buffer is empty.
+   */
+  function flush() {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (mode === 'append') {
+      if (useEntries) {
+        if (entryCount === 0) return;
+        /** @type {unknown[]} */
+        const snapshot = [];
+        for (let entry = first; entry !== null; entry = entry.next) snapshot.push(entry.value);
+        first = last = firstPlain = lastPlain = null;
+        entryCount = 0;
+        bufferedBytes = 0;
+        if (byKey !== null) byKey.clear();
+        evictedSinceFlush = 0;
+        sendFn(channel, snapshot);
+        return;
+      }
+      const buf = /** @type {unknown[]} */ (buffer);
+      if (buf.length === 0) return;
+      buffer = [];
+      if (keys !== null) keys = [];
+      if (retained !== null) retained = [];
+      evictedSinceFlush = 0;
+      sendFn(channel, buf);
+    } else {
+      // A pending producer is resolved HERE, once, and dropped before the send so a
+      // throwing producer cannot be retried against a window it already consumed.
+      if (producer !== null) {
+        const build = producer;
+        producer = null;
+        sendFn(channel, build());
+        return;
+      }
+      if (buffer === undefined) return;
+      const snapshot = buffer;
+      buffer = undefined;
+      sendFn(channel, snapshot);
+    }
+  }
+
+  /**
+   * Flush remaining events and prevent further pushes.
+   */
+  function destroy() {
+    if (destroyed) return;
+    flush();
+    destroyed = true;
+  }
+
+  /**
+   * Snapshot of this batcher's own accounting, as a fresh object per call.
+   *
+   * `pushed`, `coalesced`, `evicted` and `retainedEvicted` are lifetime totals;
+   * `evictedSinceFlush` returns to 0 on every flush that actually sent; `highWater` is a
+   * lifetime maximum and never returns to 0. Still readable after {@link destroy}, which
+   * leaves the totals standing and `buffered` at 0.
+   *
+   * Two exclusions, stated rather than implied. A push refused because the batcher was
+   * destroyed is not counted anywhere — it never entered. And {@link pushLazy} is outside
+   * this accounting entirely: a queued producer moves no counter and a pending one reads
+   * `buffered: 0`, because what it will build does not exist yet.
+   *
+   * In 'latest' mode only the counters that can apply do: `buffered` is 0 or 1, and
+   * `coalesced`, `evicted`, `evictedSinceFlush` and `retainedEvicted` stay 0 — a one-slot
+   * buffer can neither overflow nor merge.
+   * @returns {BatcherStats}
+   * @since v0.13.0
+   */
+  function getStats() {
+    return {
+      pushed,
+      coalesced,
+      evicted,
+      evictedSinceFlush,
+      retainedEvicted,
+      highWater,
+      buffered: bufferedCount(),
+      ...(byteCapacity !== undefined ? { bufferedBytes, highWaterBytes } : {}),
+    };
+  }
+
+  return { push, pushLazy, flush, destroy, getStats };
+}
+
+module.exports = {
+  createBatcher,
+  createSecurityBatcher: require('./security-event-pipeline').createSecurityBatcher,
+};

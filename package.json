@@ -1,0 +1,237 @@
+{
+  "name": "walrus",
+  "version": "0.25.0-beta",
+  "description": "Project Walrus — Open-source AI Agent Security, Intelligence & Engineering Control Platform for BlueIce (https://blueice.one)",
+  "main": "src/main/main.js",
+  "scripts": {
+    "dev:context": "node tools/development/context.mjs",
+    "dev:map": "npm --prefix tools/development run map",
+    "dev:security": "node tools/development/security.mjs",
+    "dev:windows": "node tools/development/windows-fixtures.mjs",
+    "dev:worktrees": "node tools/development/worktrees.mjs",
+    "dev:pr-readiness": "node tools/development/pr-readiness.mjs",
+    "dev:tools:test": "vitest run tests/main/development-tools.test.js && node tools/development/check-rules.mjs",
+    "start": "npm run build:renderer && node scripts/launch.js",
+    "dev": "vite --config vite.frontend.config.ts --mode preview",
+    "build:renderer": "vite build --config vite.frontend.config.ts",
+    "build:demo": "vite build --config vite.frontend.config.ts --mode preview",
+    "build": "electron-builder --publish never",
+    "dist": "electron-builder --publish never",
+    "format": "prettier --write 'src/**/*.{js,ts,svelte,css,html}' 'bench/**/*.{js,json}' '*.{js,ts,json}' 'frontend/observatory/**/*.{js,ts,svelte,css,html,json,mjs}'",
+    "format:check": "prettier --check 'src/**/*.{js,ts,svelte,css,html}' 'bench/**/*.{js,json}' '*.{js,ts,json}' 'frontend/observatory/**/*.{js,ts,svelte,css,html,json,mjs}'",
+    "lint": "npx eslint src/ tests/ scripts/ bench/ frontend/observatory/ tools/development/",
+    "typecheck": "tsc --noEmit -p tsconfig.main.json && tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p frontend/observatory/tsconfig.json",
+    "typecheck:main": "tsc --noEmit -p tsconfig.main.json",
+    "typecheck:renderer": "tsc --noEmit -p tsconfig.renderer.json",
+    "typecheck:svelte": "svelte-check --tsconfig ./tsconfig.renderer.json && svelte-check --tsconfig frontend/observatory/tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "verify:gate": "node scripts/verify-witness-gate.mjs",
+    "verify:seq-gate": "node scripts/verify-sequence-gate.mjs",
+    "counts:check": "node scripts/counts.js",
+    "build:sidecar": "node scripts/build-sidecar.js",
+    "bench:generation": "node scripts/bench-generation.js",
+    "bench:run": "node bench/run.js",
+    "bench:s1": "node bench/run.js --scenario S1-agent-lifecycle --arm A",
+    "bench:score": "node bench/score.js",
+    "bench:replay": "node bench/trace/bench-replay.js",
+    "prepare": "husky",
+    "frontend:dev": "vite --config vite.frontend.config.ts --mode preview",
+    "frontend:build": "vite build --config vite.frontend.config.ts",
+    "frontend:build:preview": "vite build --config vite.frontend.config.ts --mode preview",
+    "frontend:check": "tsc --noEmit -p frontend/observatory/tsconfig.json && svelte-check --tsconfig frontend/observatory/tsconfig.json",
+    "frontend:test": "node frontend/observatory/tests/check-build.mjs",
+    "frontend:test:electron": "node frontend/observatory/tests/electron-smoke.mjs"
+  },
+  "engines": {
+    "node": ">=24.16.0 <25"
+  },
+  "lint-staged": {
+    "src/**/*.{js,ts,svelte,css,html}": "prettier --write",
+    "bench/**/*.{js,json}": "prettier --write",
+    "./*.{js,ts,json}": "prettier --write",
+    "frontend/observatory/**/*.{js,ts,svelte,css,html,json,mjs}": "prettier --write"
+  },
+  "build": {
+    "appId": "com.aegis.oversight",
+    "productName": "WALRUS - AI Agent Security & Intelligence Platform",
+    "copyright": "Copyright © 2026 BlueIce & Project Walrus Contributors",
+    "beforeBuild": "scripts/electron-builder-before-build.js",
+    "beforePack": "scripts/linux-sensor-before-pack.js",
+    "afterPack": "scripts/linux-sensor-after-pack.js",
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico",
+      "signExts": [
+        "!\\hook-review\\runtime\\dotnet.exe",
+        "!\\hook-review\\runtime\\shared\\Microsoft.NETCore.App\\10.0.10\\createdump.exe",
+        "!\\hook-review\\runtime\\shared\\Microsoft.NETCore.App\\10.0.14\\createdump.exe"
+      ],
+      "extraResources": [
+        {
+          "from": "build/sidecar",
+          "to": "sidecar",
+          "filter": [
+            "**/*"
+          ]
+        },
+        {
+          "from": "build/etw-file",
+          "to": "etw-file",
+          "filter": [
+            "**/*",
+            "!**/*.pdb"
+          ]
+        },
+        {
+          "from": "build/hook-review",
+          "to": "hook-review",
+          "filter": [
+            "assets.json",
+            "host/*",
+            "runtime/**/*"
+          ]
+        }
+      ]
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "assets/icon.png",
+      "category": "public.app-category.utilities"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility",
+      "icon": "assets/icon.png",
+      "extraResources": [
+        {
+          "from": "build/linux-sensor/${arch}/aegis-sensor-linux",
+          "to": "sensor/aegis-sensor-linux"
+        },
+        {
+          "from": "src/main/platform/linux-process-control.py",
+          "to": "linux-process-control.py"
+        },
+        {
+          "from": "src/main/podman-local.conf",
+          "to": "podman-local.conf"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "WALRUS",
+      "artifactName": "WALRUS-Setup-${version}.${ext}",
+      "include": "build/installer/observatory.nsh",
+      "installerIcon": "build/installer/installer.ico",
+      "uninstallerIcon": "build/installer/installer.ico",
+      "installerSidebar": "build/installer/sidebar.bmp",
+      "uninstallerSidebar": "build/installer/sidebar.bmp",
+      "installerHeader": "build/installer/header.bmp",
+      "installerLanguages": [
+        "en_US"
+      ],
+      "deleteAppDataOnUninstall": false
+    },
+    "files": [
+      "keys/aegis-release-pubkey.pub",
+      "src/main/**/*",
+      "src/shared/**/*",
+      "dist/renderer/**/*",
+      "frontend/observatory/vendor/tabler-icons.LICENSE",
+      "rules/**/*",
+      "assets/icon.png",
+      "assets/icon.ico",
+      "assets/tray-*.png",
+      "package.json"
+    ],
+    "extraMetadata": {
+      "main": "src/main/main.js"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "antropos17",
+        "repo": "Aegis"
+      }
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/antropos17/Aegis.git"
+  },
+  "homepage": "https://blueice.one",
+  "author": "BlueIce (https://blueice.one) & Project Walrus Contributors",
+  "license": "MIT",
+  "keywords": [
+    "ai-agent-security",
+    "ai-agent-monitoring",
+    "edr",
+    "endpoint-detection",
+    "ai-safety",
+    "ai-oversight",
+    "process-monitoring",
+    "electron",
+    "svelte",
+    "typescript",
+    "open-source",
+    "openclaw",
+    "mcp-security",
+    "llm-agent-security",
+    "mcp-gateway",
+    "appcontainer",
+    "hyper-v"
+  ],
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.65.0",
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/svelte": "^5.4.2",
+    "@types/node": "^26.6.6",
+    "@typescript-eslint/eslint-plugin": "^8.72.2",
+    "@typescript-eslint/parser": "^8.56.1",
+    "@vitest/coverage-v8": "^5.1.0",
+    "electron": "^45.3.1",
+    "electron-builder": "^26.18.0",
+    "eslint-plugin-svelte": "^3.24.1",
+    "globals": "^17.14.0",
+    "husky": "^9.1.7",
+    "jsdom": "^31.0.1",
+    "lint-staged": "^17.6.0",
+    "minimatch": "file:tools/minimatch-compat",
+    "prettier": "^3.10.1",
+    "prettier-plugin-svelte": "^4.1.1",
+    "sharp": "^0.35.5",
+    "svelte": "^5.57.3",
+    "svelte-check": "^4.7.8",
+    "typescript": "^6.0.3",
+    "vite": "^7.3.8",
+    "vitest": "^5.0.3"
+  },
+  "dependencies": {
+    "@cedar-policy/cedar-wasm": "4.14.0",
+    "@lezer/python": "1.1.19",
+    "acorn": "8.19.0",
+    "ajv": "^6.14.0",
+    "chokidar": "6.0.0",
+    "electron-updater": "6.8.11",
+    "js-yaml": "^5.5.0",
+    "jsonc-parser": "3.3.1",
+    "semver": "^7.8.6",
+    "smol-toml": "1.9.1"
+  },
+  "overrides": {
+    "picomatch@<=2.3.1": "^2.3.2",
+    "devalue": "5.9.3",
+    "http-cache-semantics": "4.3.0",
+    "minimatch": "$minimatch"
+  }
+}

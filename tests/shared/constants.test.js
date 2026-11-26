@@ -1,0 +1,84 @@
+import { describe, it, expect } from 'vitest';
+import {
+  AGENT_SELF_CONFIG,
+  AGENT_CONFIG_PATHS,
+  PERMISSION_CATEGORIES,
+  EDITORS,
+  IGNORE_PROCESS_PATTERNS,
+} from '../../src/shared/constants.js';
+
+describe('constants', () => {
+  describe('AGENT_SELF_CONFIG', () => {
+    it('each matches its own config path', () => {
+      expect(AGENT_SELF_CONFIG.claude.test('/home/.claude/config')).toBe(true);
+      expect(AGENT_SELF_CONFIG.cursor.test('/home/.cursor/settings')).toBe(true);
+      expect(AGENT_SELF_CONFIG.copilot.test('/home/.copilot/hosts.json')).toBe(true);
+      expect(AGENT_SELF_CONFIG.codeium.test('/home/.codeium/config')).toBe(true);
+    });
+
+    it('no cross-matching (claude ≠ .cursor/)', () => {
+      expect(AGENT_SELF_CONFIG.claude.test('/home/.cursor/settings')).toBe(false);
+      expect(AGENT_SELF_CONFIG.cursor.test('/home/.claude/config')).toBe(false);
+      expect(AGENT_SELF_CONFIG.copilot.test('/home/.claude/config')).toBe(false);
+    });
+
+    it('Gate ③ agents match their own config dirs', () => {
+      expect(AGENT_SELF_CONFIG.kilo.test('/home/.config/kilo/kilo.jsonc')).toBe(true);
+      expect(AGENT_SELF_CONFIG.opencode.test('/home/.opencode/auth.json')).toBe(true);
+      expect(AGENT_SELF_CONFIG.grok.test('/home/.grok-build/settings.json')).toBe(true);
+    });
+
+    it('Gate ③ agents do not cross-match each other', () => {
+      expect(AGENT_SELF_CONFIG.kilo.test('/home/.opencode/auth.json')).toBe(false);
+      expect(AGENT_SELF_CONFIG.opencode.test('/home/.grok-build/settings.json')).toBe(false);
+      expect(AGENT_SELF_CONFIG.grok.test('/home/.config/kilo/kilo.jsonc')).toBe(false);
+    });
+  });
+
+  describe('AGENT_CONFIG_PATHS', () => {
+    it('includes the watched config dirs for kilo / opencode / grok', () => {
+      expect(AGENT_CONFIG_PATHS).toContain('.config/kilo');
+      expect(AGENT_CONFIG_PATHS).toContain('.opencode');
+      expect(AGENT_CONFIG_PATHS).toContain('.grok-build');
+    });
+  });
+
+  describe('PERMISSION_CATEGORIES', () => {
+    it('exactly 6 entries', () => {
+      expect(PERMISSION_CATEGORIES).toHaveLength(6);
+      expect(PERMISSION_CATEGORIES).toContain('filesystem');
+      expect(PERMISSION_CATEGORIES).toContain('sensitive');
+      expect(PERMISSION_CATEGORIES).toContain('network');
+      expect(PERMISSION_CATEGORIES).toContain('terminal');
+      expect(PERMISSION_CATEGORIES).toContain('clipboard');
+      expect(PERMISSION_CATEGORIES).toContain('screen');
+    });
+  });
+
+  describe('EDITORS', () => {
+    it('all have names[] and label', () => {
+      for (const editor of EDITORS) {
+        expect(Array.isArray(editor.names)).toBe(true);
+        expect(editor.names.length).toBeGreaterThan(0);
+        expect(typeof editor.label).toBe('string');
+        expect(editor.label.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  describe('IGNORE_PROCESS_PATTERNS', () => {
+    it("doesn't match known AI agents", () => {
+      const aiNames = ['claude', 'copilot', 'cursor', 'codeium', 'tabnine', 'aider'];
+      for (const name of aiNames) {
+        const matches = IGNORE_PROCESS_PATTERNS.some((p) => name.includes(p));
+        expect(matches).toBe(false);
+      }
+    });
+
+    it('matches hardware/driver process names', () => {
+      expect(IGNORE_PROCESS_PATTERNS.some((p) => 'nvidia-smi'.includes(p))).toBe(true);
+      expect(IGNORE_PROCESS_PATTERNS.some((p) => 'logioptionsplus'.includes(p))).toBe(true);
+      expect(IGNORE_PROCESS_PATTERNS.some((p) => 'razer-control'.includes(p))).toBe(true);
+    });
+  });
+});

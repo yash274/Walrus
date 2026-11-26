@@ -1,0 +1,588 @@
+/**
+ * Regression tests for watcher startup, bounded retry and teardown (main.js).
+ *
+ * `initDeferredSubsystems` runs off `ready-to-show` → `setImmediate`. For a local
+ * `loadFile` the renderer's `did-finish-load` has ALREADY fired by then, so the
+ * previous `webContents.once('did-finish-load', …)` was attached to a spent event
+ * and never ran: `setupFileWatchers` was never called and zero chokidar watchers
+ * existed. Both orderings are asserted here — the already-loaded one is the case
+ * that regressed.
+ */
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import Module from 'module';
+import os from 'os';
+import { EventEmitter } from 'node:events';
+import { createRequire } from 'module';
+
+// ── electron stub ─────────────────────────────────────────────────────────────
+// `app.whenReady()` never resolves, so requiring main.js wires the module scope
+// (and the exports below) without running the startup sequence.
+const appListeners = {};
+const fakeElectron = {
+  app: {
+    name: 'Aegis',
+    getPath: () => os.tmpdir(),
+    getVersion: () => '0.0.0-test',
+    setName: () => {},
+    disableHardwareAcceleration: () => {},
+    requestSingleInstanceLock: () => true,
+    whenReady: () => new Promise(() => {}),
+    on: (event, cb) => {
+      (appListeners[event] ||= []).push(cb);
+    },
+    quit: () => {},
+  },
+  BrowserWindow: class {},
+  globalShortcut: { register: () => {}, unregisterAll: () => {} },
+  shell: { openExternal: () => {} },
+  ipcMain: { handle: () => {}, on: () => {} },
+  dialog: {},
+  Notification: class {},
+  Tray: class {},
+  Menu: { buildFromTemplate: (t) => t },
+  nativeImage: { createFromBuffer: (b) => b },
+  safeStorage: { isEncryptionAvailable: () => false },
+};
+
+const originalLoad = Module._load;
+Module._load = function (request, _parent, _isMain) {
+  if (request === 'electron') return fakeElectron;
+  // electron-builder strips build metadata from the installed package.json.
+  if (request === '../../package.json' && _parent?.filename.endsWith('main.js')) {
+    const packaged = { ...originalLoad.apply(this, arguments) };
+    delete packaged.build;
+    return packaged;
+  }
+  return originalLoad.apply(this, arguments);
+};
+
+const originalArgv = process.argv;
+// main.js exits early via a module-scope `return` when argv carries a CLI flag —
+// vitest's own argv must not trip that branch and blank out module.exports.
+process.argv = ['node', 'main.js'];
+
+// createRequire, not `import`: main.js is CommonJS with a module-scope `return`,
+// which is a syntax error under an ESM transform but legal for the CJS loader.
+const require_ = createRequire(import.meta.url);
+const main = require_('../../src/main/main.js');
+const logger = require_('../../src/main/logger.js');
+
+afterAll(() => {
+  Module._load = originalLoad;
+  process.argv = originalArgv;
+});
+
+/** Let the `await setupFileWatchers()` inside startWatchers settle. */
+function flush() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+// Native require() can return chokidar's immutable ESM namespace. Substitute the
+// dependency at this CJS consumer boundary; never rewrite a package export.
+function loadRuleWatcher(watch) {
+  const filename = require_.resolve('../../src/main/file-watcher.js');
+  const cached = require_.cache[filename];
+  const previousLoad = Module._load;
+  try {
+    Module._load = function (request, parent) {
+      if (request === 'chokidar' && parent?.filename === filename) return { watch };
+      return previousLoad.apply(this, arguments);
+    };
+    delete require_.cache[filename];
+    return require_(filename);
+  } finally {
+    Module._load = previousLoad;
+    if (cached) require_.cache[filename] = cached;
+    else delete require_.cache[filename];
+  }
+}
+
+/**
+ * Minimal webContents double: `isLoading()` is the branch main.js reads, `once`
+ * records the listener so the test can fire `did-finish-load` on demand.
+ * @param {boolean} loading
+ */
+function makeWebContents(loading) {
+  /** @type {Record<string, Function[]>} */
+  const listeners = {};
+  return {
+    isLoading: () => loading,
+    once(event, cb) {
+      (listeners[event] ||= []).push(cb);
+    },
+    emit(event) {
+      const cbs = listeners[event] || [];
+      listeners[event] = [];
+      for (const cb of cbs) cb();
+    },
+    listenerCount: (event) => (listeners[event] || []).length,
+  };
+}
+
+describe('main — public network client certificates', () => {
+  it.each([null, { id: 1 }])('declines OS certificates for webContents %j', (contents) => {
+    const handlers = appListeners['select-client-certificate'] || [];
+    expect(handlers).toHaveLength(1);
+    const event = { preventDefault: vi.fn() };
+    const callback = vi.fn();
+    handlers[0](event, contents, 'https://github.com/', [{ subjectName: 'fixture' }], callback);
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(callback).toHaveBeenCalledExactlyOnceWith();
+  });
+});
+
+describe('main — watcher startup ordering', () => {
+  let watcherMock;
+  let watchPlan;
+
+  beforeEach(() => {
+    main._resetWatchersForTest();
+    main._setSensitiveAlertJournalForTest(undefined);
+    watchPlan = { state: 'HEALTHY', groups: [{}], liveWatcherCount: 1 };
+    watcherMock = {
+      setupFileWatchers: vi.fn(async () => {}),
+      setupRulesWatcher: vi.fn(),
+      setupSequenceRulesWatcher: vi.fn(),
+      getWatchPlan: vi.fn(() => watchPlan),
+      closeFileWatchers: vi.fn(async () => {}),
+    };
+    main._setWatcherForTest(watcherMock);
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    main._resetWatchersForTest();
+    main._setSensitiveAlertJournalForTest(undefined);
+    vi.useRealTimers();
+  });
+
+  it('exports the startup entry points', () => {
+    expect(typeof main.startWatchersWhenLoaded).toBe('function');
+    expect(typeof main.startWatchers).toBe('function');
+  });
+
+  it('starts the watchers when did-finish-load fires AFTER registration', async () => {
+    const wc = makeWebContents(true);
+
+    main.startWatchersWhenLoaded(wc);
+    await flush();
+    expect(watcherMock.setupFileWatchers).not.toHaveBeenCalled();
+    expect(wc.listenerCount('did-finish-load')).toBe(1);
+
+    wc.emit('did-finish-load');
+    await flush();
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(1);
+    expect(watcherMock.setupRulesWatcher).toHaveBeenCalledTimes(1);
+    // The second rule watcher (rules/sequences) is installed beside the first, with the
+    // reload main.js owns — a function, so a change can reach the engine reset.
+    expect(watcherMock.setupSequenceRulesWatcher).toHaveBeenCalledTimes(1);
+    expect(watcherMock.setupSequenceRulesWatcher.mock.calls[0][1]).toEqual({
+      reload: expect.any(Function),
+      isActive: expect.any(Function),
+    });
+  });
+
+  it('starts the watchers when the load has ALREADY finished (the regressed case)', async () => {
+    const wc = makeWebContents(false);
+
+    main.startWatchersWhenLoaded(wc);
+    await flush();
+
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(1);
+    expect(watcherMock.setupRulesWatcher).toHaveBeenCalledTimes(1);
+    // No listener may be parked on an event that can never fire again.
+    expect(wc.listenerCount('did-finish-load')).toBe(0);
+  });
+
+  it('creates the watcher set exactly once across repeated calls and both branches', async () => {
+    const pending = makeWebContents(true);
+    const loaded = makeWebContents(false);
+
+    main.startWatchersWhenLoaded(pending);
+    main.startWatchersWhenLoaded(loaded);
+    await flush();
+    pending.emit('did-finish-load');
+    await main.startWatchers();
+    await flush();
+
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(1);
+    expect(watcherMock.setupRulesWatcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs one line with the number of registered watch roots', async () => {
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+    // setupFileWatchers pushes each watcher into the shared array main.js owns;
+    // the mock stands in for that so the logged count is not always zero.
+    watcherMock.setupFileWatchers = vi.fn(async () => {
+      main._getWatchersForTest().push({ close: () => {} }, { close: () => {} });
+    });
+
+    await main.startWatchers();
+
+    const created = info.mock.calls.filter((c) => c[1] === 'File watchers created');
+    expect(created).toHaveLength(1);
+    expect(created[0][0]).toBe('main');
+    expect(created[0][2]).toEqual({ watchRoots: 2 });
+  });
+
+  it('logs an error instead of dying silently when setup rejects', async () => {
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => {});
+    watcherMock.setupFileWatchers = vi.fn(async () => {
+      throw new Error('PRIVATE_WATCH_ROOT_LOG_CANARY');
+    });
+
+    await main.startWatchers();
+
+    const failed = error.mock.calls.filter((c) => c[1] === 'File watcher setup failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0][2]).toEqual({ error: 'file-watcher-setup-failed' });
+    expect(JSON.stringify(error.mock.calls)).not.toContain('PRIVATE_WATCH_ROOT_LOG_CANARY');
+  });
+
+  it('retries a pre-plan failure and installs each rule watcher once', async () => {
+    vi.useFakeTimers();
+    watchPlan = { state: 'STARTING', groups: [], liveWatcherCount: 0 };
+    watcherMock.setupFileWatchers = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('initial preflight failed'))
+      .mockImplementationOnce(async () => {
+        watchPlan = { state: 'HEALTHY', groups: [{}], liveWatcherCount: 1 };
+      });
+
+    await main.startWatchers();
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(1);
+    expect(watcherMock.setupRulesWatcher).toHaveBeenCalledTimes(1);
+    expect(watcherMock.setupSequenceRulesWatcher).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(2);
+    expect(watcherMock.setupRulesWatcher).toHaveBeenCalledTimes(1);
+    expect(watcherMock.setupSequenceRulesWatcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a settled FAILED plan with zero live watchers', async () => {
+    vi.useFakeTimers();
+    watchPlan = { state: 'FAILED', groups: [{}], liveWatcherCount: 0 };
+
+    await main.startWatchers();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(2);
+  });
+
+  it('detects a full watcher loss after startup was healthy', async () => {
+    vi.useFakeTimers();
+    await main.startWatchers();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(1);
+
+    watchPlan = { state: 'FAILED', groups: [{}], liveWatcherCount: 0 };
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not tear down a DEGRADED plan with a live watcher', async () => {
+    vi.useFakeTimers();
+    watchPlan = { state: 'DEGRADED', groups: [{}, {}], liveWatcherCount: 1 };
+
+    await main.startWatchers();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds fast retries and logs while continuing slow recovery probes', async () => {
+    vi.useFakeTimers();
+    watchPlan = { state: 'STARTING', groups: [], liveWatcherCount: 0 };
+    watcherMock.setupFileWatchers = vi.fn(async () => {
+      throw new Error('PRIVATE_WATCH_ROOT_LOG_CANARY');
+    });
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => {});
+
+    await main.startWatchers();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(4);
+    expect(error.mock.calls.map((call) => call[1])).toEqual([
+      'File watcher setup failed',
+      'File watcher fast retries exhausted',
+    ]);
+    expect(JSON.stringify(error.mock.calls)).not.toContain('PRIVATE_WATCH_ROOT_LOG_CANARY');
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(150_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(6);
+    expect(error).toHaveBeenCalledTimes(2);
+  });
+
+  it('restores the retry budget after a confirmed healthy watch plan', async () => {
+    vi.useFakeTimers();
+    watchPlan = { state: 'FAILED', groups: [{}], liveWatcherCount: 0 };
+    watcherMock.setupFileWatchers = vi.fn(async () => {
+      if (watcherMock.setupFileWatchers.mock.calls.length > 1) {
+        watchPlan = { state: 'HEALTHY', groups: [{}], liveWatcherCount: 1 };
+      }
+    });
+
+    await main.startWatchers();
+    for (let cycle = 1; cycle <= 3; cycle++) {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(cycle + 1);
+      await vi.advanceTimersByTimeAsync(30_000);
+      watchPlan = { state: 'FAILED', groups: [{}], liveWatcherCount: 0 };
+    }
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(5);
+  });
+
+  it('recovers after the initial setup and three retries all fail', async () => {
+    vi.useFakeTimers();
+    watchPlan = { state: 'STARTING', groups: [], liveWatcherCount: 0 };
+    vi.spyOn(logger, 'error').mockImplementation(() => {});
+    watcherMock.setupFileWatchers = vi.fn(async () => {
+      if (watcherMock.setupFileWatchers.mock.calls.length <= 4) throw new Error('preflight failed');
+      watchPlan = { state: 'HEALTHY', groups: [{}], liveWatcherCount: 1 };
+    });
+
+    await main.startWatchers();
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(4);
+    vi.setSystemTime(new Date(0));
+    await vi.advanceTimersByTimeAsync(299_999);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(5);
+    expect(watchPlan.state).toBe('HEALTHY');
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(5);
+    expect(watcherMock.setupRulesWatcher).toHaveBeenCalledOnce();
+    expect(watcherMock.setupSequenceRulesWatcher).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a slow recovery single-flight and ignores completion after teardown', async () => {
+    vi.useFakeTimers();
+    watchPlan = { state: 'FAILED', groups: [{}], liveWatcherCount: 0 };
+    vi.spyOn(logger, 'error').mockImplementation(() => {});
+    let finishRecovery;
+    watcherMock.setupFileWatchers = vi.fn(() => {
+      if (watcherMock.setupFileWatchers.mock.calls.length <= 4)
+        return Promise.reject(new Error('failed'));
+      return new Promise((resolve) => {
+        finishRecovery = resolve;
+      });
+    });
+    await main.startWatchers();
+    await vi.advanceTimersByTimeAsync(390_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(900_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(5);
+    main._resetWatchersForTest();
+    finishRecovery();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(5);
+  });
+
+  it('keeps retry setup single-flight while its promise is pending', async () => {
+    vi.useFakeTimers();
+    watchPlan = { state: 'FAILED', groups: [{}], liveWatcherCount: 0 };
+    let resolveRetry;
+    watcherMock.setupFileWatchers = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveRetry = resolve;
+          }),
+      );
+
+    await main.startWatchers();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(2);
+    resolveRetry();
+    await Promise.resolve();
+  });
+
+  it('cancels a scheduled retry on test reset and before-quit', async () => {
+    vi.useFakeTimers();
+    watchPlan = { state: 'FAILED', groups: [{}], liveWatcherCount: 0 };
+    await main.startWatchers();
+    main._resetWatchersForTest();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(1);
+
+    await main.startWatchers();
+    const shutdown = vi.spyOn(logger, 'shutdown').mockImplementation(() => {});
+    for (const cb of appListeners['before-quit'] || []) cb();
+    expect(shutdown).toHaveBeenCalledTimes(1);
+    await main.startWatchers();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(watcherMock.setupFileWatchers).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([false, true])(
+    'fences rule mutations at quit start (pending drain: %s)',
+    async (pending) => {
+      const handles = [];
+      const sends = vi.fn();
+      const realWatcher = loadRuleWatcher(() => {
+        const handle = new EventEmitter();
+        handle.close = vi.fn(() => new Promise(() => {}));
+        handles.push(handle);
+        return handle;
+      });
+      watcherMock.setupRulesWatcher = vi.fn((_send, deps) =>
+        realWatcher.setupRulesWatcher(sends, deps),
+      );
+      watcherMock.setupSequenceRulesWatcher = vi.fn((_send, deps) =>
+        realWatcher.setupSequenceRulesWatcher(sends, deps),
+      );
+      const engine = { reset: vi.fn(), init: vi.fn() };
+      main._setSequenceEngineForTest(engine);
+      await main.startWatchers();
+      handles[0].emit('change', 'fixture.yaml');
+      handles[1].emit('change', 'fixture.yaml');
+      expect(sends).toHaveBeenCalledTimes(2);
+      expect(engine.reset).toHaveBeenCalledOnce();
+      sends.mockClear();
+      engine.reset.mockClear();
+      let release;
+      watcherMock.closeFileWatchers = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      );
+      main._setSensitiveAlertJournalForTest(
+        pending ? { hasPending: () => true, flush: async () => false } : undefined,
+      );
+      vi.spyOn(logger, 'shutdown').mockImplementation(() => {});
+      vi.spyOn(fakeElectron.app, 'quit').mockImplementation(() => {});
+      appListeners['before-quit'][0]({ preventDefault: vi.fn() });
+      try {
+        for (const handle of handles) {
+          for (const event of ['add', 'change', 'unlink']) handle.emit(event, 'fixture.yaml');
+        }
+        expect(sends).not.toHaveBeenCalled();
+        expect(engine.reset).not.toHaveBeenCalled();
+        expect(handles.every((handle) => handle.close.mock.calls.length === 1)).toBe(true);
+      } finally {
+        main._setSequenceEngineForTest(undefined);
+        release();
+        await flush();
+      }
+    },
+  );
+
+  it.each(['throw', 'reject', 'null'])(
+    'continues quit with rule close/setup result %s',
+    async (mode) => {
+      const close = vi.fn(() => {
+        if (mode === 'throw') throw new Error('fixture close');
+        return Promise.reject(new Error('fixture close'));
+      });
+      watcherMock.setupRulesWatcher.mockReturnValue(mode === 'null' ? null : { close });
+      const secondClose = vi.fn(async () => {});
+      watcherMock.setupSequenceRulesWatcher.mockReturnValue({ close: secondClose });
+      await main.startWatchers();
+      const shutdown = vi.spyOn(logger, 'shutdown').mockImplementation(() => {});
+      expect(() => appListeners['before-quit'][0]()).not.toThrow();
+      await flush();
+      expect(secondClose).toHaveBeenCalledOnce();
+      expect(close).toHaveBeenCalledTimes(mode === 'null' ? 0 : 1);
+      expect(shutdown).toHaveBeenCalledOnce();
+      appListeners['before-quit'][0]();
+      expect(secondClose).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('waits for ETW broker closure even without pending journal entries and bounds a stuck stop', async () => {
+    vi.useFakeTimers();
+    let release;
+    const sensor = {
+      isActive: () => true,
+      dispose: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      ),
+    };
+    main._setEtwFileForTest(sensor);
+    const quit = vi.spyOn(fakeElectron.app, 'quit').mockImplementation(() => {});
+    const shutdown = vi.spyOn(logger, 'shutdown').mockImplementation(() => {});
+    try {
+      const beforeQuit = appListeners['before-quit'][0];
+      const event = { preventDefault: vi.fn() };
+      beforeQuit(event);
+      expect(event.preventDefault).toHaveBeenCalledOnce();
+      expect(sensor.dispose).toHaveBeenCalledOnce();
+      expect(shutdown).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(quit).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(13000);
+      expect(quit).toHaveBeenCalledOnce();
+      release(false);
+    } finally {
+      main._setEtwFileForTest(undefined);
+      vi.useRealTimers();
+    }
+  });
+  it('finishes quit promptly after ETW acknowledges closure', async () => {
+    let release;
+    main._setEtwFileForTest({
+      isActive: () => true,
+      dispose: () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    });
+    const quit = vi.spyOn(fakeElectron.app, 'quit').mockImplementation(() => {});
+    try {
+      appListeners['before-quit'][0]({ preventDefault: vi.fn() });
+      expect(quit).not.toHaveBeenCalled();
+      release(true);
+      await flush();
+      expect(quit).toHaveBeenCalledOnce();
+    } finally {
+      main._setEtwFileForTest(undefined);
+    }
+  });
+  it('keeps repeated quit requests behind the pending alert-journal drain', async () => {
+    let releaseWatchers;
+    watcherMock.closeFileWatchers = vi.fn(
+      () => new Promise((resolve) => (releaseWatchers = resolve)),
+    );
+    const journal = {
+      hasPending: vi
+        .fn()
+        .mockReturnValueOnce(true)
+        .mockReturnValueOnce(true)
+        .mockReturnValue(false),
+      flush: vi.fn(async () => true),
+    };
+    main._setSensitiveAlertJournalForTest(journal);
+    const quit = vi.spyOn(fakeElectron.app, 'quit').mockImplementation(() => {});
+    const shutdown = vi.spyOn(logger, 'shutdown').mockImplementation(() => {});
+    const beforeQuit = appListeners['before-quit'][0];
+    const first = { preventDefault: vi.fn() };
+    const second = { preventDefault: vi.fn() };
+
+    beforeQuit(first);
+    beforeQuit(second);
+    expect(first.preventDefault).toHaveBeenCalledOnce();
+    expect(second.preventDefault).toHaveBeenCalledOnce();
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(quit).not.toHaveBeenCalled();
+
+    releaseWatchers();
+    await flush();
+    expect(journal.flush).toHaveBeenCalledOnce();
+    expect(quit).toHaveBeenCalledOnce();
+    beforeQuit({ preventDefault: vi.fn() });
+    expect(shutdown).toHaveBeenCalledOnce();
+  });
+});

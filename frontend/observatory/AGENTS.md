@@ -1,0 +1,21 @@
+# Observatory
+
+This is the Svelte integration of the approved Observatory template. Read ../../CODING_STANDARDS.md before code changes or reviews. Start with DESIGN.md and reference/README.md; read the linked dated amendments for the behavior being changed. The preserved template remains the visual authority; an implementation difference is not a new approval. Use the complete original stylesheet order in styles.ts and preserve the template's markup hierarchy and local artwork.
+
+Desktop and preview mount the same App.svelte. entry.ts uses the build-time preview constant; production must never import simulated telemetry. runtime/host.ts owns telemetry subscriptions, seed revision guards, freshness and disposal. Bind commands to the actual preload methods and require their documented success result.
+
+Use stamped instanceId for observations and process actions. Durable project permission keys have different semantics. Retain last reliable populations during outages; never turn absent measurements into zero. Show attribution and source evidence as returned. Paths are metadata, not permission to read file contents.
+
+Tests live under tests/renderer and frontend/observatory/tests. Follow
+../../docs/development/workflow.md#selecting-verification: run focused behavior
+checks and inspect the affected rendered states. Build the production renderer
+for host integration; also build preview when its entrypoint or shared build
+behavior changes. Run broader frontend coverage only for a shared layout,
+navigation, theme or other change with wider effects. Use Electron smoke for
+host/preload/native interactions that browser checks cannot establish, with a
+disposable profile. Hosted required CI owns final repository verification;
+do not duplicate its full suite locally without a specific reason. Never run
+process interventions against user processes, or paid provider tests without
+explicit authorization.
+
+The integration record and its remaining verification are in ../../OBSERVATORY-INTEGRATION.md. No release version or publication is implied by local packaging.
